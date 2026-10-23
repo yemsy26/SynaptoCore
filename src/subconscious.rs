@@ -36,13 +36,15 @@
 // ============================================================
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
+use crate::error::MemoryError;
 use crate::llm_bridge::{node_name, BridgeError, ExtractedTriple, LlmBackend};
-use crate::memory_graph::{embed_texts, GraphAccess, MemoryGraph, TraversalDirection};
+use crate::memory_graph::{canonical_id, embed_texts, ordered_pair, GraphAccess, MemoryGraph, TraversalDirection};
 use crate::prompts;
-use crate::truth_filter::{EpistemicValidator, SearchBackend, ValidationStatus};
-use crate::types::Node;
+use crate::truth_filter::{EpistemicValidator, SearchBackend, ValidationResult, ValidationStatus};
+use crate::types::{current_unix_ts, Node};
 
 // ── Constantes de operación ──────────────────────────────────────────────────
 
@@ -50,10 +52,31 @@ use crate::types::Node;
 /// Reducido a 3 segundos para investigación continua y aprendizaje dinámico sin latencia.
 pub const DEFAULT_CURIOSITY_INTERVAL_SECS: u64 = 3;
 
-/// Máximo de pares de nodos candidatos que se evalúan por ciclo.
-/// Limitar evita que el ciclo subconsciente monopolice la CPU cuando
-/// el grafo crece a cientos de miles de nodos.
-const MAX_CANDIDATES_PER_CYCLE: usize = 3;
+/// Paso 23: techo del backoff del bucle cuando los ciclos no aprenden nada.
+pub const MAX_CURIOSITY_INTERVAL_SECS: u64 = 60;
+
+/// Nodos ancla muestreados al azar por ciclo; de cada uno se evalúan sus
+/// vecinos semánticos más cercanos como candidatos a vacío.
+const GAP_ANCHORS: usize = 8;
+const GAP_NEIGHBORS_PER_ANCHOR: usize = 8;
+
+/// Banda de similitud coseno de un vacío (Paso 23). Por debajo, conceptos
+/// sin relación (la pregunta sería absurda); por encima, el mismo concepto
+/// con otro nombre (una fusión pendiente, no algo que investigar).
+/// Calibración del modelo multilingüe del Paso 22: pares relacionados
+/// 0,32–0,67 ("implantes médicos ↔ prótesis dentales" 0,54), pares sin
+/// relación ≤ 0,23.
+pub const GAP_MIN_SIMILARITY: f32 = 0.35;
+pub const GAP_MAX_SIMILARITY: f32 = 0.85;
+
+/// Enfriamiento tras un intento improductivo: 30 min, doblando por cada
+/// fallo consecutivo hasta 7 días.
+const GAP_COOLDOWN_BASE_SECS: i64 = 30 * 60;
+const GAP_COOLDOWN_MAX_SECS: i64 = 7 * 24 * 3600;
+
+/// Tras un intento productivo el par también descansa: si no, el motor
+/// seguiría extrayendo tripletas del mismo par ciclo tras ciclo.
+const GAP_COOLDOWN_PRODUCTIVE_SECS: i64 = 6 * 3600;
 
 /// Temperatura baja para generación de preguntas: queremos especificidad,
 /// no creatividad libre.
@@ -68,8 +91,7 @@ const SYNTHESIS_MAX_TOKENS: i32 = 512;
 /// Temperatura casi determinista para síntesis: queremos consistencia.
 const SYNTHESIS_TEMPERATURE: f32 = 0.1;
 
-/// Peso propuesto inicial para tripletas descubiertas subconscientemente.
-/// Se ajustará hacia abajo si la validación devuelve INCONCLUSIVE.
+/// Peso propuesto al validador para la hipótesis «A → B».
 const DEFAULT_DISCOVERY_WEIGHT: f64 = 0.75;
 
 /// Número máximo de intentos de parseo del JSON de curiosidad.
@@ -113,6 +135,9 @@ pub enum CuriosityError {
     #[error("El grafo tiene menos de 2 nodos; no hay pares que investigar")]
     GraphTooSmall,
 
+    #[error("Sin vacíos que investigar: los candidatos están conectados, son duplicados o están en enfriamiento")]
+    NoEligibleGap,
+
     #[error("Error al muestrear nodos del grafo: {0}")]
     GraphSample(String),
 
@@ -142,6 +167,8 @@ pub struct CuriosityEngine<L: LlmBackend, S: SearchBackend> {
     /// Umbral de confianza para el validador epistémico.
     /// Se pasa al `EpistemicValidator` interno de cada ciclo.
     /// Default: 0.5 (heredado de TruthFilter).
+    /// Paso 23: para consolidar, además, VERIFIED con confianza
+    /// estrictamente mayor (ver `consolidation_allowed`).
     pub validation_threshold: f64,
     /// Logger de eventos del ciclo (closure que recibe líneas de texto).
     /// En producción puede redirigir a `log::debug!` o a un canal de canal.
@@ -218,6 +245,9 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
     ///   1. Lectura      (lock, ms): vacío de conocimiento + contexto de A y B.
     ///   2. Investigación (sin lock, segundos): LLM, SearXNG, TruthFilter, síntesis.
     ///   3. Consolidación (lock, ms): deduplicación contra el grafo + inserción.
+    ///
+    /// Paso 23: el resultado se anota en `gap_attempts` para enfriar el par;
+    /// sin esa memoria, un par que no produce nada se elegía una y otra vez.
     fn run_single_cycle<G: GraphAccess>(
         &self,
         graph: &G,
@@ -226,14 +256,32 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         // ── FASE 1: Lectura ──────────────────────────────────────────────────
         // PASO A: Encontrar un par de nodos con vacío de conocimiento, y un
         // contexto breve de cada nodo para enriquecer el prompt.
-        let (node_a, node_b, ctx_a, ctx_b, embedder) = graph.with_graph(|g| {
-            let (a, b) = self.find_knowledge_gap(g)?;
-            let ctx_a = self.summarize_neighbors(g, &a);
-            let ctx_b = self.summarize_neighbors(g, &b);
-            Ok::<_, CuriosityError>((a, b, ctx_a, ctx_b, g.embedding_backend()))
+        let (gap, ctx_a, ctx_b, embedder) = graph.with_graph(|g| {
+            let gap = self.find_knowledge_gap(g, current_unix_ts())?;
+            let ctx_a = self.summarize_neighbors(g, &gap.a);
+            let ctx_b = self.summarize_neighbors(g, &gap.b);
+            Ok::<_, CuriosityError>((gap, ctx_a, ctx_b, g.embedding_backend()))
         })?;
-        self.log(&format!("Vacío detectado: «{}» ↔ «{}»", node_a, node_b));
+        match gap.similarity {
+            Some(sim) => self.log(&format!("Vacío detectado: «{}» ↔ «{}» (similitud {sim:.2})", gap.a, gap.b)),
+            None      => self.log(&format!("Vacío detectado: «{}» ↔ «{}»", gap.a, gap.b)),
+        }
 
+        let result = self.investigate(graph, gap.a.clone(), gap.b.clone(), &ctx_a, &ctx_b, embedder);
+        self.remember_attempt(graph, &gap.a, &gap.b, &result);
+        result
+    }
+
+    /// Fases 2 y 3 del ciclo para el par ya elegido.
+    fn investigate<G: GraphAccess>(
+        &self,
+        graph:    &G,
+        node_a:   String,
+        node_b:   String,
+        ctx_a:    &str,
+        ctx_b:    &str,
+        embedder: Option<std::sync::Arc<dyn crate::memory_graph::EmbeddingBackend>>,
+    ) -> Result<SleepCycleReport, CuriosityError> {
         // ── FASE 2: Investigación (sin lock) ────────────────────────────────
         // PASO B: Generar pregunta de investigación.
         let curiosity_q = self.generate_question(&node_a, &node_b, &ctx_a, &ctx_b)?;
@@ -277,11 +325,22 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         ));
 
         // PASO E: Si la validación no acepta, reportar hipótesis descartada.
-        if !validation.should_accept() {
+        if !consolidation_allowed(&validation, self.validation_threshold) {
+            // Lo que el TruthFilter aceptaría y la política del subconsciente
+            // no (INCONCLUSIVE, o VERIFIED en el umbral) se explica en el log.
+            let policy = if validation.should_accept() {
+                format!(
+                    "el subconsciente solo consolida VERIFIED con confianza > {:.2}. ",
+                    self.validation_threshold
+                )
+            } else {
+                String::new()
+            };
             let reason = format!(
-                "Hipótesis descartada — {} (conf={:.2}): {}",
+                "Hipótesis descartada — {} (conf={:.2}): {}{}",
                 validation.status.as_str(),
                 validation.confidence,
+                policy,
                 validation.reasoning,
             );
             self.log(&format!("❌ {}", reason));
@@ -310,7 +369,7 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
 
         // ── FASE 3: Consolidación ────────────────────────────────────────────
         let consolidated = graph.with_graph(|g| {
-            self.consolidate(g, &raw_triples, validation.confidence, &vectors)
+            self.consolidate(g, (&node_a, &node_b), &raw_triples, validation.confidence, &vectors)
         });
 
         if consolidated.is_empty() {
@@ -330,52 +389,96 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
 
     // ── Paso A: Detección de vacíos ──────────────────────────────────────────
 
-    /// Selecciona dos nodos del grafo que no estén directamente conectados.
+    /// Elige un par de nodos sin arista directa que merezca investigarse
+    /// (Paso 23).
     ///
-    /// ESTRATEGIA O(k) con SQLite:
-    ///   `ORDER BY RANDOM() LIMIT N` usa el índice rowid de SQLite y no
-    ///   materializa el grafo completo. Para un grafo de 1M nodos, k=3
-    ///   genera el resultado en <1ms porque SQLite salta directamente a
-    ///   posiciones aleatorias en el archivo B-tree.
+    /// 1. Muestra `GAP_ANCHORS` nodos al azar. Antes se tomaban siempre los
+    ///    más recientes, y el mismo par se repetía indefinidamente.
+    /// 2. Con embeddings, los candidatos de cada ancla son sus vecinos
+    ///    semánticos dentro de la banda [`GAP_MIN_SIMILARITY`,
+    ///    `GAP_MAX_SIMILARITY`] y gana el más similar: conceptos
+    ///    relacionados pero aún sin conectar. Sin embeddings, cualquier otra
+    ///    ancla vale.
+    /// 3. Se descartan pares conectados, en enfriamiento o casi duplicados.
     ///
-    ///   Una vez obtenido el par, verificamos que no estén ya conectados
-    ///   buscando aristas directas (get_neighbors O(vecinos)). Si están
-    ///   conectados, seleccionamos el siguiente par del pool de candidatos.
+    /// Sin candidatos: [`CuriosityError::NoEligibleGap`]. Ya no se "refuerza"
+    /// un par conectado: era otra fuente de bucles.
     fn find_knowledge_gap(
         &self,
         graph: &MemoryGraph,
-    ) -> Result<(String, String), CuriosityError> {
-        let candidates = graph
-            .sample_random_nodes(MAX_CANDIDATES_PER_CYCLE * 2)
-            .map_err(|e| CuriosityError::GraphSample(e.to_string()))?;
-
-        if candidates.len() < 2 {
+        now:   i64,
+    ) -> Result<Gap, CuriosityError> {
+        let sample_err = |e: MemoryError| CuriosityError::GraphSample(e.to_string());
+        let anchors = graph.sample_random_node_ids(GAP_ANCHORS).map_err(sample_err)?;
+        if anchors.len() < 2 {
             return Err(CuriosityError::GraphTooSmall);
         }
+        let cooling = graph.gap_pairs_cooling_down(now).map_err(sample_err)?;
+        let semantic = graph.vector_index_len() >= 2;
 
-        // Buscar el primer par sin arista directa.
-        for i in 0..candidates.len() {
-            for j in (i + 1)..candidates.len() {
-                let a = &candidates[i].id;
-                let b = &candidates[j].id;
+        let mut best: Option<Gap> = None;
+        for a in &anchors {
+            let candidates: Vec<(String, Option<f32>)> = if semantic {
+                graph.similar_to_node(a, GAP_NEIGHBORS_PER_ANCHOR)
+                    .into_iter()
+                    .filter(|(_, sim)| (GAP_MIN_SIMILARITY..=GAP_MAX_SIMILARITY).contains(sim))
+                    .map(|(b, sim)| (b, Some(sim)))
+                    .collect()
+            } else {
+                anchors.iter().filter(|b| *b != a).map(|b| (b.clone(), None)).collect()
+            };
+            if candidates.is_empty() {
+                continue;
+            }
+            let connected: HashSet<String> = graph
+                .get_neighbors(a, TraversalDirection::Both)
+                .map(|hood| hood.neighbors.into_iter().map(|(_, n)| n.id).collect())
+                .unwrap_or_default();
 
-                // Verificar si ya existe arista directa A→B o B→A.
-                let already_connected = graph
-                    .get_neighbors(a, TraversalDirection::Both)
-                    .map(|hood| hood.neighbors.iter().any(|(_, n)| &n.id == b))
-                    .unwrap_or(false);
-
-                if !already_connected {
-                    return Ok((a.clone(), b.clone()));
+            for (b, similarity) in candidates {
+                let better = match &best {
+                    None => true,
+                    Some(current) => similarity > current.similarity,
+                };
+                if better
+                    && !connected.contains(&b)
+                    && !cooling.contains(&ordered_pair(a, &b))
+                    && !is_near_duplicate(a, &b)
+                {
+                    best = Some(Gap { a: a.clone(), b, similarity });
                 }
             }
         }
+        best.ok_or(CuriosityError::NoEligibleGap)
+    }
 
-        // Todos los pares están conectados — tomar el primero de todas formas.
-        // Esto permite que el motor refuerce conocimiento existente desde
-        // una perspectiva diferente (ángulo de investigación distinto).
-        self.log("⚠ Todos los candidatos ya conectados; reforzando par existente");
-        Ok((candidates[0].id.clone(), candidates[1].id.clone()))
+    /// Anota el resultado del ciclo en `gap_attempts` y enfría el par
+    /// (Paso 23). Un fallo del LLM no cuenta: no dice nada del par.
+    fn remember_attempt<G: GraphAccess>(
+        &self,
+        graph:  &G,
+        a:      &str,
+        b:      &str,
+        result: &Result<SleepCycleReport, CuriosityError>,
+    ) {
+        let outcome = match result {
+            Ok(r) if !r.triples_consolidated.is_empty() => "consolidated",
+            Ok(r) if r.rejection_reason.is_some()       => "rejected",
+            Ok(_)                                        => "no_triples",
+            Err(CuriosityError::Bridge(_))               => return,
+            Err(_)                                       => "failed",
+        };
+        let now = current_unix_ts();
+        let recorded = graph.with_graph(|g| {
+            let attempts = if outcome == "consolidated" { 0 } else { g.gap_attempts(a, b)? + 1 };
+            let cooldown = gap_cooldown_secs(attempts);
+            g.record_gap_attempt(a, b, attempts, outcome, now, now + cooldown)?;
+            Ok::<_, MemoryError>(cooldown)
+        });
+        match recorded {
+            Ok(secs) => self.log(&format!("⏳ Par en enfriamiento durante {} ({outcome})", human_duration(secs))),
+            Err(e)   => self.log(&format!("⚠ No se pudo registrar el intento: {e}")),
+        }
     }
 
     // ── Paso B: Generación de pregunta ───────────────────────────────────────
@@ -456,14 +559,18 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         // Filtrar: solo tripletas donde al menos uno de los nodos sea A o B,
         // y ambos subject/object sean no vacíos. La deduplicación contra el
         // grafo se hace en `consolidate`, ya con el lock tomado.
+        //
+        // Paso 23: la comparación es por id canónico. El prompt pide
+        // snake_case y los ids del chat llevan espacios o mayúsculas
+        // ("diagramas de clases"): con igualdad exacta se descartaba todo
+        // y el par nunca se cerraba.
+        let targets = [canonical_id(node_a), canonical_id(node_b)];
         let valid: Vec<ExtractedTriple> = batch.triples
             .into_iter()
             .filter(|t| {
-                !t.subject.trim().is_empty()
-                && !t.object.trim().is_empty()
-                && t.subject != t.object
-                && (t.subject.as_str() == node_a || t.object.as_str() == node_b
-                    || t.subject.as_str() == node_b || t.object.as_str() == node_a)
+                let (s, o) = (canonical_id(&t.subject), canonical_id(&t.object));
+                !s.is_empty() && !o.is_empty() && s != o
+                    && (targets.contains(&s) || targets.contains(&o))
             })
             .collect();
 
@@ -477,9 +584,14 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
     ///
     /// Se ejecuta bajo el lock del grafo: la comprobación de existencia y la
     /// inserción son atómicas respecto a otros escritores (chat, federación).
+    ///
+    /// Paso 23: cada extremo se resuelve al nodo que ya nombra ese concepto
+    /// (A, B u otro con la misma forma canónica). Así "diagramas_de_clases"
+    /// conecta con «diagramas de clases» en vez de crear un duplicado.
     fn consolidate(
         &self,
         graph:      &MemoryGraph,
+        (node_a, node_b): (&str, &str),
         triples:    &[ExtractedTriple],
         confidence: f64,
         vectors:    &HashMap<String, Vec<f32>>,
@@ -490,14 +602,24 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
             node.embedding = vectors.get(&name).cloned();
             node
         };
+        let (canon_a, canon_b) = (canonical_id(node_a), canonical_id(node_b));
+        let resolve = |text: &str| -> String {
+            match canonical_id(text) {
+                c if c == canon_a => node_a.to_string(),
+                c if c == canon_b => node_b.to_string(),
+                _ => graph.resolve_node_id(text).ok().flatten().unwrap_or_else(|| text.trim().to_string()),
+            }
+        };
         let mut consolidated = Vec::new();
 
         for triple in triples {
+            let (subject, object) = (resolve(&triple.subject), resolve(&triple.object));
+
             // No reinsertar aristas que ya existen entre estos nodos exactos.
             let exists = graph
-                .get_neighbors(&triple.subject, TraversalDirection::Outgoing)
+                .get_neighbors(&subject, TraversalDirection::Outgoing)
                 .map(|h| h.neighbors.iter().any(|(e, n)| {
-                    e.relation == triple.relation && n.id == triple.object
+                    e.relation == triple.relation && n.id == object
                 }))
                 .unwrap_or(false);
             if exists {
@@ -505,14 +627,14 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
             }
 
             // Insertar nodos si no existen (idempotente: MemoryGraph ignora duplicados).
-            let _ = graph.insert_node(&concept(&triple.subject));
-            let _ = graph.insert_node(&concept(&triple.object));
+            let _ = graph.insert_node(&concept(&subject));
+            let _ = graph.insert_node(&concept(&object));
 
             // Peso ajustado por la confianza del validador.
             let final_weight = triple.weight * confidence;
-            match graph.insert_edge(&triple.subject, &triple.relation, &triple.object, final_weight) {
+            match graph.insert_edge(&subject, &triple.relation, &object, final_weight) {
                 Ok(_) => {
-                    let repr = format!("{}→{}→{}", triple.subject, triple.relation, triple.object);
+                    let repr = format!("{}→{}→{}", subject, triple.relation, object);
                     self.log(&format!("✓ Consolidada: {} (w={:.3})", repr, final_weight));
                     consolidated.push(repr);
                 }
@@ -590,34 +712,109 @@ fn slugify(text: &str) -> String {
         .to_lowercase()
 }
 
-// ── Extensión de MemoryGraph: muestreo aleatorio ──────────────────────────────
+// ── Paso 23: selección de vacíos y ritmo del bucle ───────────────────────────
 
-// Añadir `sample_random_nodes` a MemoryGraph no es posible sin modificar
-// memory_graph.rs. En lugar de eso, lo exponemos como función libre aquí,
-// delegando a `search_nodes` con una query comodín. Esto mantiene la
-// separación de módulos: memory_graph no necesita conocer el concepto de
-// "ciclo subconsciente".
-//
-// Una alternativa sería añadir `pub fn all_node_ids(&self) -> Result<...>`
-// a MemoryGraph, pero eso expone demasiado del internals del grafo.
-// La solución actual aprovecha que `search_nodes("")` con SQLite LIKE '%'
-// retorna todos los nodos, y limitamos con el parámetro `limit`.
-
-/// Samplea `n` nodos aleatorios del grafo.
-///
-/// IMPLEMENTACIÓN: Aprovecha `search_nodes` con query vacía que internamente
-/// usa `LIKE '%'` sobre el nombre del nodo, limitado a `n`. Para la
-/// aleatoriedad usamos el orden natural de SQLite que varía con los inserts.
-/// En Paso 5 se añadirá `ORDER BY RANDOM()` como método nativo de MemoryGraph.
-trait MemoryGraphExt {
-    fn sample_random_nodes(&self, n: usize) -> Result<Vec<Node>, crate::error::MemoryError>;
+/// Par elegido por `find_knowledge_gap`. `similarity` es el coseno cuando
+/// la selección fue semántica.
+#[derive(Debug, Clone, PartialEq)]
+struct Gap {
+    a:          String,
+    b:          String,
+    similarity: Option<f32>,
 }
 
-impl MemoryGraphExt for MemoryGraph {
-    fn sample_random_nodes(&self, n: usize) -> Result<Vec<Node>, crate::error::MemoryError> {
-        // `search_nodes("")` usa LIKE '%' → devuelve todos los nodos.
-        // Limitar a n evita materializar grafos grandes.
-        self.search_nodes("", n)
+/// Mismo concepto con otro nombre, o un compuesto que lo contiene
+/// («diagramas de clases» ⊂ «diagramas de clases y diagramas de
+/// secuencia»): es una fusión pendiente, no un vacío que investigar.
+/// Se compara por palabras para que "ia" no case dentro de "materia".
+fn is_near_duplicate(a: &str, b: &str) -> bool {
+    let words = |s: &str| -> HashSet<String> {
+        canonical_id(s)
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    let (wa, wb) = (words(a), words(b));
+    !wa.is_empty() && !wb.is_empty() && (wa.is_subset(&wb) || wb.is_subset(&wa))
+}
+
+/// ¿Puede el subconsciente escribir en el grafo lo que validó? (Paso 23)
+///
+/// Más estricto que `ValidationResult::should_accept`, que también admite
+/// INCONCLUSIVE con confianza ≥ umbral (a medio peso). El subconsciente
+/// aprende sin supervisión humana y el validador suele devolver
+/// INCONCLUSIVE 0,50 cuando duda: en la prueba en vivo, 5 de cada 7 ciclos
+/// productivos consolidaban así relaciones dudosas («Exynos 2400 compite_en
+/// Galaxy S24»). Ahora hace falta VERIFIED y confianza estrictamente mayor
+/// que el umbral.
+fn consolidation_allowed(validation: &ValidationResult, threshold: f64) -> bool {
+    matches!(validation.status, ValidationStatus::Verified) && validation.confidence > threshold
+}
+
+/// Enfriamiento de un par según sus intentos improductivos consecutivos;
+/// `0` significa que el último intento sí consolidó conocimiento.
+pub fn gap_cooldown_secs(unproductive_attempts: u32) -> i64 {
+    if unproductive_attempts == 0 {
+        return GAP_COOLDOWN_PRODUCTIVE_SECS;
+    }
+    let factor = 1i64 << (unproductive_attempts - 1).min(20);
+    GAP_COOLDOWN_BASE_SECS.saturating_mul(factor).min(GAP_COOLDOWN_MAX_SECS)
+}
+
+/// "30 min", "4 h", "7 d": para los logs del subconsciente.
+fn human_duration(secs: i64) -> String {
+    match secs {
+        s if s < 3600  => format!("{} min", s / 60),
+        s if s < 86400 => format!("{} h", s / 3600),
+        s              => format!("{} d", s / 86400),
+    }
+}
+
+/// Intervalo adaptativo entre ciclos del bucle subconsciente (Paso 23).
+///
+/// Cada ciclo sin conocimiento nuevo duplica la espera hasta `max`; un ciclo
+/// productivo, o un cambio en el grafo hecho por otro (el usuario enseña
+/// algo), la devuelve a `base`. Con el grafo agotado el motor deja de gastar
+/// GPU y consultas a SearXNG cada pocos segundos.
+#[derive(Debug, Clone)]
+pub struct CycleBackoff {
+    base:    Duration,
+    max:     Duration,
+    current: Duration,
+}
+
+impl CycleBackoff {
+    pub fn new(base: Duration, max: Duration) -> Self {
+        Self { base, max, current: base }
+    }
+
+    /// Ritmo por defecto: `DEFAULT_CURIOSITY_INTERVAL_SECS` hasta
+    /// `MAX_CURIOSITY_INTERVAL_SECS`.
+    pub fn standard() -> Self {
+        Self::new(
+            Duration::from_secs(DEFAULT_CURIOSITY_INTERVAL_SECS),
+            Duration::from_secs(MAX_CURIOSITY_INTERVAL_SECS),
+        )
+    }
+
+    pub fn base(&self) -> Duration {
+        self.base
+    }
+
+    /// Espera antes del próximo ciclo.
+    pub fn current(&self) -> Duration {
+        self.current
+    }
+
+    /// Ajusta la espera según el resultado del ciclo.
+    pub fn record(&mut self, productive: bool) {
+        self.current = if productive { self.base } else { (self.current * 2).min(self.max) };
+    }
+
+    /// El grafo cambió por otra vía: vuelve al ritmo base.
+    pub fn reset(&mut self) {
+        self.current = self.base;
     }
 }
 
@@ -633,16 +830,31 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    /// Grafo con un único vacío: rust ↔ machine_learning. El muestreo es
+    /// aleatorio (Paso 23), así que los tests fijan el par por construcción.
     fn populated_graph() -> MemoryGraph {
         let g = MemoryGraph::open(":memory:").unwrap();
         g.insert_node(&Node::new("rust",            "concept", "Rust")).unwrap();
         g.insert_node(&Node::new("machine_learning","concept", "Machine Learning")).unwrap();
-        g.insert_node(&Node::new("memoria",         "concept", "Memoria")).unwrap();
-        g.insert_node(&Node::new("cortisol",        "concept", "Cortisol")).unwrap();
         // Arista existente: rust → es_lenguaje_de → programacion
         g.insert_node(&Node::new("programacion",    "concept", "Programación")).unwrap();
         g.insert_edge("rust", "es_lenguaje_de", "programacion", 0.99).unwrap();
+        g.insert_edge("machine_learning", "usa", "programacion", 0.9).unwrap();
         g
+    }
+
+    /// LLM caído: cada llamada falla.
+    #[derive(Clone)]
+    struct FailingLlm;
+
+    impl LlmBackend for FailingLlm {
+        fn complete(&self, _: &str, _: &str, _: i32, _: f32) -> Result<String, BridgeError> {
+            Err(BridgeError::BackendInit("Ollama no responde".into()))
+        }
+    }
+
+    fn gap_pair(report: &SleepCycleReport) -> (String, String) {
+        ordered_pair(&report.node_a, &report.node_b)
     }
 
     fn make_engine(
@@ -790,42 +1002,203 @@ mod tests {
         assert_eq!(edges_before, edges_after);
     }
 
-    /// Múltiples ciclos: el grafo crece acumulativamente.
+    /// Paso 23: solo VERIFIED con confianza > umbral escribe en el grafo.
+    /// INCONCLUSIVE no consolida nunca, aunque el TruthFilter lo aceptaría.
+    #[test]
+    fn test_only_verified_above_threshold_consolidates() {
+        for (status, confidence, consolidates) in [
+            ("INCONCLUSIVE", 0.50, false), // el caso observado en vivo
+            ("INCONCLUSIVE", 0.90, false),
+            ("VERIFIED",     0.50, false), // igual al umbral: no basta
+            ("VERIFIED",     0.51, true),
+        ] {
+            let graph = populated_graph();
+            let edges_before = graph.stats().unwrap().edge_count;
+            let validation = format!(r#"{{"status": "{status}", "confidence": {confidence}, "reasoning": "Prueba."}}"#);
+            let engine = make_engine(
+                vec![
+                    r#"{"question": "¿Puede Rust hacer ML?", "reasoning": "Interop"}"#,
+                    &validation,
+                    r#"{"triples": [{"subject": "rust", "relation": "soporta", "object": "machine_learning", "weight": 0.9}]}"#,
+                ],
+                vec![vec!["Rust tiene crates de ML."]],
+            );
+
+            let report = engine.run_sleep_cycle(&graph, 1).pop().unwrap().unwrap();
+            let grew = graph.stats().unwrap().edge_count > edges_before;
+            assert_eq!(grew, consolidates, "{status} {confidence}");
+            assert_eq!(report.rejection_reason.is_none(), consolidates, "{status} {confidence}");
+            if !consolidates {
+                assert_eq!(graph.gap_attempts("rust", "machine_learning").unwrap(), 1,
+                    "{status} {confidence}: el par descartado se enfría");
+            }
+        }
+    }
+
+    /// Múltiples ciclos: el grafo crece acumulativamente y cada ciclo
+    /// investiga un par distinto (el primero queda en enfriamiento).
     #[test]
     fn test_multiple_sleep_cycles_accumulate_knowledge() {
-        let graph = populated_graph();
+        // Dos vacíos: rust ↔ machine_learning y cortisol ↔ memoria.
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        for id in ["rust", "machine_learning", "cortisol", "memoria"] {
+            graph.insert_node(&Node::new(id, "concept", id)).unwrap();
+        }
+        for (a, b) in [("rust", "cortisol"), ("rust", "memoria"),
+                       ("machine_learning", "cortisol"), ("machine_learning", "memoria")] {
+            graph.insert_edge(a, "relacionado_con", b, 0.9).unwrap();
+        }
 
-        // Preparamos 2 ciclos, cada uno con sus respuestas LLM y de búsqueda.
-        // MockLlmBackend consume las respuestas en orden FIFO.
+        // El orden de los pares es aleatorio: cada síntesis trae las dos
+        // tripletas y el filtro se queda con la del par investigado.
+        let synthesis = r#"{"triples": [
+            {"subject": "rust", "relation": "soporta", "object": "machine_learning", "weight": 0.88},
+            {"subject": "cortisol", "relation": "afecta", "object": "memoria", "weight": 0.80}]}"#;
         let engine = make_engine(
             vec![
-                // Ciclo 1 — pregunta
-                r#"{"question": "¿Cómo se relaciona Rust con machine learning?", "reasoning": "Interop técnica"}"#,
-                // Ciclo 1 — validación
+                r#"{"question": "¿Cómo se relacionan?", "reasoning": "Vínculo posible"}"#,
                 r#"{"status": "VERIFIED", "confidence": 0.90, "reasoning": "Confirmado."}"#,
-                // Ciclo 1 — síntesis
-                r#"{"triples": [{"subject": "rust", "relation": "soporta", "object": "machine_learning", "weight": 0.88}]}"#,
-                // Ciclo 2 — pregunta
-                r#"{"question": "¿Afecta el cortisol a la memoria?", "reasoning": "Vínculo neuroendocrino"}"#,
-                // Ciclo 2 — validación
-                r#"{"status": "VERIFIED", "confidence": 0.85, "reasoning": "Estudios neurológicos lo confirman."}"#,
-                // Ciclo 2 — síntesis
-                r#"{"triples": [{"subject": "cortisol", "relation": "afecta", "object": "memoria", "weight": 0.80}]}"#,
+                synthesis,
+                r#"{"question": "¿Cómo se relacionan?", "reasoning": "Vínculo posible"}"#,
+                r#"{"status": "VERIFIED", "confidence": 0.85, "reasoning": "Confirmado."}"#,
+                synthesis,
             ],
             vec![
-                // Búsquedas (2 ciclos × 1 búsqueda por validación)
                 vec!["Rust tiene crates de ML."],
                 vec!["El cortisol afecta la memoria a largo plazo."],
             ],
         );
 
         let edges_before = graph.stats().unwrap().edge_count;
-        let results = engine.run_sleep_cycle(&graph, 2);
+        let reports: Vec<_> = engine.run_sleep_cycle(&graph, 2).into_iter().map(Result::unwrap).collect();
 
-        assert_eq!(results.len(), 2);
-        let edges_after = graph.stats().unwrap().edge_count;
-        // Al menos 1 arista nueva por ciclo exitoso
-        assert!(edges_after > edges_before, "El grafo debería haber crecido");
+        assert_ne!(gap_pair(&reports[0]), gap_pair(&reports[1]), "el segundo ciclo cambia de par");
+        assert!(reports.iter().all(|r| r.triples_consolidated.len() == 1));
+        assert_eq!(graph.stats().unwrap().edge_count, edges_before + 2);
+    }
+
+    // ── Paso 23: selección de vacíos, enfriamiento y filtro canónico ─────────
+
+    /// Un ciclo que no consolida nada enfría su par; sin otro vacío, el
+    /// siguiente ciclo descansa en vez de repetirlo (el bucle observado).
+    #[test]
+    fn test_unproductive_pair_cools_down_instead_of_looping() {
+        let graph = populated_graph();
+        let engine = make_engine(
+            vec![
+                r#"{"question": "¿Puede Rust hacer ML?", "reasoning": "Interop"}"#,
+                r#"{"status": "VERIFIED", "confidence": 0.95, "reasoning": "Sí."}"#,
+                r#"{"triples": []}"#,
+            ],
+            vec![vec!["Rust tiene crates de ML."]],
+        );
+
+        let first = engine.run_sleep_cycle(&graph, 1).pop().unwrap().unwrap();
+        assert!(first.triples_consolidated.is_empty());
+        assert_eq!(graph.gap_attempts("rust", "machine_learning").unwrap(), 1);
+
+        let second = engine.run_sleep_cycle(&graph, 1).pop().unwrap();
+        assert!(matches!(second, Err(CuriosityError::NoEligibleGap)), "{second:?}");
+    }
+
+    /// Un LLM caído no dice nada del par: no se enfría.
+    #[test]
+    fn test_llm_failure_does_not_cool_the_pair() {
+        let graph = populated_graph();
+        let engine = CuriosityEngine::new_silent(FailingLlm, MockSearchBackend::empty());
+        let result = engine.run_sleep_cycle(&graph, 1).pop().unwrap();
+        assert!(matches!(result, Err(CuriosityError::Bridge(_))), "{result:?}");
+        assert_eq!(graph.gap_attempts("rust", "machine_learning").unwrap(), 0);
+        assert!(graph.gap_pairs_cooling_down(current_unix_ts()).unwrap().is_empty());
+    }
+
+    /// La síntesis en snake_case se conecta a los nodos existentes aunque sus
+    /// ids lleven espacios o mayúsculas, sin crear duplicados.
+    #[test]
+    fn test_synthesis_resolves_canonical_ids_to_existing_nodes() {
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        graph.insert_node(&Node::new("UML", "concept", "UML")).unwrap();
+        graph.insert_node(&Node::new("diagramas de clases", "concept", "diagramas de clases")).unwrap();
+        let engine = make_engine(
+            vec![
+                r#"{"question": "¿Qué diagramas incluye UML?", "reasoning": "Modelado"}"#,
+                r#"{"status": "VERIFIED", "confidence": 0.90, "reasoning": "Sí."}"#,
+                r#"{"triples": [
+                    {"subject": "uml", "relation": "incluye", "object": "diagramas_de_clases", "weight": 0.9},
+                    {"subject": "Diagramas de Clases", "relation": "se_dibujan_con", "object": "herramientas_case", "weight": 0.8},
+                    {"subject": "java", "relation": "usa", "object": "jvm", "weight": 0.9}]}"#,
+            ],
+            vec![vec!["UML incluye diagramas de clases y de secuencia."]],
+        );
+
+        let report = engine.run_sleep_cycle(&graph, 1).pop().unwrap().unwrap();
+
+        assert_eq!(report.triples_consolidated, [
+            "UML→incluye→diagramas de clases",
+            "diagramas de clases→se_dibujan_con→herramientas_case",
+        ], "la tripleta java→jvm no toca el par y se descarta");
+        assert_eq!(graph.stats().unwrap().node_count, 3, "solo herramientas_case es un nodo nuevo");
+    }
+
+    #[test]
+    fn test_gap_selection_uses_semantic_band_and_skips_ineligible_pairs() {
+        let graph = MemoryGraph::open(":memory:").unwrap()
+            .with_embedding(std::sync::Arc::new(crate::memory_graph::MockEmbeddingBackend::new(3)));
+        for (id, v) in [("titanio",          [1.0, 0.0, 0.0]),
+                        ("implantes",        [0.6, 0.8, 0.0]),  // coseno 0.60 con titanio
+                        ("titanio_puro",     [1.0, 0.0, 0.05]), // 0.999: casi duplicado
+                        ("receta_de_cocina", [0.0, 0.0, 1.0])]  // ~0: sin relación
+        {
+            let mut node = Node::new(id, "concept", id);
+            node.embedding = Some(v.to_vec());
+            graph.insert_node(&node).unwrap();
+        }
+        // implantes ↔ titanio_puro (0.60) queda fuera por estar conectado.
+        graph.insert_edge("titanio_puro", "se_usa_en", "implantes", 0.9).unwrap();
+        let engine = make_engine(vec![], vec![]);
+        let now = current_unix_ts();
+
+        let gap = engine.find_knowledge_gap(&graph, now).unwrap();
+        assert_eq!(ordered_pair(&gap.a, &gap.b), ordered_pair("titanio", "implantes"));
+        assert!((gap.similarity.unwrap() - 0.6).abs() < 1e-3);
+
+        graph.record_gap_attempt("titanio", "implantes", 1, "no_triples", now, now + 60).unwrap();
+        assert!(matches!(engine.find_knowledge_gap(&graph, now), Err(CuriosityError::NoEligibleGap)));
+        assert!(engine.find_knowledge_gap(&graph, now + 61).is_ok(), "el enfriamiento expira");
+    }
+
+    #[test]
+    fn test_near_duplicates_are_not_gaps() {
+        assert!(is_near_duplicate("diagramas de clases", "diagramas de clases y diagramas de secuencia"));
+        assert!(is_near_duplicate("SQLite", "sqlite"));
+        assert!(is_near_duplicate("Snapdragon 8 Gen 3", "Qualcomm_Snapdragon_8_Gen_3"));
+        assert!(!is_near_duplicate("IA", "materia prima"), "se compara por palabras");
+        assert!(!is_near_duplicate("UML", "diagramas de clases"));
+    }
+
+    #[test]
+    fn test_gap_cooldown_doubles_up_to_a_week() {
+        assert_eq!(gap_cooldown_secs(0), GAP_COOLDOWN_PRODUCTIVE_SECS);
+        assert_eq!(gap_cooldown_secs(1), 30 * 60);
+        assert_eq!(gap_cooldown_secs(2), 60 * 60);
+        assert_eq!(gap_cooldown_secs(4), 4 * 60 * 60);
+        assert_eq!(gap_cooldown_secs(40), GAP_COOLDOWN_MAX_SECS);
+        assert_eq!(human_duration(gap_cooldown_secs(1)), "30 min");
+        assert_eq!(human_duration(gap_cooldown_secs(40)), "7 d");
+    }
+
+    #[test]
+    fn test_cycle_backoff_grows_when_idle_and_resets() {
+        let mut b = CycleBackoff::new(Duration::from_secs(3), Duration::from_secs(60));
+        for expected in [6, 12, 24, 48, 60, 60] {
+            b.record(false);
+            assert_eq!(b.current().as_secs(), expected);
+        }
+        b.record(true);
+        assert_eq!(b.current().as_secs(), 3, "un ciclo productivo vuelve al ritmo base");
+        b.record(false);
+        b.reset();
+        assert_eq!(b.current(), b.base());
     }
 
     /// Si el grafo tiene menos de 2 nodos, el ciclo falla limpiamente.

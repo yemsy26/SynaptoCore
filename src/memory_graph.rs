@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -263,6 +263,12 @@ impl VectorIndex {
         self.ids.len()
     }
 
+    /// Vector normalizado de un nodo, si está indexado.
+    fn vector(&self, id: &str) -> Option<&[f32]> {
+        let i = *self.pos.get(id)?;
+        Some(&self.data[i * self.dims..(i + 1) * self.dims])
+    }
+
     /// Inserta o sustituye el vector de un nodo. Ignora vectores nulos o de
     /// otra dimensión (no pertenecen a este espacio).
     fn upsert(&mut self, id: &str, v: &[f32]) -> bool {
@@ -367,6 +373,11 @@ pub struct RetrievedContext {
     pub seeds: Vec<(String, f32)>,
     /// Aristas para el prompt, de mayor a menor relevancia.
     pub edges: Vec<ContextEdge>,
+}
+
+/// Par de ids en orden estable: clave de `gap_attempts` (Paso 23).
+pub fn ordered_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) }
 }
 
 /// Forma canónica de un identificador de nodo, tal como lo escribe el
@@ -595,6 +606,22 @@ impl MemoryGraph {
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            ) STRICT;
+
+            -- ────────── TABLA: gap_attempts (Paso 23) ──────────
+            -- Memoria de los vacíos que investigó el subconsciente: un par que
+            -- no produjo conocimiento se enfría antes de volver a intentarse.
+            -- El par se guarda ordenado (node_a < node_b); borrar un nodo
+            -- borra su historial.
+            CREATE TABLE IF NOT EXISTS gap_attempts (
+                node_a         TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                node_b         TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                -- Intentos improductivos consecutivos (0 tras uno productivo).
+                attempts       INTEGER NOT NULL,
+                last_outcome   TEXT NOT NULL,
+                last_attempt   INTEGER NOT NULL,
+                cooldown_until INTEGER NOT NULL,
+                PRIMARY KEY (node_a, node_b)
             ) STRICT;
         ")?;
         Ok(())
@@ -1082,6 +1109,102 @@ impl MemoryGraph {
     /// Los `k` nodos más cercanos a un vector ya calculado: `(id, coseno)`.
     pub fn nearest_nodes(&self, query_vec: &[f32], k: usize) -> Vec<(String, f32)> {
         self.index.borrow().search(query_vec, k)
+    }
+
+    /// Los `k` nodos más similares a un nodo del grafo, sin él mismo
+    /// (Paso 23). Vacío si el nodo aún no tiene vector.
+    pub fn similar_to_node(&self, id: &str, k: usize) -> Vec<(String, f32)> {
+        let index = self.index.borrow();
+        let Some(v) = index.vector(id) else { return Vec::new() };
+        index.search(v, k + 1).into_iter().filter(|(other, _)| other != id).take(k).collect()
+    }
+
+    /// `n` ids de nodo elegidos al azar (Paso 23).
+    ///
+    /// `ORDER BY RANDOM() LIMIT n` recorre la tabla una vez pero solo lee
+    /// ids: milisegundos con decenas de miles de nodos.
+    pub fn sample_random_node_ids(&self, n: usize) -> Result<Vec<String>, MemoryError> {
+        let mut stmt = self.conn.prepare("SELECT id FROM nodes ORDER BY RANDOM() LIMIT ?1")?;
+        let ids = stmt
+            .query_map(params![n as i64], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Id del nodo existente que nombra `text` (Paso 23): id exacto, id
+    /// canónico o id/nombre con la misma forma canónica
+    /// ("diagramas_de_clases" → "diagramas de clases"). `None` si el
+    /// concepto es nuevo.
+    ///
+    /// El último paso recorre la tabla: pensado para la consolidación del
+    /// subconsciente (pocas llamadas por ciclo), no para rutas calientes.
+    pub fn resolve_node_id(&self, text: &str) -> Result<Option<String>, MemoryError> {
+        let canon = canonical_id(text);
+        for candidate in [text.trim(), canon.as_str()] {
+            if self.node_exists(candidate)? {
+                return Ok(Some(candidate.to_string()));
+            }
+        }
+        let mut stmt = self.conn.prepare("SELECT id, name FROM nodes")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            if canonical_id(&id) == canon || canonical_id(&name) == canon {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Pares de vacíos en enfriamiento en el instante `now`, ordenados con
+    /// [`ordered_pair`] (Paso 23).
+    pub fn gap_pairs_cooling_down(&self, now: i64) -> Result<HashSet<(String, String)>, MemoryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_a, node_b FROM gap_attempts WHERE cooldown_until > ?1",
+        )?;
+        let pairs = stmt
+            .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(pairs)
+    }
+
+    /// Intentos improductivos consecutivos registrados para el par (Paso 23).
+    pub fn gap_attempts(&self, a: &str, b: &str) -> Result<u32, MemoryError> {
+        let (a, b) = ordered_pair(a, b);
+        let attempts: Option<i64> = self.conn
+            .query_row(
+                "SELECT attempts FROM gap_attempts WHERE node_a = ?1 AND node_b = ?2",
+                params![a, b],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(attempts.unwrap_or(0) as u32)
+    }
+
+    /// Registra el resultado de investigar un par y hasta cuándo se enfría
+    /// (Paso 23). `attempts` son los intentos improductivos consecutivos.
+    pub fn record_gap_attempt(
+        &self,
+        a:              &str,
+        b:              &str,
+        attempts:       u32,
+        outcome:        &str,
+        now:            i64,
+        cooldown_until: i64,
+    ) -> Result<(), MemoryError> {
+        let (a, b) = ordered_pair(a, b);
+        self.conn.execute(
+            "INSERT INTO gap_attempts (node_a, node_b, attempts, last_outcome, last_attempt, cooldown_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (node_a, node_b) DO UPDATE SET
+                 attempts = excluded.attempts,
+                 last_outcome = excluded.last_outcome,
+                 last_attempt = excluded.last_attempt,
+                 cooldown_until = excluded.cooldown_until",
+            params![a, b, attempts as i64, outcome, now, cooldown_until],
+        )?;
+        Ok(())
     }
 
     /// **Recuperación de contexto para el chat** (Paso 22).
@@ -2314,5 +2437,71 @@ mod tests {
         g.apply_decay_and_prune(0.001, 0.01).unwrap();
         let second = weight_of(&g, "a", "b");
         assert!((second - first).abs() < 0.01, "2.ª pasada: {first} → {second}");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Paso 23 — Soporte del subconsciente: muestreo, vecinos, intentos
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sample_random_node_ids_distinct_and_bounded() {
+        let g = in_memory_graph();
+        for i in 0..20 {
+            g.insert_node(&Node::new(&format!("n{i}"), "concept", "x")).unwrap();
+        }
+        let ids = g.sample_random_node_ids(8).unwrap();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 8, "sin repetidos");
+        assert_eq!(g.sample_random_node_ids(50).unwrap().len(), 20);
+
+        // Antes del Paso 23 el "muestreo" devolvía siempre los mismos nodos.
+        let distinct: HashSet<Vec<String>> = (0..10).map(|_| g.sample_random_node_ids(3).unwrap()).collect();
+        assert!(distinct.len() > 1, "diez muestras idénticas: no es aleatorio");
+    }
+
+    #[test]
+    fn test_similar_to_node_excludes_itself() {
+        let g = mock_graph(2);
+        for (id, v) in [("a", [1.0, 0.0]), ("b", [0.8, 0.6]), ("c", [0.0, 1.0])] {
+            let mut node = Node::new(id, "concept", id);
+            node.embedding = Some(v.to_vec());
+            g.insert_node(&node).unwrap();
+        }
+        let ids: Vec<String> = g.similar_to_node("a", 2).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["b", "c"]);
+        assert!(g.similar_to_node("fantasma", 2).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_node_id_by_canonical_form() {
+        let g = in_memory_graph();
+        g.insert_node(&Node::new("diagramas de clases", "concept", "diagramas de clases")).unwrap();
+        g.insert_node(&Node::new("fenix_flow", "concept", "Fénix Flow")).unwrap();
+
+        assert_eq!(g.resolve_node_id("diagramas de clases").unwrap().as_deref(), Some("diagramas de clases"));
+        assert_eq!(g.resolve_node_id("Diagramas_de_Clases").unwrap().as_deref(), Some("diagramas de clases"));
+        assert_eq!(g.resolve_node_id("Fénix Flow").unwrap().as_deref(), Some("fenix_flow"));
+        assert_eq!(g.resolve_node_id("herramientas_case").unwrap(), None);
+    }
+
+    #[test]
+    fn test_gap_attempts_cool_down_and_follow_node_deletion() {
+        let g = in_memory_graph();
+        for id in ["a", "b", "c"] {
+            g.insert_node(&Node::new(id, "concept", id)).unwrap();
+        }
+        g.record_gap_attempt("b", "a", 1, "no_triples", 100, 200).unwrap();
+        g.record_gap_attempt("a", "c", 0, "consolidated", 100, 150).unwrap();
+
+        assert_eq!(g.gap_attempts("a", "b").unwrap(), 1, "el orden del par no importa");
+        assert_eq!(g.gap_pairs_cooling_down(120).unwrap(),
+            HashSet::from([ordered_pair("a", "b"), ordered_pair("a", "c")]));
+        assert_eq!(g.gap_pairs_cooling_down(160).unwrap(), HashSet::from([ordered_pair("a", "b")]));
+
+        g.record_gap_attempt("a", "b", 2, "rejected", 300, 900).unwrap();
+        assert_eq!(g.gap_attempts("a", "b").unwrap(), 2, "upsert, no fila nueva");
+
+        g.delete_node("b").unwrap();
+        assert_eq!(g.gap_attempts("a", "b").unwrap(), 0, "ON DELETE CASCADE");
     }
 }

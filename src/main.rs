@@ -46,7 +46,7 @@ use ollama_backend::OllamaBackend;
 use priority::{BackgroundLlm, CognitivePriority, YieldEvent};
 use truth_filter::{BoxedSearch, MockSearchBackend, SearxngBackend};
 use forgetting_curve::{ForgettingConfig, ForgettingCurve};
-use subconscious::CuriosityEngine;
+use subconscious::{CuriosityEngine, CuriosityError, CycleBackoff};
 use api_server::{build_router, AppState, SubconsciousEvent};
 use fenix_tools::{ClientTool, InventoryTool};
 use tools::{TimeTool, ToolRegistry, WebhookTool};
@@ -323,7 +323,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let priority_sc = Arc::clone(&priority);
 
     tokio::spawn(async move {
-        println!("[subconsciente] Motor de curiosidad continuo iniciado (ciclo cada {}s)\n", subconscious::DEFAULT_CURIOSITY_INTERVAL_SECS);
+        println!(
+            "[subconsciente] Motor de curiosidad continuo iniciado (ciclo cada {}–{} s según lo que aprenda)\n",
+            subconscious::DEFAULT_CURIOSITY_INTERVAL_SECS,
+            subconscious::MAX_CURIOSITY_INTERVAL_SECS,
+        );
+        // Paso 23: el intervalo crece mientras los ciclos no aprendan nada.
+        let mut backoff = CycleBackoff::standard();
         loop {
             // Paso 21: no arrancar un ciclo mientras el usuario está activo.
             priority_sc.wait_idle().await;
@@ -334,7 +340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tx         = events_sc.clone();
 
             // spawn_blocking: CuriosityEngine::run_sleep_cycle es síncrono.
-            tokio::task::spawn_blocking(move || {
+            // Devuelve si el ciclo consolidó conocimiento nuevo.
+            let productive = tokio::task::spawn_blocking(move || {
                 // Closure de logging que emite SubconsciousEvent al canal WS.
                 // Si no hay clientes conectados, send() devuelve SendError
                 // que se descarta con let _ = ... (sin panic, Paso 9).
@@ -368,9 +375,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Se pasa el Mutex, no un guard: el lock se toma por fases (Paso 21).
                 let reports = engine.run_sleep_cycle(&*graph_ref, 1);
+                let mut productive = false;
                 for r in reports {
                     match r {
                         Ok(report) if !report.triples_consolidated.is_empty() => {
+                            productive = true;
                             let msg = format!(
                                 "✓ Aprendido: {}",
                                 report.triples_consolidated.join(", ")
@@ -382,6 +391,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         Ok(_)  => {} // Ciclo sin nuevas tripletas; silencioso.
+                        // Paso 23: sin vacíos elegibles el motor descansa; no es un error.
+                        Err(CuriosityError::NoEligibleGap) => {
+                            let msg = format!("💤 {}", CuriosityError::NoEligibleGap);
+                            println!("  [🧠 subconscious] {msg}");
+                            let _ = tx.send(SubconsciousEvent::new("Cycle", msg).to_json());
+                        }
                         Err(e) => {
                             let msg = format!("⚠ Error de ciclo: {}", e);
                             eprintln!("[subconsciente] {}", msg);
@@ -391,10 +406,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-            }).await.ok();
+                productive
+            }).await.unwrap_or(false);
 
-            // Espera cooperativa: ciclo continuo de 3s para aprendizaje acelerado.
-            tokio::time::sleep(std::time::Duration::from_secs(subconscious::DEFAULT_CURIOSITY_INTERVAL_SECS)).await;
+            // Paso 23: espera adaptativa, troceada en pasos del intervalo base
+            // para despertar en cuanto el grafo cambie por otra vía (el
+            // usuario enseña algo, la federación importa nodos).
+            backoff.record(productive);
+            if backoff.current() > backoff.base() {
+                let msg = format!(
+                    "💤 Sin conocimiento nuevo; próximo ciclo en {} s",
+                    backoff.current().as_secs()
+                );
+                println!("  [🧠 subconscious] {msg}");
+                let _ = events_sc.send(SubconsciousEvent::new("Cycle", msg).to_json());
+            }
+            let before = graph_signature(&graph_sc).await;
+            let deadline = tokio::time::Instant::now() + backoff.current();
+            while tokio::time::Instant::now() < deadline {
+                let step = backoff.base().min(deadline - tokio::time::Instant::now());
+                tokio::time::sleep(step).await;
+                if graph_signature(&graph_sc).await != before {
+                    backoff.reset();
+                    break;
+                }
+            }
         }
     });
 
@@ -427,11 +463,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // ── 6. Iniciar el servidor Axum ───────────────────────────────────────────
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    // SYNAPTOCORE_PORT permite levantar una segunda instancia (p. ej. sobre
+    // una copia de la base) sin detener la principal.
+    let port: u16 = std::env::var("SYNAPTOCORE_PORT").ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let router = build_router(state);
 
     println!("╔════════════════════════════════════════════════════════════════════╗");
-    println!("║  🧠 SynaptoCore API escuchando en http://127.0.0.1:8080           ║");
+    println!("║  🧠 SynaptoCore API escuchando en {:<33}║", format!("http://{addr}"));
     println!("║                                                                    ║");
     println!("║  Endpoints disponibles:                                            ║");
     println!("║    GET  /health                     → Estado del sistema          ║");
@@ -441,7 +482,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║    POST /api/v1/federation/export   → Delta incremental (24h)      ║");
     println!("║                                                                    ║");
     println!("║  Backend LLM: {:<52} ║", llm_label);
-    println!("║  Bucle subconsciente: continuo (cada 3s)                          ║");
+    println!("║  Bucle subconsciente: cada 3–60 s según lo que aprenda            ║");
     println!("║  Presiona Ctrl+C para detener.                                    ║");
     println!("╚════════════════════════════════════════════════════════════════════╝\n");
 
@@ -488,6 +529,16 @@ async fn attach_embeddings(graph: MemoryGraph) -> MemoryGraph {
 async fn attach_embeddings(graph: MemoryGraph) -> MemoryGraph {
     println!("ℹ Compilado sin la feature 'embeddings': recuperación léxica (LIKE)\n");
     graph
+}
+
+/// Huella barata del grafo (nodos, aristas) para que el bucle subconsciente
+/// detecte cambios hechos por otros mientras espera (Paso 23).
+async fn graph_signature(graph: &Arc<Mutex<MemoryGraph>>) -> Option<(u64, u64)> {
+    let graph = Arc::clone(graph);
+    tokio::task::spawn_blocking(move || {
+        let stats = graph.lock().ok()?.stats().ok()?;
+        Some((stats.node_count, stats.edge_count))
+    }).await.ok().flatten()
 }
 
 /// Espera la señal Ctrl+C para shutdown graceful.
@@ -656,6 +707,9 @@ mod integration_tests {
         graph.insert_node(&Node::new("rust",    "concept", "Rust")).unwrap();
         graph.insert_node(&Node::new("ml",      "concept", "ML")).unwrap();
         graph.insert_node(&Node::new("memoria", "concept", "Memoria")).unwrap();
+        // El muestreo es aleatorio (Paso 23): rust ↔ ml es el único vacío.
+        graph.insert_edge("rust", "usa", "memoria", 0.9).unwrap();
+        graph.insert_edge("ml", "usa", "memoria", 0.9).unwrap();
 
         let engine = CuriosityEngine::new_silent(
             MockLlmBackend::new(vec![
@@ -939,6 +993,9 @@ mod integration_tests {
             g.insert_node(&Node::new("rust",    "concept", "Rust")).unwrap();
             g.insert_node(&Node::new("ml",      "concept", "ML")).unwrap();
             g.insert_node(&Node::new("memoria", "concept", "Memoria")).unwrap();
+            // El muestreo es aleatorio (Paso 23): rust ↔ ml es el único vacío.
+            g.insert_edge("rust", "usa", "memoria", 0.9).unwrap();
+            g.insert_edge("ml", "usa", "memoria", 0.9).unwrap();
         }
         let llm = LockProbeLlm::new(&graph, vec![
             r#"{"question":"¿Puede Rust ejecutar ML?","reasoning":"Interop técnica."}"#,
