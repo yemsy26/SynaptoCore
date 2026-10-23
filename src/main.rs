@@ -33,6 +33,7 @@ mod forgetting_curve;
 mod importer;
 mod investigation;
 mod llm_bridge;
+mod math_tools;
 mod memory_graph;
 mod ollama_backend;
 mod priority;
@@ -293,9 +294,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // WebhookTool: GET HTTP a una URL.
     // Paso 25: los sistemas externos (ERP, CRM, motores de cálculo…) se
     // declaran en conectores.json; el núcleo no depende de ninguno.
+    // Paso 29: cálculo exacto, conjeturas comprobadas y sucesiones.
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(TimeTool);
     tool_registry.register(WebhookTool);
+    tool_registry.register(math_tools::Calculadora);
+    tool_registry.register(math_tools::Conjetura);
+    tool_registry.register(math_tools::Sucesion);
     for connector in tokio::task::spawn_blocking(load_declared_connectors).await? {
         tool_registry.register(connector);
     }

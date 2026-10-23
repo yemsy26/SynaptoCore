@@ -12,13 +12,14 @@ SynaptoCore es un sistema de memoria semántica persistente con razonamiento aut
 2. [Requisitos](#requisitos)
 3. [Instalación y primer arranque](#instalación-y-primer-arranque)
 4. [Configuración (.env)](#configuración-env)
-5. [Importar conocimiento por lotes](#importar-conocimiento-por-lotes)
-6. [Investigación profunda](#investigación-profunda)
-7. [API REST](#api-rest)
-8. [CLI — sc](#cli--sc)
-9. [Memoria Federada (.synapse)](#memoria-federada-synapse)
-10. [Features opcionales](#features-opcionales)
-11. [Compilación de producción](#compilación-de-producción)
+5. [Herramientas matemáticas](#herramientas-matemáticas)
+6. [Importar conocimiento por lotes](#importar-conocimiento-por-lotes)
+7. [Investigación profunda](#investigación-profunda)
+8. [API REST](#api-rest)
+9. [CLI — sc](#cli--sc)
+10. [Memoria Federada (.synapse)](#memoria-federada-synapse)
+11. [Features opcionales](#features-opcionales)
+12. [Compilación de producción](#compilación-de-producción)
 
 ---
 
@@ -221,6 +222,35 @@ elige URLs. Los secretos van en variables de entorno y se citan como `${NOMBRE}`
 Plantilla completa en `conectores.example.json`. Con `POST`, los parámetros se envían como JSON. Un
 conector mal declarado (URL con un `{parámetro}` sin describir, variable de entorno ausente) se omite al
 arrancar con su motivo; los demás siguen funcionando.
+
+## Herramientas matemáticas
+
+El modelo de 2B no calcula bien, así que las preguntas de cálculo van a tres herramientas que responden
+por sí mismas, sin que el modelo reescriba el resultado. El planificador traduce la pregunta a una
+expresión y la respuesta la repite, para que se vea qué se calculó:
+
+| Pregunta | Herramienta | Respuesta |
+|----------|-------------|-----------|
+| ¿Cuánto es 2^100? | `Calculadora` | `2^100 = 1267650600228229401496703205376 (exacto)` |
+| ¿Cuántas combinaciones de 6 números hay en una lotería de 49? | `Calculadora` | `C(49,6) = 13983816 (exacto)` |
+| ¿Es primo 2^61-1? | `Calculadora` | `esprimo(2^61-1) = verdadero` |
+| comprueba que n^2+n+41 es primo para n de 0 a 100 | `Conjetura` | `«esprimo(n^2+n+41)» es falsa: falla en n = 40 (…). No es primo: 1681 = 41^2.` |
+| ¿qué número sigue en 2, 6, 12, 20, 30? | `Sucesion` | `… los siguientes términos serían 42, 56, 72. Fórmula: a(n) = n^2 + n …` |
+
+- **Calculadora**: enteros de cualquier tamaño y fracciones exactas (`0.1 + 0.2 == 0.3` es verdadero).
+  Operadores `+ - * / ^ ! %` y `mod`, comparaciones, `and`/`or`/`not`; funciones `raiz`, `abs`, `piso`,
+  `techo`, `redondear`, `mcd`, `mcm`, `C(n,k)`, `fib`, `esprimo` (Miller–Rabin: exacto hasta 3,3·10²⁴,
+  «primo probable» por encima), `factoriza`, `suma(k^2,k,1,10)`, `producto(k,k,1,5)`, y las reales
+  `sin cos tan asin acos atan ln log log10 log2 exp` con `pi` y `e` (resultado marcado como aproximado).
+- **Conjetura**: evalúa una afirmación sobre una variable para cada valor de un rango (por defecto 1–1000,
+  máximo 100 000) y da el primer contraejemplo con su motivo. Si se cumple, lo dice como lo que es: una
+  comprobación numérica en ese rango, no una demostración.
+- **Sucesion**: busca una fórmula polinómica (diferencias finitas), geométrica o de recurrencia de dos
+  términos que confirme al menos un término de sobra y predice los tres siguientes; también es una conjetura.
+
+Límites: 400 caracteres por expresión, ~120 000 cifras por número, 3 s por cálculo (6 s por conjetura).
+Lo que el planificador plantea mal (`C(8,1)` para ordenar 8 libros, en lugar de `8!`) no se puede
+corregir aquí, pero queda a la vista en la respuesta.
 
 ## Importar conocimiento por lotes
 

@@ -133,6 +133,14 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 async-stream = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std", "async-await"] }
 
+# ── Paso 29: Herramientas matemáticas ────────────────────────────────────────
+# Enteros de tamaño arbitrario y fracciones exactas para Calculadora, Conjetura
+# y Sucesion. Ya estaban en el árbol como dependencias transitivas.
+num-bigint   = "0.4"
+num-rational = "0.4"
+num-integer  = "0.1"
+num-traits   = "0.2"
+
 # ── Binarios adicionales ──────────────────────────────────────────────────────
 [[bin]]
 name = "sc"

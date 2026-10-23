@@ -76,7 +76,8 @@ pub fn tool_answer_system_prompt() -> &'static str {
 respuesta actual del sistema que se consultó para esta pregunta: son datos reales y vigentes. Responde \
 la pregunta directamente con esos valores (cifras, nombres, estados), en el idioma de la pregunta, de \
 forma clara y breve. Usa la memoria solo si añade algo. Si los datos son un error o no contienen lo que \
-se pregunta, dilo claramente. No inventes datos."
+se pregunta, dilo claramente. No inventes datos. Copia los números exactamente como aparecen, sin \
+redondearlos ni acortarlos, y si los datos dicen que algo es una comprobación y no una demostración, dilo así."
 }
 
 /// Formatea el contexto de vecinos del grafo para inyección en el prompt.
@@ -325,8 +326,8 @@ CAMPOS:
 1. "i" (intención): por defecto "query". Usa "learn" SOLO si el mensaje afirma un hecho nuevo ("Rust es un lenguaje compilado", "PostgreSQL usa MVCC") o pide memorizar algo ("Memoriza que la sucursal abre a las 9"). Preguntas (aunque no lleven signos), peticiones ("Explícame…", "Háblame de…", "Dime…", "Cuéntame…"), saludos y conversación son SIEMPRE "query". Si dudas, "query".
 2. "q" (consulta reescrita): el mensaje reescrito de forma autocontenida, sustituyendo pronombres, referencias ("eso", "ese producto") o el sujeto omitido ("Y cómo afecta al sueño") por lo que indique el historial. Si ya es autocontenido, cópialo igual. Mismo idioma.
 3. "e" (entidades): de 1 a 4 conceptos clave del mensaje, en minúsculas y sin artículos ("postgresql", "cortisol", "inteligencia artificial"). Lista vacía si no hay ninguno (por ejemplo, un saludo).
-4. "t" (herramienta): usa una herramienta SOLO si la pregunta pide datos que esa herramienta proporciona según su descripción (datos en tiempo real, de un sistema conectado, fecha/hora actual). Para conocimiento general responde "none".
-5. "p" (parámetros): parámetros de la herramienta según su esquema, o {{}} si "t" es "none".
+4. "t" (herramienta): usa una herramienta SOLO si la pregunta pide datos que esa herramienta proporciona según su descripción (datos en tiempo real, de un sistema conectado, fecha/hora actual) o un cálculo matemático (operaciones, primos, comprobar una afirmación sobre números, continuar una sucesión). Para conocimiento general responde "none".
+5. "p" (parámetros): parámetros de la herramienta según su esquema, o {{}} si "t" es "none". Las expresiones matemáticas se escriben con la sintaxis de la herramienta (2^100, 37!, esprimo(n)).
 
 HERRAMIENTAS DISPONIBLES:
 {tool_descriptions}
@@ -347,6 +348,14 @@ Mensaje: "Explícame qué hace Kubernetes"
 Historial: User: ¿Qué es PostgreSQL? / Assistant: Una base de datos relacional.
 Mensaje: "¿En qué lenguaje está hecho?"
 {{"i":"query","q":"¿En qué lenguaje está hecho PostgreSQL?","e":["postgresql","lenguaje de programación"],"t":"none","p":{{}}}}
+
+Historial: (vacío)
+Mensaje: "¿De cuántas formas puedo elegir 5 cartas de una baraja de 52?"
+{{"i":"query","q":"¿De cuántas formas puedo elegir 5 cartas de una baraja de 52?","e":[],"t":"Calculadora","p":{{"expresion":"C(52,5)"}}}}
+
+Historial: (vacío)
+Mensaje: "¿Es cierto que n^2+n+41 siempre da un primo?"
+{{"i":"query","q":"¿Es cierto que n^2+n+41 siempre da un primo?","e":[],"t":"Conjetura","p":{{"afirmacion":"esprimo(n^2+n+41)"}}}}
 
 Historial: (vacío)
 Mensaje: "Hola, buenos días"
@@ -716,7 +725,7 @@ mod tests {
 
         let (_, examples) = p.split_once("EJEMPLOS:").expect("sección de ejemplos");
         let examples: Vec<&str> = examples.lines().filter(|l| l.starts_with('{')).collect();
-        assert_eq!(examples.len(), 5);
+        assert_eq!(examples.len(), 7);
         for ex in examples {
             let v: serde_json::Value = serde_json::from_str(ex).expect(ex);
             let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();

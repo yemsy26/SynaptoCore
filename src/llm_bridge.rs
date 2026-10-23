@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use crate::error::MemoryError;
 use crate::memory_graph::{canonical_id, embed_texts, EdgeWrite, GraphAccess, MemoryGraph, RetrievalConfig};
 use crate::prompts;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolError, ToolRegistry};
 use crate::truth_filter::{BoxedSearch, SearchBackend, SearchHit};
 use crate::types::{EdgeOrigin, Node, Provenance};
 
@@ -334,6 +334,10 @@ pub struct PreparedAnswer {
     pub memory_context:   String,
     /// Fuentes citables (modo `Research`), en el orden de sus números [n].
     pub sources:          Vec<SearchHit>,
+    /// Paso 29: respuesta ya hecha por una herramienta que responde por sí
+    /// misma (cálculo exacto). `answer`/`answer_stream` la devuelven sin
+    /// llamar al modelo.
+    pub direct:           Option<String>,
 }
 
 
@@ -784,6 +788,17 @@ impl<B: LlmBackend> NeuralBridge<B> {
         plan:  &Plan,
     ) -> Result<PreparedAnswer, BridgeError> {
         // ── 1. Herramienta (una sola: el planificador ya eligió) ────────
+        if let Some(direct) = plan.tool.as_ref().and_then(|call| self.run_direct_tool(call)) {
+            return Ok(PreparedAnswer {
+                user_prompt:      String::new(),
+                context_edge_ids: Vec::new(),
+                mode:             AnswerMode::Tool,
+                uncovered:        Vec::new(),
+                memory_context:   String::new(),
+                sources:          Vec::new(),
+                direct:           Some(direct),
+            });
+        }
         let tool_output = plan.tool.as_ref().map(|call| self.run_tool(call));
 
         // ── 2. Vectorizar las sondas fuera del lock ─────────────────────
@@ -834,6 +849,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             uncovered: context.uncovered,
             memory_context: graph_context,
             sources: Vec::new(),
+            direct: None,
         })
     }
 
@@ -849,6 +865,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             uncovered:        Vec::new(),
             memory_context:   String::new(),
             sources:          Vec::new(),
+            direct:           None,
         }
     }
 
@@ -930,10 +947,29 @@ impl<B: LlmBackend> NeuralBridge<B> {
         }
     }
 
+    /// Ejecuta la herramienta si responde por sí misma (Paso 29). Un error
+    /// también se entrega tal cual: el modelo intentaría calcularlo él.
+    fn run_direct_tool(&self, call: &ToolCall) -> Option<String> {
+        let tool = self.tool_registry.as_ref()?.get(&call.name)?;
+        if !tool.answers_directly() {
+            return None;
+        }
+        Some(match tool.execute(call.params.clone()) {
+            Ok(output) => output,
+            Err(ToolError::Execution(e) | ToolError::InvalidInput(e) | ToolError::Network(e)) => {
+                log::warn!("Herramienta '{}' falló: {e}", call.name);
+                format!("No pude calcularlo: {e}.")
+            }
+        })
+    }
+
     /// Inferencia final (sin streaming). El prompt del sistema depende del
     /// modo; en modo `General` el servidor antepone la etiqueta de "no
     /// verificado" (no se confía en que el modelo la escriba).
     pub fn answer(&self, prepared: &PreparedAnswer) -> Result<String, BridgeError> {
+        if let Some(direct) = &prepared.direct {
+            return Ok(direct.clone());
+        }
         let text = self.backend.complete(
             prepared.mode.system_prompt(),
             &prepared.user_prompt,
@@ -949,6 +985,9 @@ impl<B: LlmBackend> NeuralBridge<B> {
     /// Inferencia final como stream de tokens (SSE). Igual que `answer`.
     pub fn answer_stream(&self, prepared: &PreparedAnswer) -> Result<BoxedTokenStream, BridgeError> {
         use futures_util::StreamExt;
+        if let Some(direct) = prepared.direct.clone() {
+            return Ok(Box::pin(futures_util::stream::once(async { Ok(direct) })));
+        }
         let stream = self.backend.stream_synthesis(
             prepared.mode.system_prompt(),
             &prepared.user_prompt,
@@ -2061,6 +2100,34 @@ Espero que sea útil."#;
         assert_eq!(prepared.mode, AnswerMode::Research);
         assert!(prepared.context_edge_ids.is_empty(), "una respuesta de la web no refuerza la memoria");
         assert!(bridge.backend.user_prompts()[2].contains("titanio es metal ligero"), "memoria + fuentes");
+    }
+
+    fn math_bridge(expression: &str) -> NeuralBridge<MockLlmBackend> {
+        let plan = serde_json::json!({
+            "i": "query", "q": "¿Cuánto es?", "e": [], "t": "Calculadora", "p": { "expresion": expression }
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(crate::math_tools::Calculadora);
+        NeuralBridge::new(MockLlmBackend::new(vec![plan.to_string()])).with_tools(Arc::new(registry))
+    }
+
+    #[tokio::test]
+    async fn test_math_tool_answers_without_synthesis() {
+        use futures_util::StreamExt;
+        let graph = cortisol_graph();
+        let bridge = math_bridge("2^10");
+        let (answer, prepared) = bridge.ask(&graph, "¿Cuánto es 2 elevado a 10?", "").unwrap();
+
+        assert_eq!(answer, "2^10 = 1024 (exacto)");
+        assert_eq!(prepared.mode, AnswerMode::Tool);
+        assert!(!bridge.research_first(&prepared));
+        assert_eq!(bridge.backend.call_count(), 1, "solo el planificador: la cifra no pasa por el modelo");
+        let tokens: Vec<String> = bridge.answer_stream(&prepared).unwrap()
+            .map(|t| t.unwrap()).collect().await;
+        assert_eq!(tokens.concat(), "2^10 = 1024 (exacto)");
+
+        let (failed, _) = math_bridge("2^").ask(&graph, "¿Cuánto es 2 elevado a?", "").unwrap();
+        assert_eq!(failed, "No pude calcularlo: «2^»: la expresión está incompleta.");
     }
 
     #[tokio::test]

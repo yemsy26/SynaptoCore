@@ -70,6 +70,13 @@ pub trait Tool: Send + Sync {
     /// - `Ok(String)`: resultado legible por el LLM.
     /// - `Err(ToolError)`: fallo que se inyectará como contexto de error.
     fn execute(&self, input: Value) -> Result<String, ToolError>;
+
+    /// Paso 29: la salida ya es la respuesta, redactada y exacta, y se
+    /// entrega tal cual. Si pasara por el modelo de síntesis, el 2B
+    /// recalcularía las cifras y las estropearía.
+    fn answers_directly(&self) -> bool {
+        false
+    }
 }
 
 // ──────────────────────────────────────────────────────────────

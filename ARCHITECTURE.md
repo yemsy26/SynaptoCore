@@ -157,8 +157,13 @@ respuesta → usuario
 | `TimeTool` | `{}` | Fecha/hora actual del sistema (LLMs no tienen noción del tiempo) |
 | `WebhookTool` | `{"url": "..."}` | GET HTTP a sistemas externos. Timeout 10s. |
 | Conectores (`connectors.rs`) | los `params` declarados | Cualquier API HTTP declarada en `conectores.json` (Paso 25) |
+| `Calculadora` (`math_tools.rs`) | `{"expresion": "..."}` | Cálculo exacto: enteros de cualquier tamaño, fracciones, primos, factorización, combinatoria (Paso 29) |
+| `Conjetura` (`math_tools.rs`) | `{"afirmacion": "...", "desde": 1, "hasta": 1000}` | Comprueba una afirmación sobre n en un rango y da el primer contraejemplo (Paso 29) |
+| `Sucesion` (`math_tools.rs`) | `{"terminos": "..."}` | Fórmula polinómica, geométrica o de recurrencia que confirmen los términos dados, y los siguientes (Paso 29) |
 
 Conectar un sistema externo no requiere código: se declara en `conectores.json` (ver README, «Conectores externos»). Para una herramienta con lógica propia, implementar `trait Tool` y llamar `tool_registry.register(MiHerramienta)` en `main.rs`.
+
+**Respuesta directa** (Paso 29): una herramienta cuyo `answers_directly()` devuelve `true` entrega su salida como respuesta, sin pasar por el modelo de síntesis (`PreparedAnswer.direct`). Las tres matemáticas lo hacen: al parafrasear, el 2B recalculaba las cifras y las estropeaba (convertía `a(n) = n^2 + n` en «el siguiente es 930»). La respuesta repite la expresión evaluada, así que un planteamiento erróneo del planificador (`C(8,1)` en lugar de `8!`) queda a la vista. El evaluador es propio (sin `eval`), con límites de tamaño (~120 000 cifras), pasos y tiempo (3 s; 6 s en conjeturas).
 
 ---
 
