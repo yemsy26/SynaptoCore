@@ -13,11 +13,12 @@ SynaptoCore es un sistema de memoria semántica persistente con razonamiento aut
 3. [Instalación y primer arranque](#instalación-y-primer-arranque)
 4. [Configuración (.env)](#configuración-env)
 5. [Importar conocimiento por lotes](#importar-conocimiento-por-lotes)
-6. [API REST](#api-rest)
-7. [CLI — sc](#cli--sc)
-8. [Memoria Federada (.synapse)](#memoria-federada-synapse)
-9. [Features opcionales](#features-opcionales)
-10. [Compilación de producción](#compilación-de-producción)
+6. [Investigación profunda](#investigación-profunda)
+7. [API REST](#api-rest)
+8. [CLI — sc](#cli--sc)
+9. [Memoria Federada (.synapse)](#memoria-federada-synapse)
+10. [Features opcionales](#features-opcionales)
+11. [Compilación de producción](#compilación-de-producción)
 
 ---
 
@@ -253,6 +254,31 @@ Medido (release, CPU): 7 405 relaciones de 195 países en 1,6 s (+5,3 MB); 300 0
 con 147 000 conceptos en 186 s (≈1 600 líneas/s, ≈3 KB por concepto con sus relaciones, pico de 840 MB).
 Con ese grafo el servidor arranca en 2,7 s con 725 MB de RAM y responde desde la memoria en ≈1 s.
 
+## Investigación profunda
+
+Para preguntas que piden más que un dato. Desde el botón **Investigar** del dashboard (o por la API) le das un
+objetivo y trabaja en segundo plano, por rondas:
+
+1. **Preguntas**: divide el objetivo en preguntas de búsqueda; en rondas siguientes, pregunta por lo que sigue sin resolver.
+2. **Fuentes**: busca cada pregunta en SearXNG; cada fuente recibe un número estable [n].
+3. **Hipótesis**: propone respuestas posibles al objetivo.
+4. **Evidencias**: busca a favor y en contra de cada hipótesis y la juzga citando fuentes: *apoyada*, *refutada* o *sin confirmar*.
+5. Para cuando una hipótesis queda apoyada con certeza ≥ 0,7 o se agotan las rondas (3 por defecto, hasta 5),
+   redacta la conclusión con citas y aprende en el grafo lo verificado.
+
+Para que un veredicto cuente, el modelo tiene que citar fuentes que vio, con certeza ≥ 0,6 y sin fuentes en
+conflicto. Además, una hipótesis apoyada que nombra algo (p. ej. un producto) debe tenerlo en las fuentes que cita.
+Si no, queda «sin confirmar»: preferimos un «no concluyente» a una conclusión falsa.
+
+- Una investigación a la vez; mientras dura, el subconsciente espera y el chat sigue teniendo prioridad sobre el LLM.
+- El estado se guarda tras cada paso: el panel lo muestra en vivo y sobrevive a un reinicio (queda «interrumpida»).
+- Si SearXNG no responde (motores limitados), reintenta a los 20 s y a los 60 s antes de rendirse.
+- Medido: «¿Quién descubrió la penicilina y en qué año?» se resolvió en 19 s (3 hipótesis apoyadas con fuentes,
+  3 hechos aprendidos); el chat respondió en 0,9 s mientras tanto.
+
+Una investigación hace entre 5 y 15 búsquedas. Si SearXNG solo tiene activos brave, duckduckgo y google cse,
+estos motores se suspenden por exceso de peticiones; conviene activar más motores en `searxng-settings.yml`.
+
 ## API REST
 
 Base URL: `http://localhost:8080`
@@ -344,6 +370,17 @@ Vecinos directos de un nodo (útil para explorar el grafo localmente).
 
 ```bash
 curl "http://localhost:8080/api/v1/graph/neighbors/postgresql"
+```
+
+### Investigaciones (Paso 28)
+
+```bash
+curl -X POST http://localhost:8080/api/v1/investigations \
+  -H "Content-Type: application/json" \
+  -d '{"objective": "¿Quién descubrió la penicilina y en qué año?", "rounds": 3}'   # 202 · 409 si ya hay una · 503 sin SearXNG
+curl http://localhost:8080/api/v1/investigations                 # lista (resumen)
+curl http://localhost:8080/api/v1/investigations/{id}            # preguntas, fuentes, hipótesis, conclusión, aprendido
+curl -X POST http://localhost:8080/api/v1/investigations/{id}/cancel
 ```
 
 ### `POST /api/v1/federation/export`

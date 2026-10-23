@@ -532,6 +532,68 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
 }
 
 /* ================================================================
+   INVESTIGACIÓN PROFUNDA (Paso 28) — panel lateral
+   ================================================================ */
+.drawer {
+  position: fixed; top: 12px; right: 12px; bottom: 12px; z-index: 40;
+  width: min(560px, calc(100vw - 24px)); display: flex; flex-direction: column;
+  background: linear-gradient(180deg, rgba(20,27,46,.95), rgba(9,13,25,.97));
+  transform: translateX(calc(100% + 24px)); visibility: hidden;
+  transition: transform .3s ease, visibility 0s linear .3s;
+}
+.drawer.open { transform: none; visibility: visible; transition: transform .3s ease; }
+.drawer .panel-head .icon { color: var(--violet); }
+.inv-form { display: grid; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.inv-form textarea {
+  width: 100%; min-height: 58px; resize: vertical; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--line-2); background: rgba(255,255,255,.03); color: var(--text); font: inherit; font-size: 13px;
+}
+.inv-form textarea:focus { outline: none; border-color: rgba(167,139,250,.55); box-shadow: 0 0 0 4px rgba(167,139,250,.1); }
+.inv-form-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-3); }
+.inv-form-row select {
+  height: 26px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--line-2);
+  background: var(--glass-strong); color: var(--text); font: inherit; font-size: 12px;
+}
+.inv-form-row .spacer, .inv-status .spacer { flex: 1; }
+.inv-scroll { flex: 1; overflow-y: auto; padding: 14px; display: grid; gap: 16px; align-content: start; }
+.inv-scroll section { display: grid; gap: 6px; }
+.inv-empty { margin: 0; padding: 18px 6px; color: var(--text-3); font-size: 12.5px; line-height: 1.5; text-align: center; }
+.inv-objective { font-size: 15px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+.inv-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--text-2); }
+.inv-chip { padding: 1px 8px; border-radius: 999px; font: 600 10.5px var(--mono); letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+.inv-chip[data-s="running"] { color: var(--cyan-2); background: rgba(34,211,238,.12); }
+.inv-chip[data-s="done"] { color: var(--emerald); background: rgba(52,211,153,.12); }
+.inv-chip[data-s="failed"], .inv-chip[data-s="cancelled"], .inv-chip[data-s="interrupted"] { color: var(--amber); background: rgba(251,191,36,.12); }
+.inv-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--cyan); animation: spin .8s linear infinite; }
+.inv-sec { font: 10.5px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--text-3); }
+.inv-conclusion { font-size: 13.5px; line-height: 1.55; }
+.inv-conclusion p { margin: 0 0 6px; }
+.inv-hyps { display: grid; gap: 8px; }
+.hyp { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 12px; background: rgba(255,255,255,.02); }
+.hyp[data-v="supported"] { border-color: rgba(52,211,153,.35); }
+.hyp[data-v="refuted"] { border-color: rgba(251,113,133,.3); }
+.hyp-top { display: flex; align-items: center; gap: 10px; }
+.hyp-text { font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+.hyp-why { font-size: 12px; line-height: 1.45; color: var(--text-3); }
+.inv-questions, .inv-learned { display: flex; flex-wrap: wrap; gap: 6px; }
+.inv-q { padding: 3px 8px; border-radius: 8px; border: 1px solid var(--line); background: rgba(255,255,255,.03); font-size: 11.5px; color: var(--text-2); }
+.inv-fact { padding: 2px 7px; border-radius: 6px; font: 11px var(--mono); color: var(--emerald); background: rgba(52,211,153,.08); overflow-wrap: anywhere; }
+.inv-sources summary { cursor: pointer; }
+.inv-sources ol { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; }
+.inv-sources a { color: var(--cyan-2); text-decoration: none; overflow-wrap: anywhere; }
+.inv-sources a:hover { text-decoration: underline; }
+.inv-sources .host { color: var(--text-3); font-size: 11px; }
+.inv-error { margin: 0; color: #fecdd3; font-size: 12.5px; }
+.inv-history { display: grid; gap: 6px; }
+.inv-history-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; text-align: left;
+  border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.02); color: var(--text-2); font-size: 12.5px;
+}
+.inv-history-item:hover, .inv-history-item[aria-current="true"] { border-color: rgba(167,139,250,.45); color: var(--text); }
+.inv-history-item .obj { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.inv-history-item .when { font: 11px var(--mono); color: var(--text-3); }
+
+/* ================================================================
    RESPONSIVE
    ================================================================ */
 @media (max-width: 1480px) { .kpi--opt { display: none; } }
@@ -558,6 +620,7 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
   .graph-legend { display: none; }
   .inspector { left: 12px; right: 12px; width: auto; top: 62px; max-height: calc(100% - 76px); }
   .bubble, .learn-card { max-width: 92%; }
+  .drawer { top: 0; right: 0; bottom: 0; width: 100vw; border-radius: 0; }
 }
 @media (max-width: 420px) {
   .tab { font-size: 12.5px; }
@@ -613,6 +676,7 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
     </div>
 
     <div class="actions">
+      <button class="btn" id="btn-investigate" data-icon="bulb" title="Investigación profunda con hipótesis y evidencias"><span class="btn-label">Investigar</span></button>
       <button class="btn btn-primary" id="btn-teach" data-icon="book"><span class="btn-label">Enseñar</span></button>
       <button class="btn btn-icon" id="btn-refresh" data-icon="refresh" title="Sincronizar grafo y métricas" aria-label="Sincronizar"></button>
     </div>
@@ -790,6 +854,37 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
   </div>
 </div>
 
+<!-- ============================================================
+     INVESTIGACIÓN PROFUNDA (Paso 28) — /api/v1/investigations
+     ============================================================ -->
+<aside class="drawer glass" id="inv-drawer" aria-labelledby="inv-title" aria-hidden="true">
+  <div class="panel-head">
+    <span data-icon="bulb"></span>
+    <div>
+      <div class="panel-title" id="inv-title">Investigación profunda</div>
+      <div class="panel-sub">Preguntas · hipótesis · evidencias · conclusión</div>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn btn-sm btn-square" id="inv-close" data-icon="x" title="Cerrar (Esc)" aria-label="Cerrar"></button>
+  </div>
+  <form class="inv-form" id="inv-form">
+    <textarea id="inv-objective" rows="2" maxlength="500" aria-label="Objetivo de la investigación"
+      placeholder="¿Qué quieres que investigue a fondo? Ej.: ¿Qué ERP de código abierto sirven para una farmacia?"></textarea>
+    <div class="inv-form-row">
+      <label for="inv-rounds">Rondas</label>
+      <select id="inv-rounds">
+        <option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option>
+      </select>
+      <span class="spacer"></span>
+      <button class="btn btn-primary btn-sm" id="inv-start" type="submit" data-icon="search">Investigar</button>
+    </div>
+  </form>
+  <div class="inv-scroll">
+    <div id="inv-detail"></div>
+    <div id="inv-history"></div>
+  </div>
+</aside>
+
 <div class="toast glass" id="toast" role="status"></div>
 
 <script>
@@ -902,7 +997,7 @@ const ORIGIN_LABEL = {
 function originTag(e) {
   const label = ORIGIN_LABEL[e.data('origin')];
   if (!label) return '';
-  const src = e.data('source');
+  const src = e.data('sourceRef');
   return ` <span class="rel-origin"${src ? ` title="${escapeHtml(src)}"` : ''}>· ${label}</span>`;
 }
 
@@ -1102,7 +1197,8 @@ function applySnapshot(data) {
       const ex = cy.getElementById(e.id);
       if (ex.nonempty()) {
         ex.removeClass('dying');
-        ex.data({ origin: e.origin, source: e.source });
+        // `source` es el nodo de origen para Cytoscape: la procedencia va en `sourceRef`.
+        ex.data({ origin: e.origin, sourceRef: e.source });
         const prev = ex.data('weight');
         if (Math.abs(prev - e.weight) > 1e-4) {
           ex.data('weight', e.weight);
@@ -1112,7 +1208,7 @@ function applySnapshot(data) {
       }
       addedEdges.merge(cy.add({
         group: 'edges',
-        data: { id: e.id, source: e.source_id, target: e.target_id, weight: e.weight, relation: e.relation, created: e.created_at, accessed: e.last_accessed, origin: e.origin, source: e.source },
+        data: { id: e.id, source: e.source_id, target: e.target_id, weight: e.weight, relation: e.relation, created: e.created_at, accessed: e.last_accessed, origin: e.origin, sourceRef: e.source },
       }));
     }
   });
@@ -1359,6 +1455,7 @@ function interpret(evt) {
   if (/Pausa cognitiva/.test(m)) return { kind: 'yield-pause', text: m.replace(/^⏸\s*/, '') };
   if (/^▶ Reanudado tras/.test(m)) return { kind: 'yield-resume', text: m.replace(/^▶\s*/, '') };
   if (/^📚/.test(m)) return { kind: 'research', text: m.replace(/^📚\s*/, '') };
+  if (/^🔎/.test(m)) return { kind: 'investigation', text: m.replace(/^🔎\s*/, '') };
   if (evt.event_type === 'Error' || /^⚠/.test(m)) return { kind: 'warn', text: m.replace(/^⚠\s*/, '') };
   return { kind: 'info', text: m };
 }
@@ -1434,6 +1531,10 @@ function handleSubEvent(evt) {
       endCycle(false);
       break;
     }
+    case 'investigation':
+      if (inv.open) refreshInvestigation();
+      if (/^✓ Investigación completa/.test(it.text)) scheduleGraph();
+      break;
     case 'yield-pause':
       $('#pipeline').classList.add('is-paused');
       $('#think-stage').textContent = 'en pausa · prioridad al chat';
@@ -1542,6 +1643,7 @@ const EV_META = {
   'yield-resume':  { tag: 'Prioridad',     tone: 'cyan',    ico: 'play',   group: 'system' },
   'info':          { tag: 'Sistema',       tone: '',        ico: 'info',   group: 'system' },
   'research':      { tag: 'Investigación', tone: 'cyan',    ico: 'globe',  group: 'research' },
+  'investigation': { tag: 'Investigación', tone: 'violet',  ico: 'bulb',   group: 'research' },
 };
 
 function eventHtml(it, evt) {
@@ -1992,6 +2094,177 @@ async function submitTeach() {
 }
 
 // ================================================================
+// INVESTIGACIÓN PROFUNDA (Paso 28)
+// ================================================================
+const INV_STATUS = { running: 'En curso', done: 'Completa', cancelled: 'Cancelada', failed: 'Fallida', interrupted: 'Interrumpida' };
+const VERDICT = {
+  supported: { label: 'Apoyada',       cls: 'verdict--ok',  color: 'var(--emerald)' },
+  refuted:   { label: 'Refutada',      cls: 'verdict--bad', color: 'var(--rose)' },
+  uncertain: { label: 'Sin confirmar', cls: 'verdict--mid', color: 'var(--amber)' },
+  pending:   { label: 'Pendiente',     cls: '',             color: 'var(--text-3)' },
+};
+const inv = { open: false, current: null, data: null, timer: null };
+
+function openInvestigations() {
+  inv.open = true;
+  const d = $('#inv-drawer');
+  d.classList.add('open');
+  d.setAttribute('aria-hidden', 'false');
+  loadInvestigations();
+  if (inv.data?.status !== 'running') setTimeout(() => $('#inv-objective').focus(), 60);
+}
+
+function closeInvestigations() {
+  inv.open = false;
+  clearTimeout(inv.timer);
+  const d = $('#inv-drawer');
+  d.classList.remove('open');
+  d.setAttribute('aria-hidden', 'true');
+}
+
+async function apiError(r) {
+  try { return (await r.json()).error || `HTTP ${r.status}`; } catch { return `HTTP ${r.status}`; }
+}
+
+async function loadInvestigations() {
+  try {
+    const r = await fetch(`${API}/api/v1/investigations`);
+    if (!r.ok) throw new Error(await apiError(r));
+    const list = await r.json();
+    renderHistory(list);
+    if (inv.current) await showInvestigation(inv.current);
+    else if (list.length) await showInvestigation(list[0].id);
+    else renderInvestigation(null);
+  } catch (e) {
+    $('#inv-history').innerHTML = `<p class="inv-error">No se pudo cargar el historial: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+/** Carga una investigación y, mientras siga en curso, la vuelve a pedir. */
+async function showInvestigation(id) {
+  clearTimeout(inv.timer);
+  inv.current = id;
+  try {
+    const r = await fetch(`${API}/api/v1/investigations/${encodeURIComponent(id)}`);
+    if (!r.ok) throw new Error(await apiError(r));
+    const data = await r.json();
+    const wasRunning = inv.data?.id === id && inv.data.status === 'running';
+    inv.data = data;
+    renderInvestigation(data);
+    $$('.inv-history-item').forEach(b => b.setAttribute('aria-current', String(b.dataset.inv === id)));
+    if (data.status === 'running') {
+      if (inv.open) inv.timer = setTimeout(() => showInvestigation(id), 2500);
+    } else if (wasRunning) {
+      toast(`Investigación ${INV_STATUS[data.status].toLowerCase()}`, data.status === 'done' ? 'ok' : '');
+      refreshHistory();
+    }
+  } catch (e) {
+    $('#inv-detail').innerHTML = `<p class="inv-error">No se pudo cargar la investigación: ${escapeHtml(e.message)}</p>`;
+  }
+}
+const refreshInvestigation = debounce(() => { if (inv.current) showInvestigation(inv.current); }, 400);
+
+async function refreshHistory() {
+  try {
+    const r = await fetch(`${API}/api/v1/investigations`);
+    if (r.ok) renderHistory(await r.json());
+  } catch { /* el historial se refresca en la próxima apertura */ }
+}
+
+function renderHistory(list) {
+  $('#inv-history').innerHTML = list.length < 2 ? '' : `
+    <section><div class="inv-sec">Investigaciones</div><div class="inv-history">${list.map(x => `
+      <button class="inv-history-item" data-inv="${escapeHtml(x.id)}" aria-current="${x.id === inv.current}">
+        <span class="obj">${escapeHtml(x.objective)}</span>
+        <span class="inv-chip" data-s="${escapeHtml(x.status)}">${escapeHtml(INV_STATUS[x.status] || x.status)}</span>
+        <span class="when">${relTime(x.created_at)}</span>
+      </button>`).join('')}</div></section>`;
+}
+
+function renderInvestigation(d) {
+  const box = $('#inv-detail');
+  if (!d) {
+    box.innerHTML = `<p class="inv-empty">Escribe un objetivo y SynaptoCore lo dividirá en preguntas, formulará hipótesis,
+      buscará evidencias a favor y en contra y te dará una conclusión con fuentes. Trabaja en segundo plano: el chat
+      sigue disponible, y lo verificado queda en su memoria.</p>`;
+    return;
+  }
+  const running = d.status === 'running';
+  const cite = html => linkCitations(html, d.sources);
+  const hyps = d.hypotheses.map(hy => {
+    const v = VERDICT[hy.verdict] || VERDICT.pending;
+    const refs = [...hy.supporting, ...hy.contradicting].map(n => `[${n}]`).join(' ');
+    const why = [hy.reasoning, refs].filter(Boolean).join(' ');
+    return `<div class="hyp" data-v="${escapeHtml(hy.verdict)}">
+      <div class="hyp-top">
+        <span class="verdict ${v.cls}">${v.label}</span>
+        <div class="conf"><div class="conf-bar"><i style="width:${Math.round(hy.confidence * 100)}%;background:${v.color}"></i></div>
+          <b>${hy.verdict === 'pending' ? '—' : hy.confidence.toFixed(2)}</b></div>
+      </div>
+      <div class="hyp-text">${escapeHtml(hy.text)}</div>
+      ${why ? `<div class="hyp-why">${cite(escapeHtml(why))}</div>` : ''}
+    </div>`;
+  }).join('');
+  const source = s => isHttp(s.url)
+    ? `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.title || hostOf(s.url))}</a> <span class="host">${escapeHtml(hostOf(s.url))}</span>`
+    : escapeHtml(s.title || s.snippet.slice(0, 90));
+  box.innerHTML = `
+    <div class="inv-objective">${escapeHtml(d.objective)}</div>
+    <div class="inv-status">
+      <span class="inv-chip" data-s="${escapeHtml(d.status)}">${escapeHtml(INV_STATUS[d.status] || d.status)}</span>
+      ${running ? '<span class="inv-spin" aria-hidden="true"></span>' : ''}
+      <span>${escapeHtml(d.stage)} · ronda ${d.round}/${d.max_rounds} · ${d.sources.length} fuentes</span>
+      <span class="spacer"></span>
+      ${running ? `<button class="btn btn-sm" id="inv-cancel" type="button">${icon('stop')}Cancelar</button>` : ''}
+    </div>
+    ${d.error ? `<p class="inv-error" style="margin-top:8px">${escapeHtml(d.error)}</p>` : ''}
+    ${d.conclusion ? `<section style="margin-top:14px"><div class="inv-sec">Conclusión</div><div class="inv-conclusion">${cite(miniMarkdown(d.conclusion))}</div></section>` : ''}
+    ${hyps ? `<section style="margin-top:14px"><div class="inv-sec">Hipótesis</div><div class="inv-hyps">${hyps}</div></section>` : ''}
+    ${d.learned.length ? `<section style="margin-top:14px"><div class="inv-sec">Aprendido en memoria</div><div class="inv-learned">${d.learned.map(f => `<span class="inv-fact">${escapeHtml(f)}</span>`).join('')}</div></section>` : ''}
+    ${d.questions.length ? `<section style="margin-top:14px"><div class="inv-sec">Preguntas investigadas</div><div class="inv-questions">${d.questions.map(q => `<span class="inv-q">${escapeHtml(q)}</span>`).join('')}</div></section>` : ''}
+    ${d.sources.length ? `<details class="inv-sources" style="margin-top:14px"><summary class="inv-sec">Fuentes (${d.sources.length})</summary>
+      <ol>${d.sources.map(s => `<li><span class="cite">${s.n}</span> ${source(s)}</li>`).join('')}</ol></details>` : ''}`;
+}
+
+async function startInvestigation(e) {
+  e.preventDefault();
+  const objective = $('#inv-objective').value.trim();
+  if (!objective) { $('#inv-objective').focus(); return; }
+  const btn = $('#inv-start');
+  btn.disabled = true;
+  try {
+    const r = await fetch(`${API}/api/v1/investigations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ objective, rounds: +$('#inv-rounds').value }),
+    });
+    if (!r.ok) throw new Error(await apiError(r));
+    const data = await r.json();
+    $('#inv-objective').value = '';
+    inv.data = data;
+    await showInvestigation(data.id);
+    refreshHistory();
+    toast('Investigación en marcha', 'ok');
+  } catch (err) {
+    toast(err.message, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function cancelInvestigation() {
+  if (!inv.current) return;
+  try {
+    const r = await fetch(`${API}/api/v1/investigations/${encodeURIComponent(inv.current)}/cancel`, { method: 'POST' });
+    if (!r.ok) throw new Error(await apiError(r));
+    toast('Cancelando: se detendrá en el siguiente paso');
+    showInvestigation(inv.current);
+  } catch (err) {
+    toast(err.message, 'bad');
+  }
+}
+
+// ================================================================
 // PESTAÑAS (móvil) Y CABLEADO DE LA UI
 // ================================================================
 function switchTab(tab) {
@@ -2021,6 +2294,19 @@ function bindUI() {
 
   // Topbar
   $('#btn-teach').addEventListener('click', openTeach);
+  $('#btn-investigate').addEventListener('click', () => (inv.open ? closeInvestigations() : openInvestigations()));
+
+  // Investigación profunda
+  $('#inv-close').addEventListener('click', closeInvestigations);
+  $('#inv-form').addEventListener('submit', startInvestigation);
+  $('#inv-objective').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('#inv-form').requestSubmit(); }
+  });
+  $('#inv-drawer').addEventListener('click', e => {
+    if (e.target.closest('#inv-cancel')) { cancelInvestigation(); return; }
+    const item = e.target.closest('.inv-history-item');
+    if (item) showInvestigation(item.dataset.inv);
+  });
   $('#btn-refresh').addEventListener('click', () => { pollHealth(); loadGraph(); toast('Sincronizando memoria…'); });
 
   // Modal
@@ -2079,6 +2365,7 @@ function bindUI() {
     }
     if (e.key === 'Escape') {
       closeTeach();
+      if (inv.open) closeInvestigations();
       clearSelection();
       $('#search-results').innerHTML = '';
     }

@@ -21,6 +21,7 @@
 //   Paso 25: Conectores externos por configuración (cualquier sistema HTTP)
 //   Paso 26: Olvido según la procedencia del conocimiento
 //   Paso 27: Índice por nombre normalizado e importador por lotes
+//   Paso 28: Investigación profunda con hipótesis y evidencias
 // ============================================================
 #![allow(dead_code)]
 
@@ -30,6 +31,7 @@ mod error;
 mod federated_memory;
 mod forgetting_curve;
 mod importer;
+mod investigation;
 mod llm_bridge;
 mod memory_graph;
 mod ollama_backend;
@@ -203,6 +205,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph = MemoryGraph::open("synaptocore_memory.db")?;
     println!("✓ Memory graph inicializado (synaptocore_memory.db)\n");
 
+    // Paso 28: una investigación que quedó en marcha murió con el proceso anterior.
+    while let Some(id) = graph.running_investigation()? {
+        graph.close_investigation(&id, "interrupted", "Interrumpida: el servidor se reinició")?;
+    }
+
     // ── 1b. Memoria semántica (Paso 22) ──────────────────────────────────────
     // Carga del modelo (y descarga la primera vez) en spawn_blocking: es E/S
     // y CPU bloqueante. Si falla (sin red en el primer arranque, sin la
@@ -368,9 +375,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         // Paso 23: el intervalo crece mientras los ciclos no aprendan nada.
         let mut backoff = CycleBackoff::standard();
+        let mut waiting_for_investigation = false;
         loop {
             // Paso 21: no arrancar un ciclo mientras el usuario está activo.
             priority_sc.wait_idle().await;
+
+            // Paso 28: mientras el usuario investiga algo, el LLM es suyo.
+            if investigation_running(&graph_sc).await {
+                if !waiting_for_investigation {
+                    let msg = "💤 En pausa mientras corre una investigación";
+                    println!("  [🧠 subconscious] {msg}");
+                    let _ = events_sc.send(SubconsciousEvent::new("Cycle", msg).to_json());
+                    waiting_for_investigation = true;
+                }
+                tokio::time::sleep(backoff.base()).await;
+                continue;
+            }
+            waiting_for_investigation = false;
 
             let graph_ref  = Arc::clone(&graph_sc);
             let llm_ref    = Arc::clone(&llm_sc);
@@ -596,6 +617,16 @@ fn load_declared_connectors() -> Vec<connectors::HttpConnector> {
             Vec::new()
         }
     }
+}
+
+/// ¿Hay una investigación en marcha? (Paso 28)
+async fn investigation_running(graph: &Arc<Mutex<MemoryGraph>>) -> bool {
+    let graph = Arc::clone(graph);
+    tokio::task::spawn_blocking(move || graph.lock().ok()?.running_investigation().ok().flatten())
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Huella barata del grafo para que el bucle subconsciente detecte lo que

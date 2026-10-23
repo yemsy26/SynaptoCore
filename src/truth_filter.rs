@@ -83,6 +83,11 @@ pub enum SearchError {
 
     #[error("Search timeout after {seconds}s")]
     Timeout { seconds: u32 },
+
+    /// Paso 28: SearXNG respondió, pero sin resultados porque sus motores
+    /// fallaron (límite de peticiones, CAPTCHA…); no es «no hay nada».
+    #[error("motores de búsqueda sin respuesta: {0}")]
+    EnginesUnavailable(String),
 }
 
 /// Contrato mínimo de cualquier motor de búsqueda.
@@ -134,6 +139,9 @@ struct SearxngResult {
 #[derive(Debug, Deserialize)]
 struct SearxngResponse {
     results: Vec<SearxngResult>,
+    /// Motores que fallaron en esta búsqueda: `[nombre, motivo]`.
+    #[serde(default)]
+    unresponsive_engines: Vec<(String, String)>,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -240,6 +248,16 @@ impl SearchBackend for SearxngBackend {
         let body: SearxngResponse = response
             .json()
             .map_err(|e| SearchError::InvalidResponse(e.to_string()))?;
+
+        // Paso 28: cero resultados con motores caídos es un fallo del
+        // buscador, no una búsqueda sin coincidencias.
+        if body.results.is_empty() && !body.unresponsive_engines.is_empty() {
+            let engines: Vec<String> = body.unresponsive_engines
+                .iter()
+                .map(|(name, reason)| format!("{name} ({reason})"))
+                .collect();
+            return Err(SearchError::EnginesUnavailable(engines.join(", ")));
+        }
 
         // Top-N resultados con snippet no vacío.
         let hits: Vec<SearchHit> = body.results
@@ -821,6 +839,30 @@ mod tests {
             matches!(err, SearchError::Network(_) | SearchError::Timeout { .. }),
             "Esperado Network o Timeout, obtenido: {:?}", err
         );
+    }
+
+    /// Paso 28: cero resultados con motores caídos es un error del buscador.
+    #[test]
+    fn test_searxng_reports_unresponsive_engines() {
+        use std::io::{Read, Write};
+        let serve = |body: &'static str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.read(&mut [0u8; 2048]).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            SearxngBackend::new(format!("http://127.0.0.1:{port}"))
+        };
+
+        let down = serve(r#"{"results": [], "unresponsive_engines": [["brave", "too many requests"], ["duckduckgo", "CAPTCHA"]]}"#);
+        match down.search_detailed("ERP farmacia") {
+            Err(SearchError::EnginesUnavailable(m)) => assert_eq!(m, "brave (too many requests), duckduckgo (CAPTCHA)"),
+            other => panic!("se esperaba EnginesUnavailable: {other:?}"),
+        }
+        let empty = serve(r#"{"results": [], "unresponsive_engines": []}"#);
+        assert!(empty.search_detailed("xyz").unwrap().is_empty(), "sin coincidencias no es un error");
     }
 
     // ── Snippets acotados a MAX_SEARCH_SNIPPETS ───────────────

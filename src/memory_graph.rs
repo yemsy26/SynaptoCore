@@ -688,6 +688,19 @@ impl MemoryGraph {
                 started_at  INTEGER NOT NULL,
                 finished_at INTEGER
             ) STRICT;
+
+            -- ────────── TABLA: investigations (Paso 28) ──────────
+            -- Investigaciones profundas: `data` es el estado completo en JSON
+            -- (preguntas, fuentes, hipótesis, conclusión), que se reescribe
+            -- tras cada paso; `status` va aparte para consultarlo sin leerlo.
+            CREATE TABLE IF NOT EXISTS investigations (
+                id         TEXT PRIMARY KEY,
+                objective  TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                data       TEXT NOT NULL
+            ) STRICT;
         ")?;
         Ok(())
     }
@@ -1956,6 +1969,87 @@ impl MemoryGraph {
     }
 
     // ──────────────────────────────────────────────────────
+    //  Paso 28 — Investigaciones (ver investigation.rs)
+    // ──────────────────────────────────────────────────────
+
+    /// Guarda el estado de una investigación (alta o actualización).
+    pub fn save_investigation(
+        &self,
+        id:         &str,
+        objective:  &str,
+        status:     &str,
+        created_at: i64,
+        updated_at: i64,
+        data:       &str,
+    ) -> Result<(), MemoryError> {
+        self.conn.execute(
+            "INSERT INTO investigations (id, objective, status, created_at, updated_at, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 status = excluded.status, updated_at = excluded.updated_at, data = excluded.data",
+            params![id, objective, status, created_at, updated_at, data],
+        )?;
+        Ok(())
+    }
+
+    /// Estado de una investigación, si existe.
+    pub fn investigation_status(&self, id: &str) -> Result<Option<String>, MemoryError> {
+        Ok(self.conn
+            .query_row("SELECT status FROM investigations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// El JSON completo de una investigación.
+    pub fn investigation_data(&self, id: &str) -> Result<Option<String>, MemoryError> {
+        Ok(self.conn
+            .query_row("SELECT data FROM investigations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Resumen de las últimas investigaciones, de la más reciente a la más antigua.
+    pub fn investigation_summaries(&self, limit: usize) -> Result<Vec<InvestigationSummary>, MemoryError> {
+        Ok(self.conn
+            .prepare(
+                "SELECT id, objective, status, created_at, updated_at,
+                        json_extract(data, '$.stage')
+                 FROM investigations ORDER BY created_at DESC LIMIT ?1",
+            )?
+            .query_map(params![limit as i64], |r| {
+                Ok(InvestigationSummary {
+                    id:         r.get(0)?,
+                    objective:  r.get(1)?,
+                    status:     r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                    stage:      r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Id de la investigación en marcha, si hay una.
+    pub fn running_investigation(&self) -> Result<Option<String>, MemoryError> {
+        Ok(self.conn
+            .query_row("SELECT id FROM investigations WHERE status = 'running' LIMIT 1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Cierra una investigación en marcha con `status` y la etapa `stage`
+    /// (cancelación del usuario, reinicio del servidor). `false` si no
+    /// estaba en marcha.
+    pub fn close_investigation(&self, id: &str, status: &str, stage: &str) -> Result<bool, MemoryError> {
+        let now = current_unix_ts();
+        let changed = self.conn.execute(
+            "UPDATE investigations
+             SET status = ?2, updated_at = ?4,
+                 data = json_set(data, '$.status', ?2, '$.stage', ?3, '$.updated_at', ?4, '$.finished_at', ?4)
+             WHERE id = ?1 AND status = 'running'",
+            params![id, status, stage, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    // ──────────────────────────────────────────────────────
     //  Paso 27 — Importación por lotes (ver importer.rs)
     // ──────────────────────────────────────────────────────
 
@@ -2162,6 +2256,17 @@ impl ImportRecord {
             finished_at: r.get(6)?,
         })
     }
+}
+
+/// Una investigación en la lista (Paso 28).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InvestigationSummary {
+    pub id:         String,
+    pub objective:  String,
+    pub status:     String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub stage:      String,
 }
 
 /// Lo que escribió un tramo de importación.
@@ -3002,6 +3107,22 @@ mod tests {
         let cfg = RetrievalConfig { focus: vec!["¿Cuáles son los idiomas oficiales de Japón y Plutón?".into()], ..RetrievalConfig::default() };
         assert_eq!(g.retrieve_context(&probes, None, &cfg).unwrap().uncovered, ["Plutón"]);
         assert_eq!((singular("oficiales"), singular("paises"), singular("idiomas"), singular("gas")), ("oficial", "pais", "idioma", "gas"));
+    }
+
+    #[test]
+    fn test_investigation_storage_and_close() {
+        let g = in_memory_graph();
+        let data = r#"{"status": "running", "stage": "Buscando fuentes"}"#;
+        g.save_investigation("i1", "¿Qué es X?", "running", 10, 11, data).unwrap();
+        assert_eq!(g.running_investigation().unwrap().as_deref(), Some("i1"));
+        assert_eq!(g.investigation_summaries(5).unwrap()[0].stage, "Buscando fuentes");
+
+        assert!(g.close_investigation("i1", "cancelled", "Cancelada").unwrap());
+        assert!(!g.close_investigation("i1", "interrupted", "Interrumpida").unwrap(), "ya no estaba en marcha");
+        assert_eq!(g.running_investigation().unwrap(), None);
+        let saved: serde_json::Value = serde_json::from_str(&g.investigation_data("i1").unwrap().unwrap()).unwrap();
+        assert_eq!((saved["status"].as_str(), saved["stage"].as_str()), (Some("cancelled"), Some("Cancelada")));
+        assert_eq!(g.investigation_status("i1").unwrap().as_deref(), Some("cancelled"));
     }
 
     // ─────────────── PROCEDENCIA (Paso 26) ───────────────

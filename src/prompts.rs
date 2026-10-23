@@ -464,6 +464,115 @@ REGLAS:
 }
 
 // ──────────────────────────────────────────────────────────────
+//  Paso 28 — Investigación profunda con hipótesis y evidencias
+// ──────────────────────────────────────────────────────────────
+//
+// Cada paso pide al modelo de 2B una cosa pequeña con JSON de claves
+// cortas (como el planificador): dividir, proponer, juzgar, reformular.
+// El informe lo arma el servidor; el modelo solo redacta la conclusión.
+
+/// Divide el objetivo en preguntas de búsqueda (primera ronda).
+pub fn investigation_questions_system_prompt() -> &'static str {
+    r#"Eres el planificador de una investigación. Divide el objetivo en 2 a 4 preguntas de búsqueda web concretas y distintas que, juntas, permitan responderlo.
+
+Responde SOLO con este JSON: {"q": ["pregunta 1", "pregunta 2"]}
+
+REGLAS:
+1. Cada pregunta, breve (máximo 12 palabras) y autocontenida: repite los nombres propios del objetivo.
+2. En el idioma del objetivo."#
+}
+
+/// Preguntas nuevas para lo que sigue sin resolver (rondas siguientes).
+pub fn investigation_refine_system_prompt() -> &'static str {
+    r#"Eres el planificador de una investigación en curso. Según el estado de las hipótesis, escribe 1 a 3 preguntas de búsqueda web NUEVAS que ayuden a confirmar o descartar lo que sigue sin resolver.
+
+Responde SOLO con este JSON: {"q": ["pregunta 1"]}
+
+REGLAS:
+1. No repitas las preguntas ya hechas.
+2. Preguntas breves y autocontenidas, en el idioma del objetivo."#
+}
+
+/// Esquema de `{"q": [...]}` (preguntas de búsqueda).
+pub fn investigation_questions_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { "q": { "type": "array", "items": { "type": "string" }, "maxItems": 4 } },
+        "required": ["q"]
+    })
+}
+
+/// Propone hipótesis comprobables a partir de las fuentes.
+pub fn investigation_hypotheses_system_prompt() -> &'static str {
+    r#"Eres un investigador. A partir de las fuentes, propón de 2 a 4 hipótesis: respuestas posibles y distintas al objetivo, que las fuentes puedan confirmar o refutar.
+
+Responde SOLO con este JSON: {"h": ["hipótesis 1", "hipótesis 2"]}
+
+REGLAS:
+1. Cada hipótesis RESPONDE al objetivo con UNA afirmación concreta (máximo 20 palabras). Ejemplo: para «¿quién descubrió la penicilina?», «Alexander Fleming descubrió la penicilina».
+2. Usa los nombres concretos que aparecen en las fuentes; si las fuentes sugieren respuestas distintas, propón cada una.
+3. Nada de preguntas, justificaciones ni afirmaciones sobre otro tema.
+4. No repitas las hipótesis ya evaluadas. En el idioma del objetivo."#
+}
+
+/// Esquema de `{"h": [...]}` (hipótesis).
+pub fn investigation_hypotheses_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { "h": { "type": "array", "items": { "type": "string" }, "maxItems": 4 } },
+        "required": ["h"]
+    })
+}
+
+/// Juzga una hipótesis SOLO con las fuentes numeradas que se le dan.
+pub fn investigation_judge_system_prompt() -> &'static str {
+    r#"Evalúa una hipótesis usando SOLO las fuentes numeradas.
+
+Responde SOLO con un JSON con estas claves:
+- "v": "apoya", "contradice" o "insuficiente"
+- "c": tu certeza, de 0.0 a 1.0
+- "a": números de las fuentes que la apoyan
+- "x": números de las fuentes que la contradicen
+- "r": una frase que explique el veredicto
+
+REGLAS:
+1. "apoya" solo si alguna fuente afirma la hipótesis; "contradice" si alguna afirma lo contrario; si no hablan de ello, "insuficiente".
+2. Certeza alta (0.8-1.0) solo si una fuente lo dice explícitamente; media (0.5-0.7) si se deduce de ellas.
+3. No uses conocimiento propio: solo lo que dicen las fuentes."#
+}
+
+/// Esquema del veredicto.
+pub fn investigation_judge_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "v": { "type": "string", "enum": ["apoya", "contradice", "insuficiente"] },
+            "c": { "type": "number" },
+            "a": { "type": "array", "items": { "type": "integer" } },
+            "x": { "type": "array", "items": { "type": "integer" } },
+            "r": { "type": "string" }
+        },
+        "required": ["v", "c", "a", "x", "r"]
+    })
+}
+
+/// Conclusión final, en prosa y con citas [n]. Dos variantes: con una sola
+/// instrucción condicional («si ninguna quedó apoyada…») el 2B escribía que
+/// no había apoyo junto a hipótesis apoyadas.
+pub fn investigation_conclusion_system_prompt(any_supported: bool) -> &'static str {
+    if any_supported {
+        "Eres SynaptoCore. Redacta la conclusión de una investigación en 2 a 5 frases, en el idioma del \
+objetivo: responde al objetivo con las hipótesis APOYADAS y menciona las refutadas si ayuda. Cita las \
+fuentes con su número entre corchetes, por ejemplo [3]. Usa SOLO las hipótesis y fuentes dadas; no \
+inventes datos."
+    } else {
+        "Eres SynaptoCore. Ninguna hipótesis de esta investigación quedó apoyada por las fuentes. Redacta \
+en 2 a 4 frases, en el idioma del objetivo, que la investigación no es concluyente, qué se descartó (si \
+algo quedó refutado, con su número de fuente entre corchetes) y qué faltaría averiguar. No inventes datos."
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
 //  Tests de prompts (verifican formato, no el LLM)
 // ──────────────────────────────────────────────────────────────
 #[cfg(test)]

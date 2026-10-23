@@ -60,11 +60,12 @@ use tokio::sync::broadcast;
 
 use crate::error::MemoryError;
 use crate::federated_memory::{self, FederationError};
+use crate::investigation::{self, Investigation, InvestigationStatus};
 use crate::llm_bridge::{
     classify_answer_head, AnswerHead, AnswerMode, BoxedTokenStream, BridgeError, ExtractionResult, Intent,
     LlmBackend, NeuralBridge, Plan, PreparedAnswer,
 };
-use crate::memory_graph::{GraphSnapshot, MemoryGraph, TraversalDirection};
+use crate::memory_graph::{GraphSnapshot, InvestigationSummary, MemoryGraph, TraversalDirection};
 use crate::priority::{BackgroundLlm, CognitivePriority};
 use crate::research;
 use crate::tools::ToolRegistry;
@@ -265,6 +266,52 @@ fn spawn_research_learning(deps: LearnDeps, question: String, hits: Vec<SearchHi
     });
 }
 
+/// Guarda el estado completo de una investigación (Paso 28).
+fn save_investigation(g: &MemoryGraph, inv: &Investigation) -> Result<(), MemoryError> {
+    let data = serde_json::to_string(inv)?;
+    g.save_investigation(&inv.id, &inv.objective, inv.status.as_str(), inv.created_at, inv.updated_at, &data)
+}
+
+/// Corre una investigación en un hilo bloqueante con el LLM de fondo, que
+/// cede el turno al chat (Paso 28). Tras cada paso guarda el estado y emite
+/// un evento; la cancelación llega por la base: si el estado guardado ya no
+/// es «running», el motor se detiene en el siguiente paso.
+fn spawn_investigation(deps: LearnDeps, mut inv: Investigation) {
+    let Some(search) = deps.search.clone() else { return };
+    tokio::task::spawn_blocking(move || {
+        let llm: Arc<dyn LlmBackend + Send + Sync> =
+            Arc::new(BackgroundLlm::new(Arc::clone(&deps.llm), Arc::clone(&deps.priority)));
+        let events = deps.events.clone();
+        let graph = Arc::clone(&deps.graph);
+        let mut checkpoint = |state: &Investigation, msg: &str| -> bool {
+            println!("  [🔎 investigación] {msg}");
+            let _ = events.send(SubconsciousEvent::new("Investigation", format!("🔎 {msg}")).to_json());
+            let Ok(g) = graph.lock() else { return false };
+            if g.investigation_status(&state.id).ok().flatten().as_deref() != Some("running") {
+                return false;
+            }
+            if let Err(e) = save_investigation(&g, state) {
+                eprintln!("[investigación] No se pudo guardar el progreso: {e}");
+            }
+            true
+        };
+        let waits = investigation::SEARCH_RETRY_WAITS;
+        if let Err(e) = investigation::run(&llm, &search, &*deps.graph, &mut inv, &waits, &mut checkpoint) {
+            inv.error = Some(e.to_string());
+            inv.finish(InvestigationStatus::Failed, "Fallida");
+            let msg = format!("⚠ La investigación falló: {e}");
+            eprintln!("[investigación] {msg}");
+            let _ = deps.events.send(SubconsciousEvent::new("Error", format!("🔎 {msg}")).to_json());
+        }
+        // Estado final, también el de una cancelada con lo que llegó a reunir.
+        if let Ok(g) = deps.graph.lock() {
+            if let Err(e) = save_investigation(&g, &inv) {
+                eprintln!("[investigación] No se pudo guardar el estado final: {e}");
+            }
+        }
+    });
+}
+
 /// Fuentes citables para el cliente: `{n, title, url}` en el orden de [n].
 fn sources_json(hits: &[SearchHit]) -> Vec<Value> {
     hits.iter()
@@ -362,17 +409,24 @@ pub enum ApiError {
     BadRequest(String),
     /// Fallo interno no recuperable (SQLite, LLM, mutex envenenado).
     Internal(String),
+    /// Choca con el estado actual (p. ej. ya hay una investigación en marcha).
+    Conflict(String),
+    /// Falta un servicio externo necesario (p. ej. SearXNG para investigar).
+    Unavailable(String),
 }
 
 impl ApiError {
     pub fn not_found(msg: impl ToString)  -> Self { Self::NotFound(msg.to_string())  }
     pub fn bad_request(msg: impl ToString)-> Self { Self::BadRequest(msg.to_string())}
     pub fn internal(msg: impl ToString)   -> Self { Self::Internal(msg.to_string())  }
+    pub fn conflict(msg: impl ToString)   -> Self { Self::Conflict(msg.to_string())  }
+    pub fn unavailable(msg: impl ToString)-> Self { Self::Unavailable(msg.to_string())}
 
     /// Texto del error, para enviarlo dentro de un stream SSE ya abierto.
     pub fn message(&self) -> &str {
         match self {
-            Self::NotFound(m) | Self::BadRequest(m) | Self::Internal(m) => m,
+            Self::NotFound(m) | Self::BadRequest(m) | Self::Internal(m)
+            | Self::Conflict(m) | Self::Unavailable(m) => m,
         }
     }
 }
@@ -383,6 +437,8 @@ impl IntoResponse for ApiError {
             Self::NotFound(m)  => (StatusCode::NOT_FOUND, m.clone()),
             Self::BadRequest(m)=> (StatusCode::BAD_REQUEST, m.clone()),
             Self::Internal(m)  => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
+            Self::Conflict(m)  => (StatusCode::CONFLICT, m.clone()),
+            Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
         };
         let body = Json(serde_json::json!({
             "error": message,
@@ -1101,6 +1157,98 @@ async fn pump_ws(
 /// GET  /api/v1/graph/neighbors/{id}
 /// POST /api/v1/federation/export
 /// ```
+// ──────────────────────────────────────────────────────────────
+//  PASO 28 — Investigaciones profundas
+// ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct InvestigationRequest {
+    /// Qué investigar: una pregunta o un tema.
+    pub objective: String,
+    /// Rondas máximas (1-5; por defecto 3).
+    #[serde(default)]
+    pub rounds:    Option<u32>,
+}
+
+const MAX_OBJECTIVE_CHARS: usize = 500;
+
+/// `POST /api/v1/investigations` — empieza una investigación en segundo
+/// plano y devuelve su estado inicial (202). Una a la vez.
+pub async fn handle_start_investigation(
+    State(state): State<AppState>,
+    Json(req): Json<InvestigationRequest>,
+) -> Result<(StatusCode, Json<Investigation>), ApiError> {
+    let objective = req.objective.trim();
+    if objective.is_empty() {
+        return Err(ApiError::bad_request("El objetivo no puede estar vacío"));
+    }
+    if objective.chars().count() > MAX_OBJECTIVE_CHARS {
+        return Err(ApiError::bad_request(format!("El objetivo no puede superar {MAX_OBJECTIVE_CHARS} caracteres")));
+    }
+    if state.search.is_none() {
+        return Err(ApiError::unavailable("Investigar necesita búsqueda web: configura SEARXNG_URL"));
+    }
+    let inv = Investigation::new(objective, req.rounds.unwrap_or(investigation::DEFAULT_ROUNDS));
+    let graph = Arc::clone(&state.graph);
+    let initial = inv.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        if g.running_investigation()?.is_some() {
+            return Err(ApiError::conflict("Ya hay una investigación en marcha; espera a que termine o cancélala"));
+        }
+        Ok(save_investigation(&g, &initial)?)
+    })
+    .await??;
+    spawn_investigation(LearnDeps::from_state(&state), inv.clone());
+    Ok((StatusCode::ACCEPTED, Json(inv)))
+}
+
+/// `GET /api/v1/investigations` — las últimas investigaciones (resumen).
+pub async fn handle_list_investigations(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<InvestigationSummary>>, ApiError> {
+    let graph = Arc::clone(&state.graph);
+    let list = tokio::task::spawn_blocking(move || {
+        let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        g.investigation_summaries(30).map_err(ApiError::from)
+    })
+    .await??;
+    Ok(Json(list))
+}
+
+/// `GET /api/v1/investigations/{id}` — estado completo: preguntas, fuentes,
+/// hipótesis con su veredicto, conclusión y lo aprendido.
+pub async fn handle_get_investigation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let graph = Arc::clone(&state.graph);
+    let data = tokio::task::spawn_blocking(move || {
+        let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        g.investigation_data(&id)?.ok_or_else(|| ApiError::not_found(format!("No existe la investigación {id}")))
+    })
+    .await??;
+    Ok(Json(serde_json::from_str(&data).map_err(|e| ApiError::internal(e.to_string()))?))
+}
+
+/// `POST /api/v1/investigations/{id}/cancel` — el motor se detiene en su
+/// siguiente paso y conserva lo reunido.
+pub async fn handle_cancel_investigation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let graph = Arc::clone(&state.graph);
+    tokio::task::spawn_blocking(move || {
+        let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        if g.investigation_status(&id)?.is_none() {
+            return Err(ApiError::not_found(format!("No existe la investigación {id}")));
+        }
+        let cancelled = g.close_investigation(&id, InvestigationStatus::Cancelled.as_str(), "Cancelada")?;
+        Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+    })
+    .await?
+}
+
 pub fn build_router(state: AppState) -> Router {
     let api_v1 = Router::new()
         .route("/chat",                 post(handle_query_stream))
@@ -1109,7 +1257,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/learn",                post(handle_learn))
         .route("/graph/all",            get(handle_graph_all))
         .route("/graph/neighbors/{id}", get(handle_neighbors))
-        .route("/federation/export",    post(handle_federation_export));
+        .route("/federation/export",    post(handle_federation_export))
+        .route("/investigations",       get(handle_list_investigations).post(handle_start_investigation))
+        .route("/investigations/{id}",  get(handle_get_investigation))
+        .route("/investigations/{id}/cancel", post(handle_cancel_investigation));
 
     Router::new()
         .route("/",                   get(handle_dashboard))
@@ -1220,6 +1371,49 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(json.to_string()))
             .unwrap()
+    }
+
+    // ── Tests: investigaciones (Paso 28) ─────────────────────
+
+    #[tokio::test]
+    async fn test_investigation_requests_are_validated() {
+        let start = |body: &str| send(test_router(vec![]), post_json("/api/v1/investigations", body));
+        assert_eq!(start(r#"{"objective": "   "}"#).await.0, StatusCode::BAD_REQUEST);
+        let (status, body) = start(r#"{"objective": "¿Qué ERP sirven para farmacias?"}"#).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "sin SearXNG no se investiga");
+        assert!(String::from_utf8_lossy(&body).contains("SEARXNG_URL"));
+        assert_eq!(send(test_router(vec![]), get_req("/api/v1/investigations/nada")).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_one_investigation_at_a_time_and_cancel() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let running = Investigation::new("¿Primera?", 2);
+        save_investigation(&graph.lock().unwrap(), &running).unwrap();
+        let app = || build_router(AppState {
+            graph:         Arc::clone(&graph),
+            llm:           mock_llm(vec![]),
+            agent_id:      "agent-test".to_string(),
+            events_tx:     dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        Some(BoxedSearch::new(crate::truth_filter::MockSearchBackend::empty())),
+        });
+
+        let (status, _) = send(app(), post_json("/api/v1/investigations", r#"{"objective": "¿Segunda?"}"#)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "una investigación a la vez");
+
+        let (_, body) = send(app(), get_req("/api/v1/investigations")).await;
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()[0]["objective"], "¿Primera?");
+
+        let cancel = format!("/api/v1/investigations/{}/cancel", running.id);
+        let (status, body) = send(app(), post_json(&cancel, "{}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["cancelled"], true);
+        let (_, body) = send(app(), get_req(&format!("/api/v1/investigations/{}", running.id))).await;
+        let detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((detail["status"].as_str(), detail["objective"].as_str()), (Some("cancelled"), Some("¿Primera?")));
     }
 
     // ── Tests: GET /health ───────────────────────────────────
