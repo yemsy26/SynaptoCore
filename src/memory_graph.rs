@@ -341,6 +341,9 @@ pub struct RetrievalConfig {
     pub min_edge_weight: f64,
     /// Máximo de aristas en el contexto final (presupuesto de tokens).
     pub max_edges:       usize,
+    /// Texto de la pregunta (Paso 27): sus palabras dan prioridad a las
+    /// relaciones que nombra («¿qué moneda usa Japón?» → `moneda`).
+    pub focus:           Vec<String>,
 }
 
 impl Default for RetrievalConfig {
@@ -350,7 +353,7 @@ impl Default for RetrievalConfig {
     /// relacionados 0.13-0.23. 0.40 prioriza precisión: a un modelo de 2B le
     /// perjudica más el contexto irrelevante que el ausente.
     fn default() -> Self {
-        Self { seeds_per_probe: 3, min_similarity: 0.40, min_edge_weight: 0.3, max_edges: 12 }
+        Self { seeds_per_probe: 3, min_similarity: 0.40, min_edge_weight: 0.3, max_edges: 12, focus: Vec::new() }
     }
 }
 
@@ -395,6 +398,27 @@ fn content_words(text: &str) -> HashSet<String> {
         .filter(|w| !w.is_empty() && !STOP_WORDS.contains(w))
         .map(String::from)
         .collect()
+}
+
+/// Singular aproximado de una palabra canónica, para comparar la pregunta
+/// con los nombres de relación (Paso 27): "oficiales" → "oficial",
+/// "paises" → "pais", "idiomas" → "idioma".
+fn singular(word: &str) -> &str {
+    if let Some(stem) = word.strip_suffix("es") {
+        if stem.len() >= 4 && stem.ends_with(['l', 'r', 'n', 'd', 'z', 's']) {
+            return stem;
+        }
+    }
+    match word.strip_suffix('s') {
+        Some(stem) if stem.len() >= 3 => stem,
+        _ => word,
+    }
+}
+
+/// Palabras de contenido en singular aproximado: así se comparan la
+/// pregunta y los nombres de relación (Paso 27).
+fn singular_words(text: &str) -> HashSet<String> {
+    content_words(text).iter().map(|w| singular(w).to_string()).collect()
 }
 
 /// Par de ids en orden estable: clave de `gap_attempts` (Paso 23).
@@ -623,6 +647,11 @@ impl MemoryGraph {
             CREATE INDEX IF NOT EXISTS idx_edges_last_accessed
                 ON edges (last_accessed ASC);
 
+            -- Instantánea del dashboard (Paso 27): los N nodos más recientes
+            -- sin ordenar la tabla entera.
+            CREATE INDEX IF NOT EXISTS idx_nodes_created
+                ON nodes (created_at DESC);
+
             -- ────────── TABLA: meta (Paso 22) ──────────
             -- Metadatos del grafo, p. ej. el modelo que generó los embeddings.
             CREATE TABLE IF NOT EXISTS meta (
@@ -644,6 +673,20 @@ impl MemoryGraph {
                 last_attempt   INTEGER NOT NULL,
                 cooldown_until INTEGER NOT NULL,
                 PRIMARY KEY (node_a, node_b)
+            ) STRICT;
+
+            -- ────────── TABLA: imports (Paso 27) ──────────
+            -- Lotes importados: el progreso permite reanudar un lote cortado
+            -- y el nombre, deshacerlo (sus aristas llevan origin = 'imported'
+            -- y source = batch).
+            CREATE TABLE IF NOT EXISTS imports (
+                batch       TEXT PRIMARY KEY,
+                file        TEXT NOT NULL,
+                lines_done  INTEGER NOT NULL DEFAULT 0,
+                nodes_added INTEGER NOT NULL DEFAULT 0,
+                edges_added INTEGER NOT NULL DEFAULT 0,
+                started_at  INTEGER NOT NULL,
+                finished_at INTEGER
             ) STRICT;
         ")?;
         Ok(())
@@ -695,7 +738,34 @@ impl MemoryGraph {
         );
         let _ = self.conn.execute("ALTER TABLE edges ADD COLUMN source TEXT", []);
 
+        // v0.27: forma canónica del nombre, indexada (Paso 27). Antes
+        // `resolve_node_id` recorría la tabla entera en cada consolidación:
+        // con cientos de miles de nodos importados bloquearía el chat.
+        let _ = self.conn.execute("ALTER TABLE nodes ADD COLUMN canon TEXT", []);
+        self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_nodes_canon ON nodes (canon)")?;
+        self.backfill_canon()?;
+
         Ok(())
+    }
+
+    /// Rellena `canon` en los nodos anteriores al Paso 27 (una sola vez).
+    fn backfill_canon(&self) -> Result<usize, MemoryError> {
+        let pending: Vec<(String, String)> = self.conn
+            .prepare("SELECT id, name FROM nodes WHERE canon IS NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached("UPDATE nodes SET canon = ?1 WHERE id = ?2")?;
+            for (id, name) in &pending {
+                stmt.execute(params![canonical_id(name), id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(pending.len())
     }
 
     // ──────────────────────────────────────────────────────
@@ -736,8 +806,8 @@ impl MemoryGraph {
         let embedding_blob = embedding.as_deref().map(embedding_to_blob);
 
         self.conn.execute(
-            "INSERT INTO nodes (id, label, name, properties, created_at, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO nodes (id, label, name, properties, created_at, embedding, canon)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 node.id,
                 node.label,
@@ -745,6 +815,7 @@ impl MemoryGraph {
                 props_json,
                 node.created_at,
                 embedding_blob,
+                canonical_id(&node.name),
             ],
         )?;
 
@@ -1212,12 +1283,12 @@ impl MemoryGraph {
     }
 
     /// Id del nodo existente que nombra `text` (Paso 23): id exacto, id
-    /// canónico o id/nombre con la misma forma canónica
+    /// canónico o nombre con la misma forma canónica
     /// ("diagramas_de_clases" → "diagramas de clases"). `None` si el
     /// concepto es nuevo.
     ///
-    /// El último paso recorre la tabla: pensado para la consolidación del
-    /// subconsciente (pocas llamadas por ciclo), no para rutas calientes.
+    /// Paso 27: tres búsquedas por índice (antes el último paso recorría la
+    /// tabla entera); a igualdad de forma canónica gana el nodo más antiguo.
     pub fn resolve_node_id(&self, text: &str) -> Result<Option<String>, MemoryError> {
         let canon = canonical_id(text);
         for candidate in [text.trim(), canon.as_str()] {
@@ -1225,16 +1296,10 @@ impl MemoryGraph {
                 return Ok(Some(candidate.to_string()));
             }
         }
-        let mut stmt = self.conn.prepare("SELECT id, name FROM nodes")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            if canonical_id(&id) == canon || canonical_id(&name) == canon {
-                return Ok(Some(id));
-            }
-        }
-        Ok(None)
+        Ok(self.conn
+            .prepare_cached("SELECT id FROM nodes WHERE canon = ?1 LIMIT 1")?
+            .query_row(params![canon], |r| r.get(0))
+            .optional()?)
     }
 
     /// Pares de vacíos en enfriamiento en el instante `now`, ordenados con
@@ -1297,7 +1362,9 @@ impl MemoryGraph {
     ///      embeddings, búsqueda léxica como último recurso.
     ///   2. Expansión a 1 salto (entrantes y salientes) de cada semilla.
     ///   3. Ranking por `puntuación de la semilla × peso de la arista`,
-    ///      filtrando aristas débiles y truncando a `max_edges`.
+    ///      filtrando aristas débiles y truncando a `max_edges`. Paso 27:
+    ///      antes, las relaciones que nombra la pregunta (`cfg.focus`); el
+    ///      resto, por turnos entre relaciones.
     ///
     /// `probe_vecs[i]` es el embedding de `probes[i]`, calculado por el
     /// llamador FUERA del lock. Todo lo de aquí es lectura en RAM y SQLite.
@@ -1392,22 +1459,51 @@ impl MemoryGraph {
             }
         }
 
-        // 3. Ranking determinista y presupuesto de tokens.
+        // 3. Ranking determinista y presupuesto de tokens. Paso 27: primero
+        //    las relaciones que nombra la pregunta; después, por turnos entre
+        //    relaciones (la 2.ª arista de una relación va tras la 1.ª de
+        //    todas). Sin turnos, un concepto importado con 30 «miembro_de»
+        //    del mismo peso dejaba fuera su capital o su moneda.
+        let focus: HashSet<String> = cfg.focus.iter().flat_map(|text| singular_words(text)).collect();
+        let names_focus = |relation: &str| !singular_words(relation).is_disjoint(&focus);
         let mut edges: Vec<ContextEdge> = edges.into_values().collect();
         edges.sort_by(|a, b| b.relevance.total_cmp(&a.relevance).then_with(|| a.edge_id.cmp(&b.edge_id)));
-        edges.truncate(cfg.max_edges);
+        let mut turns: HashMap<String, usize> = HashMap::new();
+        let mut ranked: Vec<(bool, usize, usize, ContextEdge)> = edges
+            .into_iter()
+            .enumerate()
+            .map(|(position, edge)| {
+                let turn = turns.entry(edge.relation.clone()).or_insert(0);
+                *turn += 1;
+                (names_focus(&edge.relation), *turn, position, edge)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let edges: Vec<ContextEdge> = ranked.into_iter().take(cfg.max_edges).map(|(.., edge)| edge).collect();
 
         // 4. Cobertura: una sonda está cubierta si algún nodo que la nombra
-        //    aporta al menos una arista al contexto final.
+        //    aporta al menos una arista al contexto final, o (Paso 27) si
+        //    nombra la relación de una de ellas: en «¿cuáles son los idiomas
+        //    oficiales de Suiza?» el planificador da "idiomas oficiales" como
+        //    entidad, y no es un concepto sino `idioma_oficial` de Suiza.
         let covered_seeds: HashSet<&String> = edges
             .iter()
             .filter_map(|e| reached_by.get(&e.edge_id))
             .flatten()
             .collect();
+        let context_relations: Vec<HashSet<String>> = edges.iter().map(|e| singular_words(&e.relation)).collect();
+        let names_relation = |probe: &str| {
+            let words = singular_words(probe);
+            !words.is_empty() && context_relations.iter().any(|r| words.is_subset(r))
+        };
         let uncovered = probes
             .iter()
             .zip(&probe_seeds)
-            .filter(|(probe, ids)| !probe.trim().is_empty() && !ids.iter().any(|id| covered_seeds.contains(id)))
+            .filter(|(probe, ids)| {
+                !probe.trim().is_empty()
+                    && !ids.iter().any(|id| covered_seeds.contains(id))
+                    && !names_relation(probe)
+            })
             .map(|(probe, _)| probe.trim().to_string())
             .collect();
 
@@ -1434,8 +1530,9 @@ impl MemoryGraph {
         node_limit: usize,
     ) -> Result<GraphSnapshot, MemoryError> {
         // ── Paso 1: Recuperar hasta `node_limit` nodos ───────────────
+        // Sin el vector (1,5 KB por nodo): el JSON del dashboard no lo lleva.
         let mut node_stmt = self.conn.prepare(
-            "SELECT id, label, name, properties, created_at, embedding
+            "SELECT id, label, name, properties, created_at, NULL
              FROM nodes
              ORDER BY created_at DESC
              LIMIT ?1",
@@ -1450,47 +1547,58 @@ impl MemoryGraph {
             nodes.iter().map(|n| n.id.as_str()).collect();
 
         // ── Paso 2: Recuperar aristas entre nodos visibles ───────────
-        // Solo aristas INNER JOIN para garantizar que source y target existen.
-        // El LIMIT de aristas es 10x el de nodos: un grafo denso puede
-        // tener muchas aristas por nodo.
+        // Paso 27: las salientes de cada nodo visible, por el índice de
+        // origen. Antes se ordenaba la tabla de aristas entera por peso (80 ms
+        // con 300 000) y casi ninguna de las más fuertes unía nodos visibles.
+        // El límite de aristas es 10x el de nodos: un grafo denso puede tener
+        // muchas aristas por nodo.
         let edge_limit = (node_limit * 10).min(20_000);
-        let mut edge_stmt = self.conn.prepare(
+        let mut edge_stmt = self.conn.prepare_cached(
             "SELECT id, source_id, relation, target_id, weight, properties,
                     created_at, last_accessed, origin, source
              FROM edges
-             ORDER BY weight DESC
-             LIMIT ?1",
+             WHERE source_id = ?1",
         )?;
-
-        let all_edges: Vec<Edge> = edge_stmt
-            .query_map(params![edge_limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, f64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|(_, src, _, tgt, ..)| {
-                visible_ids.contains(src.as_str()) && visible_ids.contains(tgt.as_str())
-            })
-            .map(|(id, source_id, relation, target_id, weight, props_str, created_at, last_accessed, origin, source)| {
-                let properties = serde_json::from_str(&props_str)
-                    .unwrap_or_default();
-                let origin = EdgeOrigin::parse(&origin);
-                Edge { id, source_id, relation, target_id, weight, properties, created_at, last_accessed, origin, source }
-            })
-            .collect();
+        let mut all_edges: Vec<Edge> = Vec::new();
+        for node in &nodes {
+            let rows = edge_stmt.query_map(params![node.id], |row| {
+                Ok(Edge {
+                    id:            row.get(0)?,
+                    source_id:     row.get(1)?,
+                    relation:      row.get(2)?,
+                    target_id:     row.get(3)?,
+                    weight:        row.get(4)?,
+                    properties:    serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                    created_at:    row.get(6)?,
+                    last_accessed: row.get(7)?,
+                    origin:        EdgeOrigin::parse(&row.get::<_, String>(8)?),
+                    source:        row.get(9)?,
+                })
+            })?;
+            for edge in rows {
+                let edge = edge?;
+                if visible_ids.contains(edge.target_id.as_str()) {
+                    all_edges.push(edge);
+                }
+            }
+        }
+        all_edges.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+        all_edges.truncate(edge_limit);
 
         Ok(GraphSnapshot { nodes, edges: all_edges })
+    }
+
+    /// Marca barata de cambios (Paso 27): el mayor rowid de nodos y de
+    /// aristas, que crece con cada alta. `stats()` contaba y promediaba las
+    /// tablas enteras (≈30 ms con 300 000 aristas) cada vez que el
+    /// subconsciente comprobaba si el grafo había cambiado.
+    pub fn change_marker(&self) -> Result<(i64, i64), MemoryError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE((SELECT MAX(rowid) FROM nodes), 0),
+                    COALESCE((SELECT MAX(rowid) FROM edges), 0)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     /// Retorna estadísticas básicas del grafo (útil para debugging y métricas).
@@ -1701,11 +1809,18 @@ impl MemoryGraph {
     ) -> Result<DecayReport, MemoryError> {
         let now = current_unix_ts();
 
-        // ── 1. Leer todas las aristas con su last_accessed ───────────────
+        // ── 1. Leer las aristas que decaen, con su last_accessed ─────────
         // Leemos solo los campos necesarios para el cálculo; no cargamos
         // `properties` (potencialmente grandes) para mantener el footprint
-        // de memoria del ciclo mínimo.
-        let edges_raw = self.fetch_edges_for_decay()?;
+        // de memoria del ciclo mínimo. Paso 27: lo que no se olvida (p. ej.
+        // cientos de miles de aristas importadas) ni siquiera se lee.
+        let decaying: Vec<&str> = EdgeOrigin::ALL
+            .iter()
+            .filter(|o| rate_for(**o).is_some())
+            .map(|o| o.as_str())
+            .collect();
+        let edges_raw = self.fetch_edges_for_decay(&decaying)?;
+        let total_edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
 
         let mut updates:  Vec<(String, f64)> = Vec::new();   // (id, new_weight)
         let mut to_prune: Vec<String>         = Vec::new();   // ids a borrar
@@ -1713,12 +1828,9 @@ impl MemoryGraph {
         // ── 2. Calcular nuevo peso para cada arista ──────────────────────
         // `since` = el más reciente entre último acceso y última pasada
         // (Paso 22): el peso guardado ya incluye el decaimiento anterior.
-        let mut permanent = 0u64;
+        let permanent = (total_edges as u64).saturating_sub(edges_raw.len() as u64);
         for (edge_id, current_weight, since, origin) in &edges_raw {
-            let Some(decay_rate) = rate_for(*origin) else {
-                permanent += 1;
-                continue;
-            };
+            let Some(decay_rate) = rate_for(*origin) else { continue };
             let delta_t  = (now - since).max(0) as f64;           // Δt en segundos
             let new_weight = current_weight * (-decay_rate * delta_t).exp();
 
@@ -1741,10 +1853,6 @@ impl MemoryGraph {
         // entrante). Los borramos para mantener el grafo limpio y evitar
         // que el subconsciente (Paso 4) investigue nodos sin contexto.
         let orphans_removed = self.prune_orphan_nodes()?;
-        if orphans_removed > 0 {
-            // Los nodos se borraron por SQL: resincronizar el índice en RAM.
-            self.reload_index()?;
-        }
 
         Ok(DecayReport {
             edges_decayed:  updated_count as u64,
@@ -1755,15 +1863,21 @@ impl MemoryGraph {
         })
     }
 
-    /// Lee `(id, weight, desde, procedencia)` de todas las aristas, donde
-    /// `desde` es el instante más reciente entre el último acceso y la última
-    /// pasada de decaimiento: el intervalo que aún no se ha descontado del peso.
-    fn fetch_edges_for_decay(&self) -> Result<Vec<(String, f64, i64, EdgeOrigin)>, MemoryError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, weight, MAX(last_accessed, COALESCE(decayed_at, 0)), origin FROM edges",
-        )?;
+    /// Lee `(id, weight, desde, procedencia)` de las aristas con alguna de
+    /// las procedencias `origins`, donde `desde` es el instante más reciente
+    /// entre el último acceso y la última pasada de decaimiento: el
+    /// intervalo que aún no se ha descontado del peso.
+    fn fetch_edges_for_decay(&self, origins: &[&str]) -> Result<Vec<(String, f64, i64, EdgeOrigin)>, MemoryError> {
+        if origins.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; origins.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, weight, MAX(last_accessed, COALESCE(decayed_at, 0)), origin
+             FROM edges WHERE origin IN ({placeholders})"
+        ))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(origins), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, f64>(1)?,
@@ -1819,16 +1933,137 @@ impl MemoryGraph {
     /// Un NOT EXISTS con subquery es más eficiente que un LEFT JOIN en
     /// SQLite para grafos densos, porque puede usar el índice de `source_id`
     /// y cortocircuitar en el primer match.
+    ///
+    /// Paso 27: los borrados se quitan del índice en RAM uno a uno; antes se
+    /// recargaba entero desde los BLOBs (≈1,5 GB con un millón de nodos).
     fn prune_orphan_nodes(&self) -> Result<usize, MemoryError> {
-        let count = self.conn.execute(
-            "DELETE FROM nodes
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM edges
-                 WHERE edges.source_id = nodes.id OR edges.target_id = nodes.id
-             )",
-            [],
+        let removed: Vec<String> = self.conn
+            .prepare(
+                "DELETE FROM nodes
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM edges
+                     WHERE edges.source_id = nodes.id OR edges.target_id = nodes.id
+                 )
+                 RETURNING id",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut index = self.index.borrow_mut();
+        for id in &removed {
+            index.remove(id);
+        }
+        Ok(removed.len())
+    }
+
+    // ──────────────────────────────────────────────────────
+    //  Paso 27 — Importación por lotes (ver importer.rs)
+    // ──────────────────────────────────────────────────────
+
+    /// Estado de un lote, si existe.
+    pub fn import_record(&self, batch: &str) -> Result<Option<ImportRecord>, MemoryError> {
+        Ok(self.conn
+            .query_row(
+                &format!("SELECT {IMPORT_COLUMNS} FROM imports WHERE batch = ?1"),
+                params![batch],
+                ImportRecord::from_row,
+            )
+            .optional()?)
+    }
+
+    /// Todos los lotes, del más reciente al más antiguo.
+    pub fn import_records(&self) -> Result<Vec<ImportRecord>, MemoryError> {
+        Ok(self.conn
+            .prepare(&format!("SELECT {IMPORT_COLUMNS} FROM imports ORDER BY started_at DESC"))?
+            .query_map([], ImportRecord::from_row)?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Registra un lote nuevo, sin progreso.
+    pub fn begin_import(&self, batch: &str, file: &str) -> Result<(), MemoryError> {
+        self.conn.execute(
+            "INSERT INTO imports (batch, file, started_at) VALUES (?1, ?2, ?3)",
+            params![batch, file, current_unix_ts()],
         )?;
-        Ok(count)
+        Ok(())
+    }
+
+    /// Marca un lote como completo.
+    pub fn finish_import(&self, batch: &str) -> Result<(), MemoryError> {
+        self.conn.execute(
+            "UPDATE imports SET finished_at = ?1 WHERE batch = ?2",
+            params![current_unix_ts(), batch],
+        )?;
+        Ok(())
+    }
+
+    /// Escribe un tramo de un lote en UNA transacción junto con su progreso
+    /// (`lines_done` = líneas del archivo ya procesadas): si el proceso se
+    /// corta, el lote se reanuda justo después del último tramo confirmado.
+    ///
+    /// Las aristas nuevas llevan `origin = imported` y `source = batch`. Una
+    /// relación que el grafo ya tenía no se toca: deshacer el lote no debe
+    /// borrar lo que el sistema sabía por otra vía.
+    pub fn apply_import_chunk(
+        &self,
+        batch:      &str,
+        lines_done: u64,
+        nodes:      &[Node],
+        edges:      &[(String, String, String, f64)],
+    ) -> Result<ChunkOutcome, MemoryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let written = (|| {
+            let mut out = ChunkOutcome::default();
+            for node in nodes {
+                match self.insert_node(node) {
+                    Ok(()) => out.nodes_added += 1,
+                    Err(MemoryError::DuplicateNode(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let provenance = Provenance::new(EdgeOrigin::Imported).with_source(batch);
+            for (source, relation, target, weight) in edges {
+                match self.insert_edge_from(source, relation, target, *weight, &provenance) {
+                    Ok(_) => out.edges_added += 1,
+                    Err(MemoryError::DuplicateEdge { .. }) => out.edges_existing += 1,
+                    Err(e) => return Err(e),
+                }
+            }
+            self.conn.execute(
+                "UPDATE imports
+                 SET lines_done = ?1, nodes_added = nodes_added + ?2, edges_added = edges_added + ?3
+                 WHERE batch = ?4",
+                params![lines_done as i64, out.nodes_added as i64, out.edges_added as i64, batch],
+            )?;
+            Ok(out)
+        })();
+        match written {
+            Ok(out) => {
+                tx.commit()?;
+                Ok(out)
+            }
+            Err(e) => {
+                drop(tx); // rollback
+                // Los nodos del tramo ya entraron en el índice en RAM.
+                self.reload_index()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Deshace un lote: borra sus aristas y los nodos que se quedan sin
+    /// ninguna. Devuelve `(aristas, nodos)` borrados, o `None` si el lote no
+    /// existe.
+    pub fn undo_import(&self, batch: &str) -> Result<Option<(usize, usize)>, MemoryError> {
+        if self.import_record(batch)?.is_none() {
+            return Ok(None);
+        }
+        let edges = self.conn.execute(
+            "DELETE FROM edges WHERE origin = 'imported' AND source = ?1",
+            params![batch],
+        )?;
+        let nodes = self.prune_orphan_nodes()?;
+        self.conn.execute("DELETE FROM imports WHERE batch = ?1", params![batch])?;
+        Ok(Some((edges, nodes)))
     }
 }
 
@@ -1896,6 +2131,46 @@ pub struct GraphSnapshot {
     pub nodes: Vec<Node>,
     /// Aristas entre nodos visibles, ordenadas por peso descendente.
     pub edges: Vec<Edge>,
+}
+
+/// Un lote de importación (Paso 27).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImportRecord {
+    pub batch:       String,
+    pub file:        String,
+    /// Líneas del archivo ya procesadas: desde aquí se reanuda.
+    pub lines_done:  u64,
+    pub nodes_added: u64,
+    pub edges_added: u64,
+    pub started_at:  i64,
+    /// `None` mientras el lote está a medias.
+    pub finished_at: Option<i64>,
+}
+
+const IMPORT_COLUMNS: &str =
+    "batch, file, lines_done, nodes_added, edges_added, started_at, finished_at";
+
+impl ImportRecord {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            batch:       r.get(0)?,
+            file:        r.get(1)?,
+            lines_done:  r.get::<_, i64>(2)? as u64,
+            nodes_added: r.get::<_, i64>(3)? as u64,
+            edges_added: r.get::<_, i64>(4)? as u64,
+            started_at:  r.get(5)?,
+            finished_at: r.get(6)?,
+        })
+    }
+}
+
+/// Lo que escribió un tramo de importación.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChunkOutcome {
+    pub nodes_added:    u64,
+    pub edges_added:    u64,
+    /// Relaciones del archivo que el grafo ya tenía (no se tocan).
+    pub edges_existing: u64,
 }
 
 /// Resultado de [`MemoryGraph::learn_edge`] (Paso 26).
@@ -2692,6 +2967,41 @@ mod tests {
 
         g.delete_node("b").unwrap();
         assert_eq!(g.gap_attempts("a", "b").unwrap(), 0, "ON DELETE CASCADE");
+    }
+
+    /// Paso 27: un concepto con muchas relaciones del mismo tipo y peso no
+    /// debe dejar fuera la que se pregunta ni las demás.
+    #[test]
+    fn test_retrieve_context_prioritizes_asked_relation_and_diversifies() {
+        let g = in_memory_graph();
+        g.insert_node(&Node::new("japon", "concept", "Japón")).unwrap();
+        for (relation, target) in [("moneda", "yen"), ("tiene_capital", "tokio"), ("idioma_oficial", "japones")] {
+            g.insert_node(&Node::new(target, "concept", target)).unwrap();
+            g.insert_edge("japon", relation, target, 0.9).unwrap();
+        }
+        for i in 0..30 {
+            let org = format!("organizacion_{i}");
+            g.insert_node(&Node::new(&org, "concept", &org)).unwrap();
+            g.insert_edge("japon", "miembro_de", &org, 0.9).unwrap();
+        }
+        let relations = |focus: &str| -> Vec<String> {
+            let cfg = RetrievalConfig { max_edges: 4, focus: vec![focus.to_string()], ..RetrievalConfig::default() };
+            g.retrieve_context(&["Japón".to_string()], None, &cfg).unwrap().edges.into_iter().map(|e| e.relation).collect()
+        };
+
+        let mut diverse = relations("háblame de Japón");
+        diverse.sort();
+        assert_eq!(diverse, ["idioma_oficial", "miembro_de", "moneda", "tiene_capital"], "una de cada relación");
+        assert_eq!(relations("¿Qué moneda usa Japón?")[0], "moneda");
+        assert_eq!(relations("¿Cuáles son los idiomas oficiales de Japón?")[0], "idioma_oficial");
+        assert!(relations("¿De qué organizaciones es miembro Japón?").iter().all(|r| r == "miembro_de"));
+
+        // Una sonda que nombra una relación del contexto está cubierta;
+        // un concepto ausente, no.
+        let probes = ["Japón".to_string(), "idiomas oficiales".to_string(), "Plutón".to_string()];
+        let cfg = RetrievalConfig { focus: vec!["¿Cuáles son los idiomas oficiales de Japón y Plutón?".into()], ..RetrievalConfig::default() };
+        assert_eq!(g.retrieve_context(&probes, None, &cfg).unwrap().uncovered, ["Plutón"]);
+        assert_eq!((singular("oficiales"), singular("paises"), singular("idiomas"), singular("gas")), ("oficial", "pais", "idioma", "gas"));
     }
 
     // ─────────────── PROCEDENCIA (Paso 26) ───────────────

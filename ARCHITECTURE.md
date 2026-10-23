@@ -181,10 +181,11 @@ Cada arista guarda de dónde vino (`edges.origin`) y su fuente (`edges.source`: 
 | `system` | conocimiento base sembrado al arrancar | no se olvida |
 | `researched` | aprendizaje de la investigación en caliente (con URLs) | 90 días |
 | `unknown` | aristas anteriores al Paso 26 | 90 días |
+| `imported` | `synaptocore importar` (fuente = nombre del lote) | no se olvida; se retira con `--deshacer <lote>` |
 | `federated` | otro agente, vía federación | 30 días |
 | `inferred` | consolidación del subconsciente | 14 días |
 
-Si una arista se vuelve a aprender con una procedencia más duradera (`learn_edge`), sube de categoría y su reloj se reinicia: lo que el subconsciente dedujo pasa a «investigado» cuando una fuente lo confirma, y a «enseñado» si lo enseña el usuario; nunca baja. `DecayPolicy::Uniform(λ)` aplica el mismo λ a todo (demos y tests).
+Si una arista se vuelve a aprender con una procedencia más duradera (`learn_edge`), sube de categoría y su reloj se reinicia: lo que el subconsciente dedujo pasa a «investigado» cuando una fuente lo confirma, y a «enseñado» si lo enseña el usuario; nunca baja; lo enseñado también reemplaza a lo importado, para que deshacer un lote no lo borre. El importador nunca modifica una arista existente. `DecayPolicy::Uniform(λ)` aplica el mismo λ a todo (demos y tests). La pasada del olvido solo lee las aristas que decaen.
 
 **Refuerzo Hebbiano**: cuando un nodo se consulta exitosamente (`semantic_search` retorna hit), se llama `MemoryGraph::reinforce_edge()` que incrementa `weight` y resetea `last_accessed`. Implementa "las neuronas que se activan juntas, se conectan."
 

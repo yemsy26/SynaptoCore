@@ -12,11 +12,12 @@ SynaptoCore es un sistema de memoria semántica persistente con razonamiento aut
 2. [Requisitos](#requisitos)
 3. [Instalación y primer arranque](#instalación-y-primer-arranque)
 4. [Configuración (.env)](#configuración-env)
-5. [API REST](#api-rest)
-6. [CLI — sc](#cli--sc)
-7. [Memoria Federada (.synapse)](#memoria-federada-synapse)
-8. [Features opcionales](#features-opcionales)
-9. [Compilación de producción](#compilación-de-producción)
+5. [Importar conocimiento por lotes](#importar-conocimiento-por-lotes)
+6. [API REST](#api-rest)
+7. [CLI — sc](#cli--sc)
+8. [Memoria Federada (.synapse)](#memoria-federada-synapse)
+9. [Features opcionales](#features-opcionales)
+10. [Compilación de producción](#compilación-de-producción)
 
 ---
 
@@ -219,6 +220,38 @@ elige URLs. Los secretos van en variables de entorno y se citan como `${NOMBRE}`
 Plantilla completa en `conectores.example.json`. Con `POST`, los parámetros se envían como JSON. Un
 conector mal declarado (URL con un `{parámetro}` sin describir, variable de entorno ausente) se omite al
 arrancar con su motivo; los demás siguen funcionando.
+
+## Importar conocimiento por lotes
+
+`synaptocore importar` carga tripletas de un archivo JSONL directamente en el grafo, sin pasar por el LLM.
+Cada línea es una relación; `weight` es opcional (0.8 por defecto):
+
+```json
+{"subject": "Ecuador", "relation": "tiene_capital", "object": "Quito", "weight": 0.9}
+```
+
+```bash
+target/release/synaptocore importar paises.jsonl            # lote «paises» (nombre del archivo)
+target/release/synaptocore importar datos.jsonl --lote erp  # nombre de lote explícito
+target/release/synaptocore importar --lista
+target/release/synaptocore importar --deshacer paises
+```
+
+- Cada concepto se une al nodo que ya lo nombra (por su forma canónica: «Perú» = `peru`); los nuevos se vectorizan en bloque.
+- Lo importado no se olvida (procedencia `imported`) y una relación que el grafo ya tenía no se toca, así que `--deshacer` retira el lote entero sin borrar lo aprendido por otra vía.
+- Si el proceso se corta, repetir el mismo comando continúa donde iba.
+- Usa `synaptocore_memory.db` del directorio actual. Puede correr con el servidor en marcha, pero el servidor solo ve los conceptos nuevos en su índice semántico tras reiniciarlo.
+
+`scripts/wikidata_tripletas.py` genera ese JSONL desde Wikidata (solo biblioteca estándar de Python):
+
+```bash
+python scripts/wikidata_tripletas.py --preset paises -o paises.jsonl
+python scripts/wikidata_tripletas.py --clase Q11344 --propiedades P61:descubierto_por -o elementos.jsonl
+```
+
+Medido (release, CPU): 7 405 relaciones de 195 países en 1,6 s (+5,3 MB); 300 000 relaciones sintéticas
+con 147 000 conceptos en 186 s (≈1 600 líneas/s, ≈3 KB por concepto con sus relaciones, pico de 840 MB).
+Con ese grafo el servidor arranca en 2,7 s con 725 MB de RAM y responde desde la memoria en ≈1 s.
 
 ## API REST
 

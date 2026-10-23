@@ -19,6 +19,8 @@
 //   Paso 17: El Despertar (Optimización Release + Entorno)
 //   Paso 21: Concurrencia Cognitiva (locks breves + prioridad del usuario)
 //   Paso 25: Conectores externos por configuración (cualquier sistema HTTP)
+//   Paso 26: Olvido según la procedencia del conocimiento
+//   Paso 27: Índice por nombre normalizado e importador por lotes
 // ============================================================
 #![allow(dead_code)]
 
@@ -27,6 +29,7 @@ mod connectors;
 mod error;
 mod federated_memory;
 mod forgetting_curve;
+mod importer;
 mod llm_bridge;
 mod memory_graph;
 mod ollama_backend;
@@ -181,6 +184,17 @@ impl Clone for ServerMock {
 //   - Signal handling para Ctrl+C graceful shutdown
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Paso 27: `synaptocore importar …` trabaja sobre la misma base sin
+    // arrancar el servidor (ver importer.rs).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("importar") {
+        if let Err(e) = importer::run_cli(&args[1..]).await {
+            eprintln!("✗ {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     println!("╔════════════════════════════════════════════════════════════════════╗");
     println!("║  SynaptoCore v0.17 — El Despertar (Producción Ready)              ║");
     println!("╚════════════════════════════════════════════════════════════════════╝\n");
@@ -584,14 +598,16 @@ fn load_declared_connectors() -> Vec<connectors::HttpConnector> {
     }
 }
 
-/// Huella barata del grafo (nodos, aristas) para que el bucle subconsciente
-/// detecte cambios hechos por otros mientras espera (Paso 23).
-async fn graph_signature(graph: &Arc<Mutex<MemoryGraph>>) -> Option<(u64, u64)> {
+/// Huella barata del grafo para que el bucle subconsciente detecte lo que
+/// otros aprendieron mientras espera (Paso 23). Desde el Paso 27 es el mayor
+/// rowid de nodos y aristas (O(1)): solo las altas abren vacíos nuevos que
+/// investigar, y contar las tablas costaba ≈30 ms con el lock tomado.
+async fn graph_signature(graph: &Arc<Mutex<MemoryGraph>>) -> Option<(i64, i64)> {
     let graph = Arc::clone(graph);
-    tokio::task::spawn_blocking(move || {
-        let stats = graph.lock().ok()?.stats().ok()?;
-        Some((stats.node_count, stats.edge_count))
-    }).await.ok().flatten()
+    tokio::task::spawn_blocking(move || graph.lock().ok()?.change_marker().ok())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Espera la señal Ctrl+C para shutdown graceful.

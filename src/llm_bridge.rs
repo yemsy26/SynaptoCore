@@ -801,6 +801,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
         // ── 3. Recuperación semántica (único tramo con lock) ────────────
         let cfg = RetrievalConfig {
             min_edge_weight: prompts::MIN_CONTEXT_WEIGHT,
+            focus: vec![plan.rewritten_query.clone()],
             ..RetrievalConfig::default()
         };
         let context = graph

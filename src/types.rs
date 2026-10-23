@@ -191,16 +191,25 @@ pub enum EdgeOrigin {
     Inferred,
     /// Recibido de otro agente por federación.
     Federated,
+    /// Importado por lotes (Paso 27); `source` es el nombre del lote, que
+    /// permite deshacer la importación entera.
+    Imported,
 }
 
 impl EdgeOrigin {
+    pub const ALL: [Self; 7] = [
+        Self::Unknown, Self::System, Self::Taught, Self::Researched,
+        Self::Inferred, Self::Federated, Self::Imported,
+    ];
+
     /// Días sin uso para que el peso se reduzca a la mitad; `None` = no se
     /// olvida. Lo deducido sin supervisión caduca en semanas si nadie lo
-    /// usa; lo verificado, en meses; lo enseñado, nunca. Lo anterior al
-    /// Paso 26 se trata como verificado: ante la duda, no se borra.
+    /// usa; lo verificado, en meses; lo enseñado y lo importado, nunca (lo
+    /// importado se retira deshaciendo su lote). Lo anterior al Paso 26 se
+    /// trata como verificado: ante la duda, no se borra.
     pub fn half_life_days(self) -> Option<f64> {
         match self {
-            Self::System | Self::Taught      => None,
+            Self::System | Self::Taught | Self::Imported => None,
             Self::Researched | Self::Unknown => Some(90.0),
             Self::Federated                  => Some(30.0),
             Self::Inferred                   => Some(14.0),
@@ -211,12 +220,16 @@ impl EdgeOrigin {
     /// arista que ya existe? Gana la procedencia que más dura; a igual
     /// duración, una conocida reemplaza a `Unknown`. Así lo que el
     /// subconsciente dedujo pasa a «investigado» cuando una fuente lo
-    /// confirma, y nunca al revés.
+    /// confirma, y nunca al revés. Lo que el usuario enseña reemplaza a lo
+    /// importado: así deshacer un lote no borra lo que él confirmó.
     pub fn supersedes(self, current: Self) -> bool {
         match (self.half_life_days(), current.half_life_days()) {
             (None, Some(_))                  => true,
             (Some(new), Some(old)) if new > old => true,
-            (new, old) if new == old         => current == Self::Unknown && self != Self::Unknown,
+            (new, old) if new == old         => {
+                (current == Self::Unknown && self != Self::Unknown)
+                    || (current == Self::Imported && matches!(self, Self::Taught | Self::System))
+            }
             _                                => false,
         }
     }
@@ -229,6 +242,7 @@ impl EdgeOrigin {
             Self::Researched => "researched",
             Self::Inferred   => "inferred",
             Self::Federated  => "federated",
+            Self::Imported   => "imported",
         }
     }
 
@@ -240,6 +254,7 @@ impl EdgeOrigin {
             "researched" => Self::Researched,
             "inferred"   => Self::Inferred,
             "federated"  => Self::Federated,
+            "imported"   => Self::Imported,
             _            => Self::Unknown,
         }
     }
@@ -312,12 +327,15 @@ mod tests {
         assert!(!Inferred.supersedes(Unknown), "lo anterior al Paso 26 dura más que lo deducido");
         assert!(!Taught.supersedes(System));
         assert!(!Researched.supersedes(Researched));
+        assert!(Taught.supersedes(Imported), "deshacer un lote no borra lo enseñado");
+        assert!(!Imported.supersedes(Taught));
+        assert!(!Researched.supersedes(Imported), "lo importado no se olvida");
     }
 
     #[test]
     fn test_origin_round_trip() {
         use EdgeOrigin::*;
-        for origin in [Unknown, System, Taught, Researched, Inferred, Federated] {
+        for origin in EdgeOrigin::ALL {
             assert_eq!(EdgeOrigin::parse(origin.as_str()), origin);
             assert_eq!(serde_json::to_value(origin).unwrap(), origin.as_str());
         }
