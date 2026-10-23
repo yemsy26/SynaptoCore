@@ -56,6 +56,7 @@ use crate::error::MemoryError;
 use crate::memory_graph::{canonical_id, embed_texts, GraphAccess, MemoryGraph, RetrievalConfig};
 use crate::prompts;
 use crate::tools::ToolRegistry;
+use crate::truth_filter::{BoxedSearch, SearchBackend, SearchHit};
 use crate::types::Node;
 
 // ──────────────────────────────────────────────────────────────
@@ -81,8 +82,12 @@ const CONTEXT_SIZE: u32 = 4096;
 /// JSON de 10 triples = ~300 tokens. 512 es margen generoso.
 const MAX_EXTRACT_TOKENS: i32 = 512;
 
-/// Máximo de tokens a generar en síntesis de respuesta.
-const MAX_SYNTHESIS_TOKENS: i32 = 256;
+/// Máximo de tokens a generar en síntesis de respuesta. Paso 24: 256 → 384,
+/// las respuestas con fuentes citadas se cortaban a media frase.
+const MAX_SYNTHESIS_TOKENS: i32 = 384;
+
+/// Fuentes web por investigación en caliente (Paso 24).
+const MAX_RESEARCH_SOURCES: usize = 5;
 
 /// Temperatura para extracción: 0.1 = casi determinístico.
 /// Alta temperatura = más variedad = más alucinaciones en JSON estricto.
@@ -185,6 +190,125 @@ impl Plan {
             fallback:        true,
         }
     }
+
+    /// Saludo o charla (Paso 24): consulta sin herramienta que es charla
+    /// breve reconocible, o que no tiene entidades. Un plan de respaldo sin
+    /// entidades no cuenta: sin planificador no se sabe qué es.
+    pub fn is_conversation(&self) -> bool {
+        self.intent == Intent::Query
+            && self.tool.is_none()
+            && (is_small_talk(&self.rewritten_query) || (self.entities.is_empty() && !self.fallback))
+    }
+}
+
+/// Saludos que pueden encabezar un mensaje, el más largo primero.
+const GREETINGS: &[&str] = &[
+    "buenos dias", "buenas tardes", "buenas noches", "que tal", "buenas", "hola", "saludos",
+    "hey", "hello", "hi",
+];
+
+/// Charla breve que no pide información.
+const SMALL_TALK: &[&str] = &[
+    "como estas", "como esta", "como te va", "como va", "como andas", "que tal estas",
+    "gracias", "muchas gracias", "mil gracias", "adios", "hasta luego", "hasta pronto",
+    "nos vemos", "chao", "ok", "vale", "perfecto", "genial", "de acuerdo", "entendido",
+    "bien", "muy bien", "todo bien", "quien eres", "que eres", "como te llamas",
+    "que puedes hacer", "how are you", "thanks", "thank you", "bye",
+];
+
+/// ¿Es el mensaje un saludo, una cortesía o charla breve? (Paso 24)
+///
+/// Determinista a propósito: el planificador extrae "hola" como entidad, la
+/// memoria lo anclaba en el nodo «saludo» y el saludo reforzaba 7 aristas.
+/// "Hola, ¿qué es el grafeno?" no es charla: tras el saludo queda una pregunta.
+pub fn is_small_talk(message: &str) -> bool {
+    let words: Vec<String> = canonical_id(message)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect();
+    let mut rest = words.join(" ");
+    'strip: loop {
+        for greeting in GREETINGS {
+            if rest == *greeting {
+                return true;
+            }
+            if let Some(tail) = rest.strip_prefix(&format!("{greeting} ")) {
+                rest = tail.to_string();
+                continue 'strip;
+            }
+        }
+        break;
+    }
+    rest.is_empty() || SMALL_TALK.contains(&rest.as_str())
+}
+
+/// De dónde sale la respuesta (Paso 24). Se informa al cliente en el
+/// evento final del chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerMode {
+    /// Solo la memoria. Puede escalar a `Research` con `[INVESTIGAR]`.
+    Memory,
+    /// Datos en tiempo real de una herramienta, más la memoria.
+    Tool,
+    /// Fuentes web numeradas y citadas, más la memoria.
+    Research,
+    /// Sin memoria ni fuentes: conocimiento general etiquetado como no verificado.
+    General,
+    /// Saludos y charla.
+    Conversation,
+}
+
+impl AnswerMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Memory       => "memory",
+            Self::Tool         => "tool",
+            Self::Research     => "web",
+            Self::General      => "general",
+            Self::Conversation => "conversation",
+        }
+    }
+
+    fn system_prompt(&self) -> &'static str {
+        match self {
+            Self::Memory       => prompts::memory_answer_system_prompt(),
+            Self::Tool         => prompts::synthesis_system_prompt(),
+            Self::Research     => prompts::research_answer_system_prompt(),
+            Self::General      => prompts::general_answer_system_prompt(),
+            Self::Conversation => prompts::conversation_system_prompt(),
+        }
+    }
+}
+
+/// Comienzo de una respuesta en modo memoria (Paso 24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerHead {
+    /// Aún puede ser el marcador: hace falta más texto.
+    NeedMore,
+    /// El modelo pidió investigar: se descarta y se busca en la web.
+    Research,
+    /// Respuesta normal: se emite tal cual.
+    Answer,
+}
+
+/// Clasifica el comienzo de una respuesta en modo memoria: el modelo
+/// escribe `[INVESTIGAR]` cuando su memoria no alcanza. `finished` indica
+/// que el stream terminó (un marcador truncado también cuenta).
+pub fn classify_answer_head(head: &str, finished: bool) -> AnswerHead {
+    let text = head.trim_start().to_uppercase();
+    let marker = prompts::RESEARCH_MARKER;
+    if text.starts_with(&marker[..marker.len() - 1]) {
+        return AnswerHead::Research;
+    }
+    if marker.starts_with(text.as_str()) {
+        return match (finished, text.chars().count() > 1) {
+            (false, _)    => AnswerHead::NeedMore,
+            (true, true)  => AnswerHead::Research,
+            (true, false) => AnswerHead::Answer,
+        };
+    }
+    AnswerHead::Answer
 }
 
 /// Herramienta elegida por el planificador, con nombre ya validado contra
@@ -202,7 +326,16 @@ pub struct PreparedAnswer {
     /// Aristas inyectadas como contexto: se refuerzan (Hebb) cuando la
     /// respuesta se completa con éxito.
     pub context_edge_ids: Vec<String>,
+    /// Paso 24: de dónde sale la respuesta (elige el prompt del sistema).
+    pub mode:             AnswerMode,
+    /// Sondas de las que la memoria no sabe nada.
+    pub uncovered:        Vec<String>,
+    /// Contexto del grafo ya formateado, para reutilizarlo al investigar.
+    pub memory_context:   String,
+    /// Fuentes citables (modo `Research`), en el orden de sus números [n].
+    pub sources:          Vec<SearchHit>,
 }
+
 
 /// Resultado de una operacion de extraccion y memorizacion.
 #[derive(Debug, Clone)]
@@ -455,12 +588,21 @@ pub struct NeuralBridge<B: LlmBackend> {
     /// `None` → el ciclo de herramientas se salta completamente.
     /// `Some(registry)` → el LLM puede invocar herramientas antes de sintetizar.
     tool_registry: Option<Arc<ToolRegistry>>,
+    /// Buscador web para investigar en caliente (Paso 24). `None` → las
+    /// preguntas sin memoria se responden con conocimiento general etiquetado.
+    search: Option<BoxedSearch>,
 }
 
 impl<B: LlmBackend> NeuralBridge<B> {
     /// Crea un nuevo bridge con el backend dado.
     pub fn new(backend: B) -> Self {
-        Self { backend, tool_registry: None }
+        Self { backend, tool_registry: None, search: None }
+    }
+
+    /// Conecta el buscador web para la investigación en caliente (Paso 24).
+    pub fn with_search(mut self, search: BoxedSearch) -> Self {
+        self.search = Some(search);
+        self
     }
 
     /// Inyecta un `ToolRegistry` en el bridge (patrón builder, Paso 14).
@@ -676,6 +818,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             .collect();
         let graph_context = prompts::format_graph_context(&probes.join(", "), &triples);
         let question = &plan.rewritten_query;
+        let mode = if tool_output.is_some() { AnswerMode::Tool } else { AnswerMode::Memory };
         let user_prompt = match tool_output {
             Some(tool_result) => format!(
                 "Información en tiempo real:\n{tool_result}\n\nContexto del grafo:\n{graph_context}\n\nPregunta: {question}"
@@ -686,7 +829,88 @@ impl<B: LlmBackend> NeuralBridge<B> {
         Ok(PreparedAnswer {
             user_prompt,
             context_edge_ids: context.edges.into_iter().map(|e| e.edge_id).collect(),
+            mode,
+            uncovered: context.uncovered,
+            memory_context: graph_context,
+            sources: Vec::new(),
         })
+    }
+
+    /// Saludos y charla (Paso 24): sin grafo ni investigación. El historial
+    /// mantiene el hilo de la conversación.
+    pub fn prepare_conversation(&self, message: &str, history_text: &str) -> PreparedAnswer {
+        let history = history_text.trim();
+        let history = if history.is_empty() { "(vacío)" } else { history };
+        PreparedAnswer {
+            user_prompt:      format!("Historial:\n{history}\n\nUsuario: {}", message.trim()),
+            context_edge_ids: Vec::new(),
+            mode:             AnswerMode::Conversation,
+            uncovered:        Vec::new(),
+            memory_context:   String::new(),
+            sources:          Vec::new(),
+        }
+    }
+
+    /// ¿Investigar ANTES de responder? (Paso 24) Solo en modo memoria (con
+    /// herramienta ya hay datos en tiempo real):
+    ///   - sin contexto: la memoria no sabe nada; o
+    ///   - alguna entidad sin cubrir y hay buscador. Sin buscador se intenta
+    ///     con la memoria relacionada; si no alcanza, el modelo responde
+    ///     `[INVESTIGAR]` y se pasa a conocimiento general.
+    pub fn research_first(&self, prepared: &PreparedAnswer) -> bool {
+        prepared.mode == AnswerMode::Memory
+            && (prepared.context_edge_ids.is_empty() || (!prepared.uncovered.is_empty() && self.search.is_some()))
+    }
+
+    /// **Investigación en caliente** (Paso 24): busca en la web la pregunta
+    /// autocontenida y prepara una respuesta que cita las fuentes y usa la
+    /// memoria que haya. Sin buscador o sin resultados prepara una respuesta
+    /// de conocimiento general, que `answer`/`answer_stream` etiquetan como
+    /// no verificada: nunca se citan fuentes que no existen.
+    pub fn prepare_research(&self, plan: &Plan, memory: &PreparedAnswer) -> PreparedAnswer {
+        let question = &plan.rewritten_query;
+        let hits = self.search_web(question, &plan.entities);
+        let mut prepared = memory.clone();
+        // Hebb premia la memoria que respondió. Si hubo que investigar, la
+        // memoria del prompt no bastaba: reforzarla sumaba ruido en cada
+        // pregunta nueva (7-9 aristas por consulta en la prueba en vivo).
+        prepared.context_edge_ids.clear();
+        if hits.is_empty() {
+            prepared.mode = AnswerMode::General;
+            prepared.user_prompt = format!("Pregunta: {question}");
+            return prepared;
+        }
+        let memory_context = if memory.context_edge_ids.is_empty() { "(sin datos)" } else { &memory.memory_context };
+        prepared.mode = AnswerMode::Research;
+        prepared.user_prompt = format!(
+            "Memoria:\n{memory_context}\n\nFuentes:\n{}\n\nPregunta: {question}",
+            prompts::format_sources(&hits)
+        );
+        prepared.sources = hits;
+        prepared
+    }
+
+    /// Busca la pregunta en la web; si no hay resultados (SearXNG falla a
+    /// veces con frases largas), reintenta con las entidades del plan.
+    fn search_web(&self, question: &str, entities: &[String]) -> Vec<SearchHit> {
+        let Some(search) = &self.search else { return Vec::new() };
+        let mut queries = vec![question.to_string()];
+        let joined = entities.join(" ");
+        if !joined.trim().is_empty() && joined != *question {
+            queries.push(joined);
+        }
+        for query in queries {
+            match search.search_detailed(&query) {
+                Ok(hits) if !hits.is_empty() => return hits.into_iter().take(MAX_RESEARCH_SOURCES).collect(),
+                Ok(_) => log::info!("Sin resultados web para «{query}»"),
+                Err(e) => {
+                    // Un error de red no se arregla cambiando la consulta.
+                    log::warn!("Búsqueda web fallida para «{query}»: {e}");
+                    break;
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Ejecuta la herramienta del plan. Los errores se devuelven como texto
@@ -705,43 +929,84 @@ impl<B: LlmBackend> NeuralBridge<B> {
         }
     }
 
-    /// Inferencia final (sin streaming).
+    /// Inferencia final (sin streaming). El prompt del sistema depende del
+    /// modo; en modo `General` el servidor antepone la etiqueta de "no
+    /// verificado" (no se confía en que el modelo la escriba).
     pub fn answer(&self, prepared: &PreparedAnswer) -> Result<String, BridgeError> {
-        self.backend.complete(
-            prompts::synthesis_system_prompt(),
+        let text = self.backend.complete(
+            prepared.mode.system_prompt(),
             &prepared.user_prompt,
             MAX_SYNTHESIS_TOKENS,
             SYNTHESIS_TEMPERATURE,
-        )
+        )?;
+        Ok(match prepared.mode {
+            AnswerMode::General => format!("{}{text}", prompts::GENERAL_KNOWLEDGE_LABEL),
+            _ => text,
+        })
     }
 
-    /// Inferencia final como stream de tokens (SSE).
+    /// Inferencia final como stream de tokens (SSE). Igual que `answer`.
     pub fn answer_stream(&self, prepared: &PreparedAnswer) -> Result<BoxedTokenStream, BridgeError> {
-        self.backend.stream_synthesis(
-            prompts::synthesis_system_prompt(),
+        use futures_util::StreamExt;
+        let stream = self.backend.stream_synthesis(
+            prepared.mode.system_prompt(),
             &prepared.user_prompt,
             MAX_SYNTHESIS_TOKENS,
             SYNTHESIS_TEMPERATURE,
-        )
+        )?;
+        Ok(match prepared.mode {
+            AnswerMode::General => {
+                let label = futures_util::stream::once(async { Ok(prompts::GENERAL_KNOWLEDGE_LABEL.to_string()) });
+                Box::pin(label.chain(stream))
+            }
+            _ => stream,
+        })
     }
 
-    /// **Consulta fundamentada completa** (sin streaming): planificador →
-    /// herramienta → contexto semántico → respuesta → refuerzo hebbiano.
-    /// Dos llamadas al LLM en total.
+    /// **Responder siempre** (Paso 24), sin streaming:
+    ///   1. Saludo o charla → conversación.
+    ///   2. Memoria (y herramienta). Si alguna entidad no está en el grafo,
+    ///      o el modelo responde `[INVESTIGAR]`, investiga en la web.
+    ///   3. Refuerzo hebbiano de la memoria usada.
     ///
+    /// Devuelve también lo preparado (modo y fuentes): el llamador decide si
+    /// aprender de las fuentes en segundo plano (`research::learn_from_sources`).
     /// Siempre responde como consulta aunque el plan diga "learn": el
     /// enrutado aprender/consultar es cosa del endpoint `/chat`.
+    pub fn ask<G: GraphAccess>(
+        &self,
+        graph:        &G,
+        question:     &str,
+        history_text: &str,
+    ) -> Result<(String, PreparedAnswer), BridgeError> {
+        let plan = self.plan(question, history_text);
+        if plan.is_conversation() {
+            let prepared = self.prepare_conversation(question, history_text);
+            return Ok((self.answer(&prepared)?, prepared));
+        }
+        let mut prepared = self.prepare_answer(graph, &plan)?;
+        if self.research_first(&prepared) {
+            prepared = self.prepare_research(&plan, &prepared);
+        }
+        let mut answer = self.answer(&prepared)?;
+        if prepared.mode == AnswerMode::Memory
+            && classify_answer_head(&answer, true) == AnswerHead::Research
+        {
+            prepared = self.prepare_research(&plan, &prepared);
+            answer = self.answer(&prepared)?;
+        }
+        reinforce_context(graph, &prepared.context_edge_ids);
+        Ok((answer, prepared))
+    }
+
+    /// Respuesta de `ask`, sin los detalles de cómo se obtuvo.
     pub fn query_with_memory<G: GraphAccess>(
         &self,
         graph:        &G,
         question:     &str,
         history_text: &str,
     ) -> Result<String, BridgeError> {
-        let plan = self.plan(question, history_text);
-        let prepared = self.prepare_answer(graph, &plan)?;
-        let answer = self.answer(&prepared)?;
-        reinforce_context(graph, &prepared.context_edge_ids);
-        Ok(answer)
+        self.ask(graph, question, history_text).map(|(answer, _)| answer)
     }
 
     // ──────────────────────────────────────────────────────────
@@ -845,7 +1110,7 @@ pub fn init_brain(
 /// Estrategia: busca el primer `{` y el último `}` para extraer el bloque JSON.
 /// Esto es más robusto que from_str directo porque los modelos pequeños
 /// frecuentemente añaden "Aquí está el resultado:" o "```json" alrededor.
-fn parse_json_response<T: for<'de> Deserialize<'de>>(
+pub(crate) fn parse_json_response<T: for<'de> Deserialize<'de>>(
     raw: &str,
 ) -> Result<T, serde_json::Error> {
     // Intento 1: parsear directamente (el modelo fue obediente).
@@ -873,7 +1138,7 @@ pub fn node_name(id: &str) -> String {
 }
 
 /// Valida que una triple extraída sea semánticamente coherente.
-fn validate_triple(triple: &ExtractedTriple) -> bool {
+pub(crate) fn validate_triple(triple: &ExtractedTriple) -> bool {
     !triple.subject.is_empty()
         && !triple.relation.is_empty()
         && !triple.object.is_empty()
@@ -1670,16 +1935,135 @@ Espero que sea útil."#;
         assert!(bridge.backend.user_prompts()[1].contains("reduce"));
     }
 
+    /// Paso 24: sin memoria ni buscador, conocimiento general etiquetado
+    /// (antes respondía "no se encontró información").
     #[test]
-    fn test_query_unknown_entity_answers_without_context() {
+    fn test_unknown_entity_without_search_answers_with_labeled_general_knowledge() {
         let graph = MemoryGraph::open(":memory:").unwrap();
         let mock = MockLlmBackend::new(vec![
             plan_json("query", "¿Qué hace la oxitocina?", &["oxitocina"], "none"),
-            "No lo sé.".to_string(),
+            "Es una hormona.".to_string(),
         ]);
         let bridge = NeuralBridge::new(mock);
-        bridge.query_with_memory(&graph, "¿Qué hace la oxitocina?", "").unwrap();
-        assert!(bridge.backend.user_prompts()[1].contains("No se encontró información"));
+        let (answer, prepared) = bridge.ask(&graph, "¿Qué hace la oxitocina?", "").unwrap();
+        assert_eq!(prepared.mode, AnswerMode::General);
+        assert_eq!(answer, format!("{}Es una hormona.", prompts::GENERAL_KNOWLEDGE_LABEL));
+        assert_eq!(bridge.backend.user_prompts()[1], "Pregunta: ¿Qué hace la oxitocina?");
+        assert_eq!(bridge.backend.call_count(), 2, "planificador + respuesta");
+    }
+
+    // ── Paso 24: responder siempre ───────────────────────────────
+
+    fn titanio_graph() -> MemoryGraph {
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        graph.insert_node(&Node::new("titanio", "concept", "titanio")).unwrap();
+        graph.insert_node(&Node::new("metal_ligero", "concept", "metal ligero")).unwrap();
+        graph.insert_edge("titanio", "es", "metal_ligero", 0.9).unwrap();
+        graph
+    }
+
+    fn web(snippets: Vec<&str>) -> BoxedSearch {
+        BoxedSearch::new(crate::truth_filter::MockSearchBackend::new(vec![snippets]))
+    }
+
+    #[test]
+    fn test_answer_head_detects_research_marker() {
+        assert_eq!(classify_answer_head("", false), AnswerHead::NeedMore);
+        assert_eq!(classify_answer_head(" [INVES", false), AnswerHead::NeedMore);
+        assert_eq!(classify_answer_head("[INVESTIGAR]", false), AnswerHead::Research);
+        assert_eq!(classify_answer_head("[investigar]", true), AnswerHead::Research);
+        assert_eq!(classify_answer_head("[INVESTIG", true), AnswerHead::Research, "marcador truncado");
+        assert_eq!(classify_answer_head("Titanio.", false), AnswerHead::Answer);
+        assert_eq!(classify_answer_head("[Nota] el titanio", false), AnswerHead::Answer);
+        assert_eq!(classify_answer_head("", true), AnswerHead::Answer, "respuesta vacía");
+    }
+
+    #[test]
+    fn test_greeting_is_conversation_without_memory() {
+        let graph = titanio_graph();
+        // El planificador real extrae "hola" como entidad: aun así es charla.
+        let mock = MockLlmBackend::new(vec![plan_json("query", "Hola, ¿cómo estás?", &["hola"], "none"), "¡Hola!".into()]);
+        let bridge = NeuralBridge::new(mock);
+        let (answer, prepared) = bridge.ask(&graph, "Hola, ¿cómo estás?", "User: hola").unwrap();
+        assert_eq!((answer.as_str(), prepared.mode), ("¡Hola!", AnswerMode::Conversation));
+        assert!(prepared.context_edge_ids.is_empty(), "un saludo no refuerza memoria");
+        assert!(bridge.backend.user_prompts()[1].contains("Historial:\nUser: hola"));
+        assert!(!Plan::fallback("¿Qué es Rust?").is_conversation(), "el plan de respaldo no es charla");
+    }
+
+    #[test]
+    fn test_small_talk_detection() {
+        for msg in ["Hola", "Hola, ¿cómo estás?", "¡Buenos días!", "hola buenas, que tal", "Gracias!",
+                    "ok", "¿Qué puedes hacer?", "Hey, thanks"] {
+            assert!(is_small_talk(msg), "{msg}");
+        }
+        for msg in ["Hola, ¿qué es el grafeno?", "¿Qué tal el clima en Quito?", "Explícame UML",
+                    "Gracias por explicarme el cortisol, ¿y la dopamina?"] {
+            assert!(!is_small_talk(msg), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_uncovered_entity_researches_and_cites_sources() {
+        let graph = titanio_graph();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué es el grafeno?", &["grafeno"], "none"),
+            "El grafeno es una lámina de carbono [1].".into(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["El grafeno es una lámina de carbono."]));
+        let (answer, prepared) = bridge.ask(&graph, "¿Qué es el grafeno?", "").unwrap();
+
+        assert_eq!(prepared.mode, AnswerMode::Research);
+        assert_eq!(prepared.sources.len(), 1);
+        assert!(answer.ends_with("[1]."));
+        let prompt = &bridge.backend.user_prompts()[1];
+        assert!(prompt.contains("Fuentes:\n[1] El grafeno es una lámina de carbono."), "{prompt}");
+        assert!(prompt.contains("Memoria:\n(sin datos)"));
+        assert_eq!(bridge.backend.call_count(), 2, "la búsqueda no gasta llamadas al LLM");
+    }
+
+    #[test]
+    fn test_covered_entity_answers_from_memory() {
+        let graph = titanio_graph();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Cómo es el titanio?", &["titanio"], "none"),
+            "Es un metal ligero.".into(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["no debería buscarse"]));
+        let (_, prepared) = bridge.ask(&graph, "¿Cómo es el titanio?", "").unwrap();
+        assert_eq!(prepared.mode, AnswerMode::Memory);
+        assert!(prepared.uncovered.is_empty());
+        assert!(prepared.sources.is_empty());
+    }
+
+    /// La memoria conoce la entidad pero no la respuesta: el modelo pide
+    /// investigar y la respuesta final sale de la web.
+    #[test]
+    fn test_research_marker_escalates_memory_answer_to_web() {
+        let graph = titanio_graph();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Quién descubrió el titanio?", &["titanio"], "none"),
+            prompts::RESEARCH_MARKER.to_string(),
+            "William Gregor, en 1791 [1].".into(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["William Gregor descubrió el titanio en 1791."]));
+        let (answer, prepared) = bridge.ask(&graph, "¿Quién descubrió el titanio?", "").unwrap();
+
+        assert_eq!(answer, "William Gregor, en 1791 [1].");
+        assert_eq!(prepared.mode, AnswerMode::Research);
+        assert!(prepared.context_edge_ids.is_empty(), "una respuesta de la web no refuerza la memoria");
+        assert!(bridge.backend.user_prompts()[2].contains("titanio es metal ligero"), "memoria + fuentes");
+    }
+
+    #[tokio::test]
+    async fn test_general_stream_starts_with_unverified_label() {
+        use futures_util::StreamExt;
+        let bridge = NeuralBridge::new(MockLlmBackend::new(vec!["París."]));
+        let mut prepared = bridge.prepare_conversation("x", "");
+        prepared.mode = AnswerMode::General;
+        let tokens: Vec<String> = bridge.answer_stream(&prepared).unwrap()
+            .map(|t| t.unwrap()).collect().await;
+        assert_eq!(tokens.concat(), format!("{}París.", prompts::GENERAL_KNOWLEDGE_LABEL));
     }
 
     // ── Paso 22: memoria semántica + refuerzo hebbiano ─────────

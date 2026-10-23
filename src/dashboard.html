@@ -225,6 +225,16 @@ button { cursor: pointer; }
 .typing span:nth-child(2) { animation-delay: .15s; }
 .typing span:nth-child(3) { animation-delay: .3s; }
 .pending-label { font-size: 12px; color: var(--text-2); }
+/* Paso 24: fuentes citadas de la investigación en caliente */
+.sources { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line-2); font-size: 12px; }
+.sources[hidden] { display: none; }
+.sources-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font: 10.5px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); }
+.sources ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.sources a { color: var(--cyan-2); text-decoration: none; overflow-wrap: anywhere; }
+.sources a:hover { text-decoration: underline; }
+.src-host { margin-left: 4px; font: 10.5px var(--mono); color: var(--text-3); }
+.cite { display: inline-block; min-width: 16px; padding: 0 4px; margin: 0 1px; border-radius: 4px; font: 600 10px/16px var(--mono); text-align: center; vertical-align: 1px; color: var(--cyan-2); background: rgba(34,211,238,.12); text-decoration: none; }
+a.cite:hover { background: rgba(34,211,238,.25); }
 .pending-label b { font: 500 11px var(--mono); color: var(--cyan-2); }
 
 .learn-card {
@@ -1329,6 +1339,7 @@ function interpret(evt) {
   if (/sin tripletas nuevas/.test(m)) return { kind: 'no-triples', text: m.replace(/^⚠\s*/, '') };
   if (/Pausa cognitiva/.test(m)) return { kind: 'yield-pause', text: m.replace(/^⏸\s*/, '') };
   if (/^▶ Reanudado tras/.test(m)) return { kind: 'yield-resume', text: m.replace(/^▶\s*/, '') };
+  if (/^📚/.test(m)) return { kind: 'research', text: m.replace(/^📚\s*/, '') };
   if (evt.event_type === 'Error' || /^⚠/.test(m)) return { kind: 'warn', text: m.replace(/^⚠\s*/, '') };
   return { kind: 'info', text: m };
 }
@@ -1511,6 +1522,7 @@ const EV_META = {
   'yield-pause':   { tag: 'Prioridad',     tone: 'amber',   ico: 'pause',  group: 'system' },
   'yield-resume':  { tag: 'Prioridad',     tone: 'cyan',    ico: 'play',   group: 'system' },
   'info':          { tag: 'Sistema',       tone: '',        ico: 'info',   group: 'system' },
+  'research':      { tag: 'Investigación', tone: 'cyan',    ico: 'globe',  group: 'research' },
 };
 
 function eventHtml(it, evt) {
@@ -1667,12 +1679,32 @@ function appendUser(text) {
 }
 
 function appendPending() {
-  const el = h(`<div class="msg msg--agent"><div class="avatar">${AVATAR}</div><div class="bubble"><span class="typing"><span></span><span></span><span></span></span><span class="pending-label">Procesando en el córtex · <b>0.0 s</b></span></div></div>`);
+  const el = h(`<div class="msg msg--agent"><div class="avatar">${AVATAR}</div><div class="bubble"><span class="typing"><span></span><span></span><span></span></span><span class="pending-label"><span class="pl-text">Procesando en el córtex</span> · <b>0.0 s</b></span></div></div>`);
   chatLog().append(el);
   scrollChat(true);
   const b = el.querySelector('b'), t0 = performance.now();
   const iv = setInterval(() => { b.textContent = `${((performance.now() - t0) / 1000).toFixed(1)} s`; }, 100);
-  return { remove() { clearInterval(iv); el.remove(); } };
+  return {
+    remove() { clearInterval(iv); el.remove(); },
+    label(text) { el.querySelector('.pl-text').textContent = text; },
+  };
+}
+
+// ── Paso 24: fuentes citadas ───────────────────────────────────
+const isHttp = url => /^https?:\/\//i.test(url || '');
+function hostOf(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+/** Convierte las citas [n] en enlaces a su fuente (solo números que existan). */
+function linkCitations(html, sources) {
+  if (!sources?.length) return html;
+  return html.replace(/\[(\d+)\]/g, (m, n) => {
+    const s = sources[n - 1];
+    if (!s) return m;
+    return isHttp(s.url)
+      ? `<a class="cite" href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.title || s.url)}">${n}</a>`
+      : `<span class="cite">${n}</span>`;
+  });
 }
 
 /** Markdown mínimo y seguro: se escapa todo antes de transformar. */
@@ -1703,18 +1735,33 @@ function renderAgentText(raw) {
 }
 
 function appendAgent() {
-  const el = h(`<div class="msg msg--agent"><div class="avatar">${AVATAR}</div><div class="bubble"><div class="bubble-body"></div><div class="bubble-meta"></div></div></div>`);
+  const el = h(`<div class="msg msg--agent"><div class="avatar">${AVATAR}</div><div class="bubble"><div class="bubble-body"></div><div class="sources" hidden></div><div class="bubble-meta"></div></div></div>`);
   chatLog().append(el);
   const body = el.querySelector('.bubble-body'), meta = el.querySelector('.bubble-meta');
+  const srcBox = el.querySelector('.sources');
   return {
-    update(raw, streaming = true) {
+    update(raw, streaming = true, sources = null) {
       const { html, thinking } = renderAgentText(raw);
       const think = thinking ? `<div class="thinking-note">${icon('bulb')}razonando…</div>` : '';
-      body.innerHTML = html + think + (streaming && !thinking ? '<span class="caret"></span>' : '');
+      body.innerHTML = linkCitations(html, sources) + think + (streaming && !thinking ? '<span class="caret"></span>' : '');
       if (!html && !thinking && !streaming) body.innerHTML = '<p>(respuesta vacía)</p>';
       scrollChat();
     },
     meta(parts) { meta.innerHTML = parts.map(p => `<span>${escapeHtml(p)}</span>`).join(''); },
+    sources(list) {
+      if (!list?.length) return;
+      const items = list.map(s => {
+        const host = hostOf(s.url);
+        const label = escapeHtml(s.title || host || `Fuente ${s.n}`);
+        const hostTag = host ? `<span class="src-host">${escapeHtml(host)}</span>` : '';
+        return isHttp(s.url)
+          ? `<li><a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer"><b>[${s.n}]</b> ${label}</a>${hostTag}</li>`
+          : `<li><b>[${s.n}]</b> ${label}</li>`;
+      }).join('');
+      srcBox.innerHTML = `<div class="sources-head">${icon('globe')}Fuentes consultadas</div><ol>${items}</ol>`;
+      srcBox.hidden = false;
+      scrollChat();
+    },
   };
 }
 
@@ -1796,6 +1843,12 @@ async function sendChat(text) {
         try { p = JSON.parse(json); } catch { continue; }
         if (p.session_id && p.session_id !== state.sessionId) setSession(p.session_id);
         if (p.intent) intent = p.intent;
+        // Paso 24: la memoria no alcanza y el servidor busca en la web.
+        if (p.status === 'researching') {
+          pending.label('Investigando en la web');
+          logLocal('research', `Investigando en la web: «${p.query || text}»`);
+          continue;
+        }
 
         if (p.error) {
           pending.remove();
@@ -1822,16 +1875,27 @@ async function sendChat(text) {
         if (p.done) {
           finished = true;
           const end = performance.now();
-          const parts = [`TTFT ${tFirst ? secs(tFirst) : '—'}`, `total ${secs(end)}`, intent === 'learn' ? 'asimilación' : 'consulta'];
+          // Paso 24: de dónde salió la respuesta.
+          const ORIGIN = {
+            memory: 'de mi memoria', web: 'investigado en la web', tool: 'datos en tiempo real',
+            general: 'conocimiento general · no verificado', conversation: 'conversación',
+          };
+          const origin = intent === 'learn' ? 'asimilación' : (ORIGIN[p.answered_from] || 'consulta');
+          const parts = [`TTFT ${tFirst ? secs(tFirst) : '—'}`, `total ${secs(end)}`, origin];
           // Paso 22: desglose del servidor y refuerzo hebbiano.
           if (p.timings) parts.push(`plan ${p.timings.plan_ms} ms`);
+          if (p.timings?.research_ms != null) parts.push(`búsqueda ${p.timings.research_ms} ms`);
           if (p.tool) parts.push(`herramienta ${p.tool}`);
           if (p.reinforced_edges) {
             parts.push(`+${p.reinforced_edges} conexiones reforzadas`);
             logLocal('graph', `Refuerzo hebbiano: ${p.reinforced_edges} conexión(es) usada(s) en la respuesta`);
             scheduleGraph();
           }
-          if (bubble) { bubble.update(raw, false); bubble.meta(parts); }
+          if (bubble) {
+            bubble.update(raw, false, p.sources);
+            bubble.sources(p.sources);
+            bubble.meta(parts);
+          }
           if (card) card.meta(parts);
         }
       }

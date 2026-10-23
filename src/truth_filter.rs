@@ -89,6 +89,23 @@ pub enum SearchError {
 /// Devuelve fragmentos de texto relevantes para la query dada.
 pub trait SearchBackend {
     fn search(&self, query: &str) -> Result<Vec<String>, SearchError>;
+
+    /// Resultados con título y URL para citar fuentes en el chat (Paso 24).
+    /// Por defecto, los snippets de `search` sin metadatos.
+    fn search_detailed(&self, query: &str) -> Result<Vec<SearchHit>, SearchError> {
+        Ok(self.search(query)?
+            .into_iter()
+            .map(|snippet| SearchHit { title: String::new(), url: String::new(), snippet })
+            .collect())
+    }
+}
+
+/// Un resultado de búsqueda citable (Paso 24).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SearchHit {
+    pub title:   String,
+    pub url:     String,
+    pub snippet: String,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -105,6 +122,11 @@ struct SearxngResult {
     /// resultados (por eso `Option`).
     #[serde(alias = "snippet")]
     content: Option<String>,
+    /// Paso 24: título y URL para citar la fuente en el chat.
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 /// Cuerpo completo de la respuesta JSON de SearXNG.
@@ -175,6 +197,11 @@ impl SearchBackend for SearxngBackend {
     /// El `CuriosityEngine` trata cualquier `Err` como "sin fuentes" (fail-open)
     /// y continúa el ciclo con `INCONCLUSIVE`. Nunca hace panic.
     fn search(&self, query: &str) -> Result<Vec<String>, SearchError> {
+        Ok(self.search_detailed(query)?.into_iter().map(|hit| hit.snippet).collect())
+    }
+
+    /// Paso 24: la misma petición, conservando título y URL de cada resultado.
+    fn search_detailed(&self, query: &str) -> Result<Vec<SearchHit>, SearchError> {
         // Construir URL: URL-encode la query para evitar caracteres inválidos.
         let url = format!(
             "{}/search?q={}&format=json",
@@ -214,15 +241,21 @@ impl SearchBackend for SearxngBackend {
             .json()
             .map_err(|e| SearchError::InvalidResponse(e.to_string()))?;
 
-        // Extraer el campo `content` de los top-N resultados no vacíos.
-        let snippets: Vec<String> = body.results
+        // Top-N resultados con snippet no vacío.
+        let hits: Vec<SearchHit> = body.results
             .into_iter()
-            .filter_map(|r| r.content)                 // descartar resultados sin snippet
-            .filter(|s| !s.trim().is_empty())           // descartar snippets vacíos
+            .filter_map(|r| {
+                let snippet = r.content.filter(|s| !s.trim().is_empty())?;
+                Some(SearchHit {
+                    title: r.title.unwrap_or_default(),
+                    url:   r.url.unwrap_or_default(),
+                    snippet,
+                })
+            })
             .take(self.max_results)
             .collect();
 
-        Ok(snippets)
+        Ok(hits)
     }
 }
 
@@ -249,6 +282,10 @@ impl BoxedSearch {
 impl SearchBackend for BoxedSearch {
     fn search(&self, query: &str) -> Result<Vec<String>, SearchError> {
         self.0.search(query)
+    }
+
+    fn search_detailed(&self, query: &str) -> Result<Vec<SearchHit>, SearchError> {
+        self.0.search_detailed(query)
     }
 }
 

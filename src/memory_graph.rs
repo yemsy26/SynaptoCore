@@ -373,6 +373,28 @@ pub struct RetrievedContext {
     pub seeds: Vec<(String, f32)>,
     /// Aristas para el prompt, de mayor a menor relevancia.
     pub edges: Vec<ContextEdge>,
+    /// Paso 24: sondas que ningún nodo que las NOMBRE cubre con aristas en
+    /// el contexto. Si hay alguna, el chat investiga antes de responder.
+    ///
+    /// La similitud semántica sola no cuenta: con nombres cortos el modelo
+    /// de embeddings da 0,8 a pares sin relación («llvm» ↔ «ejercicio»), y
+    /// en la prueba en vivo "grafeno" (sin nodo) se dio por cubierto con
+    /// aristas de otros conceptos y el modelo inventó la respuesta.
+    pub uncovered: Vec<String>,
+}
+
+/// Palabras de contenido de un nombre, en forma canónica y sin artículos ni
+/// preposiciones: "el Samsung Galaxy S24" → {samsung, galaxy, s24}.
+fn content_words(text: &str) -> HashSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "al", "a", "en",
+        "y", "e", "o", "u", "por", "para", "con", "sin", "sobre", "the", "of", "and",
+    ];
+    canonical_id(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !STOP_WORDS.contains(w))
+        .map(String::from)
+        .collect()
 }
 
 /// Par de ids en orden estable: clave de `gap_attempts` (Paso 23).
@@ -1228,12 +1250,9 @@ impl MemoryGraph {
         cfg:        &RetrievalConfig,
     ) -> Result<RetrievedContext, MemoryError> {
         let mut seeds: HashMap<String, f32> = HashMap::new();
-        let mut add_seed = |id: String, score: f32| {
-            let best = seeds.entry(id).or_insert(score);
-            if score > *best {
-                *best = score;
-            }
-        };
+        // Paso 24: semillas que NOMBRAN cada sonda (id exacto, o un nodo cuyo
+        // id o nombre contiene todas sus palabras), para la cobertura.
+        let mut probe_seeds: Vec<Vec<String>> = vec![Vec::new(); probes.len()];
         let has_index = self.vector_index_len() > 0;
 
         for (i, probe) in probes.iter().enumerate() {
@@ -1241,10 +1260,11 @@ impl MemoryGraph {
             if probe.is_empty() {
                 continue;
             }
+            let mut found: Vec<(String, f32)> = Vec::new();
             // 1a. Coincidencia exacta de identificador: la señal más precisa.
             for candidate in [probe.to_string(), canonical_id(probe)] {
                 if self.node_exists(&candidate)? {
-                    add_seed(candidate, 1.0);
+                    found.push((candidate, 1.0));
                 }
             }
             // 1b. Similitud coseno; sin vectores, búsqueda léxica.
@@ -1252,20 +1272,37 @@ impl MemoryGraph {
                 Some(q) if has_index => {
                     for (id, sim) in self.nearest_nodes(q, cfg.seeds_per_probe) {
                         if sim >= cfg.min_similarity {
-                            add_seed(id, sim);
+                            found.push((id, sim));
                         }
                     }
                 }
                 _ => {
                     for node in self.search_nodes(probe, cfg.seeds_per_probe)? {
-                        add_seed(node.id, LEXICAL_SEED_SCORE);
+                        found.push((node.id, LEXICAL_SEED_SCORE));
                     }
+                }
+            }
+            let words = content_words(probe);
+            for (id, score) in found {
+                let names_probe = score >= 1.0 || {
+                    let name = self.get_node(&id)?.map(|n| n.name).unwrap_or_default();
+                    !words.is_empty()
+                        && (words.is_subset(&content_words(&id)) || words.is_subset(&content_words(&name)))
+                };
+                if names_probe {
+                    probe_seeds[i].push(id.clone());
+                }
+                let best = seeds.entry(id).or_insert(score);
+                if score > *best {
+                    *best = score;
                 }
             }
         }
 
         // 2. Expansión a 1 salto, quedándose con la mejor relevancia por arista.
         let mut edges: HashMap<String, ContextEdge> = HashMap::new();
+        // Semillas que alcanzan cada arista (para la cobertura).
+        let mut reached_by: HashMap<String, Vec<String>> = HashMap::new();
         for (seed_id, score) in &seeds {
             let hood = match self.get_neighbors(seed_id, TraversalDirection::Both) {
                 Ok(h) => h,
@@ -1276,6 +1313,7 @@ impl MemoryGraph {
                 if edge.weight < cfg.min_edge_weight {
                     continue;
                 }
+                reached_by.entry(edge.id.clone()).or_default().push(seed_id.clone());
                 let relevance = f64::from(*score) * edge.weight;
                 if edges.get(&edge.id).is_some_and(|e| e.relevance >= relevance) {
                     continue;
@@ -1301,9 +1339,23 @@ impl MemoryGraph {
         edges.sort_by(|a, b| b.relevance.total_cmp(&a.relevance).then_with(|| a.edge_id.cmp(&b.edge_id)));
         edges.truncate(cfg.max_edges);
 
+        // 4. Cobertura: una sonda está cubierta si algún nodo que la nombra
+        //    aporta al menos una arista al contexto final.
+        let covered_seeds: HashSet<&String> = edges
+            .iter()
+            .filter_map(|e| reached_by.get(&e.edge_id))
+            .flatten()
+            .collect();
+        let uncovered = probes
+            .iter()
+            .zip(&probe_seeds)
+            .filter(|(probe, ids)| !probe.trim().is_empty() && !ids.iter().any(|id| covered_seeds.contains(id)))
+            .map(|(probe, _)| probe.trim().to_string())
+            .collect();
+
         let mut seeds: Vec<(String, f32)> = seeds.into_iter().collect();
         seeds.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(RetrievedContext { seeds, edges })
+        Ok(RetrievedContext { seeds, edges, uncovered })
     }
 
     /// Devuelve una instantánea completa del grafo para renderizado visual.
@@ -2359,6 +2411,51 @@ mod tests {
         // Presupuesto de aristas.
         let tight = RetrievalConfig { max_edges: 1, ..cfg.clone() };
         assert_eq!(g.retrieve_context(&["cortisol".to_string()], None, &tight).unwrap().edges.len(), 1);
+    }
+
+    /// Paso 24: una sonda está cubierta solo si aporta aristas al contexto.
+    #[test]
+    fn test_retrieve_context_reports_uncovered_probes() {
+        let g = in_memory_graph();
+        g.insert_node(&Node::new("titanio", "concept", "titanio")).unwrap();
+        g.insert_node(&Node::new("metal", "concept", "metal")).unwrap();
+        g.insert_node(&Node::new("isla", "concept", "isla")).unwrap();
+        g.insert_edge("titanio", "es", "metal", 0.9).unwrap();
+        let cfg = RetrievalConfig::default();
+
+        let probes = ["titanio".to_string(), "isla".to_string(), "grafeno".to_string()];
+        let ctx = g.retrieve_context(&probes, None, &cfg).unwrap();
+        assert_eq!(ctx.uncovered, ["isla", "grafeno"], "isla existe pero sin aristas; grafeno no existe");
+
+        let ctx = g.retrieve_context(&["titanio".to_string()], None, &cfg).unwrap();
+        assert!(ctx.uncovered.is_empty());
+    }
+
+    /// Un vecino solo semántico aporta contexto pero no cubre la sonda; un
+    /// nodo cuyo nombre contiene las palabras de la sonda sí la cubre.
+    #[test]
+    fn test_coverage_requires_a_node_that_names_the_probe() {
+        let g = mock_graph(2);
+        for (id, name, v) in [("titanio", "titanio", [1.0, 0.0]), ("metal", "metal", [0.0, 1.0]),
+                              ("s24", "Samsung Galaxy S24", [0.6, 0.8])] {
+            let mut node = Node::new(id, "concept", name);
+            node.embedding = Some(v.to_vec());
+            g.insert_node(&node).unwrap();
+        }
+        g.insert_edge("titanio", "es", "metal", 0.9).unwrap();
+        g.insert_edge("s24", "usa", "metal", 0.9).unwrap();
+        let cfg = RetrievalConfig::default();
+
+        // "grafeno" no tiene nodo: su vector cae junto a titanio (coseno 0,99).
+        let grafeno = [vec![0.99, 0.1]];
+        let ctx = g.retrieve_context(&["grafeno".to_string()], Some(&grafeno), &cfg).unwrap();
+        assert!(!ctx.edges.is_empty(), "el vecino semántico aporta contexto");
+        assert_eq!(ctx.uncovered, ["grafeno"], "pero no cuenta como conocimiento sobre el grafeno");
+
+        // "el Galaxy S24" está contenido en el nombre «Samsung Galaxy S24».
+        let s24 = [vec![0.6, 0.8]];
+        let ctx = g.retrieve_context(&["el Galaxy S24".to_string()], Some(&s24), &cfg).unwrap();
+        assert!(ctx.uncovered.is_empty());
     }
 
     #[test]

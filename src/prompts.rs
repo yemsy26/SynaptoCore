@@ -375,6 +375,86 @@ pub fn planner_json_schema(tool_names: &[&str]) -> serde_json::Value {
 }
 
 // ──────────────────────────────────────────────────────────────
+//  Paso 24 — Responder siempre: memoria, investigación y conversación
+// ──────────────────────────────────────────────────────────────
+//
+// Los textos se validaron contra qwen3.5:2b con fuentes reales de
+// SearXNG: el marcador de investigación acertó 5/5 y las citas [n] solo
+// aparecen cuando hay fuentes numeradas en el prompt.
+
+/// Respuesta del modelo cuando la memoria no alcanza: el servidor descarta
+/// el stream e investiga en la web.
+pub const RESEARCH_MARKER: &str = "[INVESTIGAR]";
+
+/// Etiqueta que el SERVIDOR antepone a las respuestas sin memoria ni fuentes.
+/// No se confía en el modelo: con 2B la ponía incluso en respuestas citadas.
+pub const GENERAL_KNOWLEDGE_LABEL: &str = "Según mi conocimiento general (no verificado): ";
+
+/// Respuesta desde la memoria, con salida de escape hacia la investigación.
+pub fn memory_answer_system_prompt() -> &'static str {
+    "Eres SynaptoCore, un asistente con memoria a largo plazo. Responde la pregunta usando SOLO el \
+conocimiento de tu memoria que aparece en el contexto, en el idioma de la pregunta, de forma clara y breve.
+Si el contexto no contiene la información necesaria para responder la pregunta, responde exactamente \
+[INVESTIGAR] y nada más."
+}
+
+/// Respuesta con fuentes web numeradas (y la memoria, si aporta algo).
+pub fn research_answer_system_prompt() -> &'static str {
+    "Eres SynaptoCore, un asistente con memoria a largo plazo. Responde la pregunta con la información \
+de las fuentes web numeradas y, si ayuda, de tu memoria. Después de cada dato tomado de una fuente, pon \
+su número entre corchetes, por ejemplo [1]. Responde en el idioma de la pregunta, de forma clara y breve. \
+Si las fuentes no responden la pregunta, dilo claramente."
+}
+
+/// Respuesta sin memoria ni fuentes (SearXNG caído o sin resultados).
+pub fn general_answer_system_prompt() -> &'static str {
+    "Eres SynaptoCore, un asistente con memoria a largo plazo. No tienes fuentes ni memoria sobre esta \
+pregunta: respóndela con tu conocimiento general, en el idioma de la pregunta, de forma clara y breve. \
+No cites fuentes ni uses corchetes. Si no lo sabes con seguridad, dilo."
+}
+
+/// Saludos y charla: sin grafo ni investigación.
+pub fn conversation_system_prompt() -> &'static str {
+    "Eres SynaptoCore, un asistente cognitivo con memoria a largo plazo que aprende de cada \
+conversación. Conversa de forma natural, cálida y breve, en el idioma del usuario. No inventes datos: \
+si te piden información concreta que no conoces con seguridad, dilo y ofrece investigarla."
+}
+
+/// Fuentes numeradas para el prompt: `[n] título — fragmento`.
+pub fn format_sources(hits: &[crate::truth_filter::SearchHit]) -> String {
+    const MAX_SNIPPET_CHARS: usize = 300;
+    hits.iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let snippet: String = h.snippet.chars().take(MAX_SNIPPET_CHARS).collect();
+            match h.title.trim() {
+                "" => format!("[{}] {}", i + 1, snippet.trim()),
+                title => format!("[{}] {} — {}", i + 1, title, snippet.trim()),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extracción de hechos de las fuentes de una investigación, para el
+/// aprendizaje en segundo plano. Conceptos atómicos: los nodos compuestos
+/// («diagramas de clases y diagramas de secuencia») fragmentaban el grafo.
+pub fn research_extraction_system_prompt(question: &str) -> String {
+    format!(
+r#"Extrae de las fuentes hasta 5 hechos que ayuden a responder la pregunta «{question}».
+
+Responde ÚNICAMENTE con este JSON (sin markdown):
+{{"triples": [{{"subject": "snake_case", "relation": "verbo_snake_case", "object": "snake_case", "weight": 0.0-1.0}}]}}
+
+REGLAS:
+1. Solo hechos que las fuentes afirman; nunca inventes.
+2. Conceptos atómicos en minúsculas y snake_case ("titanio", "william_gregor"), no frases largas.
+3. El peso refleja la certeza según el texto (0.5 = posible, 0.9 = establecido).
+4. Si las fuentes no aportan hechos útiles, devuelve {{"triples": []}}."#
+    )
+}
+
+// ──────────────────────────────────────────────────────────────
 //  Tests de prompts (verifican formato, no el LLM)
 // ──────────────────────────────────────────────────────────────
 #[cfg(test)]

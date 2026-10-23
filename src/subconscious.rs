@@ -579,15 +579,8 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
 
     // ── Fase 3: Consolidación ────────────────────────────────────────────────
 
-    /// Inserta las tripletas sintetizadas con peso ajustado por la confianza
-    /// del validador. Las aristas que ya existen se omiten en silencio.
-    ///
-    /// Se ejecuta bajo el lock del grafo: la comprobación de existencia y la
-    /// inserción son atómicas respecto a otros escritores (chat, federación).
-    ///
-    /// Paso 23: cada extremo se resuelve al nodo que ya nombra ese concepto
-    /// (A, B u otro con la misma forma canónica). Así "diagramas_de_clases"
-    /// conecta con «diagramas de clases» en vez de crear un duplicado.
+    /// Inserta las tripletas sintetizadas anclando sus extremos en el par
+    /// investigado (ver [`consolidate_triples`]).
     fn consolidate(
         &self,
         graph:      &MemoryGraph,
@@ -596,56 +589,7 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         confidence: f64,
         vectors:    &HashMap<String, Vec<f32>>,
     ) -> Vec<String> {
-        let concept = |id: &str| {
-            let name = node_name(id);
-            let mut node = Node::new(id, "concept", &name);
-            node.embedding = vectors.get(&name).cloned();
-            node
-        };
-        let (canon_a, canon_b) = (canonical_id(node_a), canonical_id(node_b));
-        let resolve = |text: &str| -> String {
-            match canonical_id(text) {
-                c if c == canon_a => node_a.to_string(),
-                c if c == canon_b => node_b.to_string(),
-                _ => graph.resolve_node_id(text).ok().flatten().unwrap_or_else(|| text.trim().to_string()),
-            }
-        };
-        let mut consolidated = Vec::new();
-
-        for triple in triples {
-            let (subject, object) = (resolve(&triple.subject), resolve(&triple.object));
-
-            // No reinsertar aristas que ya existen entre estos nodos exactos.
-            let exists = graph
-                .get_neighbors(&subject, TraversalDirection::Outgoing)
-                .map(|h| h.neighbors.iter().any(|(e, n)| {
-                    e.relation == triple.relation && n.id == object
-                }))
-                .unwrap_or(false);
-            if exists {
-                continue;
-            }
-
-            // Insertar nodos si no existen (idempotente: MemoryGraph ignora duplicados).
-            let _ = graph.insert_node(&concept(&subject));
-            let _ = graph.insert_node(&concept(&object));
-
-            // Peso ajustado por la confianza del validador.
-            let final_weight = triple.weight * confidence;
-            match graph.insert_edge(&subject, &triple.relation, &object, final_weight) {
-                Ok(_) => {
-                    let repr = format!("{}→{}→{}", subject, triple.relation, object);
-                    self.log(&format!("✓ Consolidada: {} (w={:.3})", repr, final_weight));
-                    consolidated.push(repr);
-                }
-                Err(e) => {
-                    // Duplicado o error de integridad — no es fatal.
-                    self.log(&format!("⚠ Tripleta ignorada ({})", e));
-                }
-            }
-        }
-
-        consolidated
+        consolidate_triples(graph, &[node_a, node_b], triples, confidence, vectors, &|msg| self.log(msg))
     }
 
     // ── Utilidades ────────────────────────────────────────────────────────────
@@ -739,6 +683,76 @@ fn is_near_duplicate(a: &str, b: &str) -> bool {
     !wa.is_empty() && !wb.is_empty() && (wa.is_subset(&wb) || wb.is_subset(&wa))
 }
 
+/// Inserta tripletas validadas con peso `weight × confidence`; las aristas
+/// que ya existen se omiten en silencio. Compartido por el subconsciente y
+/// por el aprendizaje de la investigación en caliente (Paso 24).
+///
+/// Cada extremo se resuelve al nodo que ya nombra ese concepto: primero los
+/// `anchors` (p. ej. el par investigado), luego cualquier nodo con la misma
+/// forma canónica (Paso 23). Así "diagramas_de_clases" conecta con
+/// «diagramas de clases» en vez de crear un duplicado.
+///
+/// Se ejecuta bajo el lock del grafo: la comprobación de existencia y la
+/// inserción son atómicas respecto a otros escritores (chat, federación).
+pub(crate) fn consolidate_triples(
+    graph:      &MemoryGraph,
+    anchors:    &[&str],
+    triples:    &[ExtractedTriple],
+    confidence: f64,
+    vectors:    &HashMap<String, Vec<f32>>,
+    log:        &dyn Fn(&str),
+) -> Vec<String> {
+    let concept = |id: &str| {
+        let name = node_name(id);
+        let mut node = Node::new(id, "concept", &name);
+        node.embedding = vectors.get(&name).cloned();
+        node
+    };
+    let resolve = |text: &str| -> String {
+        let canon = canonical_id(text);
+        match anchors.iter().find(|a| canonical_id(a) == canon) {
+            Some(anchor) => anchor.to_string(),
+            None => graph.resolve_node_id(text).ok().flatten().unwrap_or_else(|| text.trim().to_string()),
+        }
+    };
+    let mut consolidated = Vec::new();
+
+    for triple in triples {
+        let (subject, object) = (resolve(&triple.subject), resolve(&triple.object));
+
+        // No reinsertar aristas que ya existen entre estos nodos exactos.
+        let exists = graph
+            .get_neighbors(&subject, TraversalDirection::Outgoing)
+            .map(|h| h.neighbors.iter().any(|(e, n)| {
+                e.relation == triple.relation && n.id == object
+            }))
+            .unwrap_or(false);
+        if exists {
+            continue;
+        }
+
+        // Insertar nodos si no existen (idempotente: MemoryGraph ignora duplicados).
+        let _ = graph.insert_node(&concept(&subject));
+        let _ = graph.insert_node(&concept(&object));
+
+        // Peso ajustado por la confianza del validador.
+        let final_weight = triple.weight * confidence;
+        match graph.insert_edge(&subject, &triple.relation, &object, final_weight) {
+            Ok(_) => {
+                let repr = format!("{}→{}→{}", subject, triple.relation, object);
+                log(&format!("✓ Consolidada: {} (w={:.3})", repr, final_weight));
+                consolidated.push(repr);
+            }
+            Err(e) => {
+                // Duplicado o error de integridad — no es fatal.
+                log(&format!("⚠ Tripleta ignorada ({})", e));
+            }
+        }
+    }
+
+    consolidated
+}
+
 /// ¿Puede el subconsciente escribir en el grafo lo que validó? (Paso 23)
 ///
 /// Más estricto que `ValidationResult::should_accept`, que también admite
@@ -748,7 +762,7 @@ fn is_near_duplicate(a: &str, b: &str) -> bool {
 /// productivos consolidaban así relaciones dudosas («Exynos 2400 compite_en
 /// Galaxy S24»). Ahora hace falta VERIFIED y confianza estrictamente mayor
 /// que el umbral.
-fn consolidation_allowed(validation: &ValidationResult, threshold: f64) -> bool {
+pub(crate) fn consolidation_allowed(validation: &ValidationResult, threshold: f64) -> bool {
     matches!(validation.status, ValidationStatus::Verified) && validation.confidence > threshold
 }
 

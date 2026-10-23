@@ -60,10 +60,15 @@ use tokio::sync::broadcast;
 
 use crate::error::MemoryError;
 use crate::federated_memory::{self, FederationError};
-use crate::llm_bridge::{BridgeError, ExtractionResult, Intent, LlmBackend, NeuralBridge};
+use crate::llm_bridge::{
+    classify_answer_head, AnswerHead, AnswerMode, BoxedTokenStream, BridgeError, ExtractionResult, Intent,
+    LlmBackend, NeuralBridge, Plan, PreparedAnswer,
+};
 use crate::memory_graph::{GraphSnapshot, MemoryGraph, TraversalDirection};
-use crate::priority::CognitivePriority;
+use crate::priority::{BackgroundLlm, CognitivePriority};
+use crate::research;
 use crate::tools::ToolRegistry;
+use crate::truth_filter::{BoxedSearch, SearchHit};
 use crate::types::current_unix_ts;
 use crate::working_memory::{format_history_as_text, Message as ChatMessage, SessionManager};
 
@@ -175,6 +180,97 @@ pub struct AppState {
     /// Prioridad cognitiva (Paso 21): los handlers de usuario toman un
     /// `ForegroundGuard` y el subconsciente cede el LLM mientras exista.
     pub priority: Arc<CognitivePriority>,
+
+    /// Buscador web para que el chat investigue lo que no sabe (Paso 24).
+    /// `None` sin SEARXNG_URL: las preguntas sin memoria se responden con
+    /// conocimiento general etiquetado como no verificado.
+    pub search: Option<BoxedSearch>,
+}
+
+/// Lo necesario para construir el bridge del chat dentro de `spawn_blocking`.
+/// Paso 24: el stream SSE puede necesitar un segundo bridge para investigar.
+#[derive(Clone)]
+struct ChatDeps {
+    llm:    Arc<dyn LlmBackend + Send + Sync + 'static>,
+    tools:  Arc<ToolRegistry>,
+    search: Option<BoxedSearch>,
+}
+
+impl ChatDeps {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            llm:    Arc::clone(&state.llm),
+            tools:  Arc::clone(&state.tool_registry),
+            search: state.search.clone(),
+        }
+    }
+
+    fn bridge(&self) -> NeuralBridge<Arc<dyn LlmBackend + Send + Sync + 'static>> {
+        let bridge = NeuralBridge::new(Arc::clone(&self.llm)).with_tools(Arc::clone(&self.tools));
+        match &self.search {
+            Some(search) => bridge.with_search(search.clone()),
+            None => bridge,
+        }
+    }
+}
+
+/// Lo necesario para aprender de una investigación en segundo plano (Paso 24).
+#[derive(Clone)]
+struct LearnDeps {
+    graph:    Arc<Mutex<MemoryGraph>>,
+    llm:      Arc<dyn LlmBackend + Send + Sync + 'static>,
+    priority: Arc<CognitivePriority>,
+    search:   Option<BoxedSearch>,
+    events:   EventSender,
+}
+
+impl LearnDeps {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            graph:    Arc::clone(&state.graph),
+            llm:      Arc::clone(&state.llm),
+            priority: Arc::clone(&state.priority),
+            search:   state.search.clone(),
+            events:   state.events_tx.clone(),
+        }
+    }
+}
+
+/// Aprende de las fuentes de una investigación sin retrasar la respuesta
+/// (Paso 24). El LLM cede el turno al chat (`BackgroundLlm`) y el progreso
+/// llega al feed del dashboard por el mismo canal que el subconsciente.
+fn spawn_research_learning(deps: LearnDeps, question: String, hits: Vec<SearchHit>) {
+    let Some(search) = deps.search.clone() else { return };
+    if hits.is_empty() {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let llm: Arc<dyn LlmBackend + Send + Sync> =
+            Arc::new(BackgroundLlm::new(Arc::clone(&deps.llm), Arc::clone(&deps.priority)));
+        let events = deps.events.clone();
+        let log = move |msg: &str| {
+            let kind = if msg.contains("Consolidada") || msg.starts_with("✓ Aprendido") { "Consolidation" } else { "Cycle" };
+            println!("  [📚 investigación] {msg}");
+            let _ = events.send(SubconsciousEvent::new(kind, msg).to_json());
+        };
+        log(&format!("📚 Aprendiendo de {} fuente(s) sobre «{question}»", hits.len()));
+        match research::learn_from_sources(
+            &llm, &search, &*deps.graph, &question, &hits, research::LEARNING_THRESHOLD, &log,
+        ) {
+            Ok(r) if r.consolidated.is_empty() =>
+                log(&format!("📚 Sin hechos verificados nuevos ({} extraídos)", r.extracted)),
+            Ok(r) => log(&format!("✓ Aprendido: {} (de la investigación)", r.consolidated.join(", "))),
+            Err(e) => log(&format!("⚠ Aprendizaje de la investigación fallido: {e}")),
+        }
+    });
+}
+
+/// Fuentes citables para el cliente: `{n, title, url}` en el orden de [n].
+fn sources_json(hits: &[SearchHit]) -> Vec<Value> {
+    hits.iter()
+        .enumerate()
+        .map(|(i, h)| serde_json::json!({ "n": i + 1, "title": h.title, "url": h.url }))
+        .collect()
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -200,6 +296,10 @@ pub struct QueryResponse {
     /// Session ID activo para esta conversación. El cliente debe
     /// persistirlo y devolverlo en el siguiente turno.
     pub session_id: String,
+    /// Paso 24: "memory", "tool", "web", "general" o "conversation".
+    pub answered_from: String,
+    /// Fuentes citadas como [n] en la respuesta (`{n, title, url}`).
+    pub sources: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +368,13 @@ impl ApiError {
     pub fn not_found(msg: impl ToString)  -> Self { Self::NotFound(msg.to_string())  }
     pub fn bad_request(msg: impl ToString)-> Self { Self::BadRequest(msg.to_string())}
     pub fn internal(msg: impl ToString)   -> Self { Self::Internal(msg.to_string())  }
+
+    /// Texto del error, para enviarlo dentro de un stream SSE ya abierto.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotFound(m) | Self::BadRequest(m) | Self::Internal(m) => m,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -400,44 +507,51 @@ pub async fn handle_query(
     let history_text = format_history_as_text(&history);
 
     let graph_arc    = Arc::clone(&state.graph);
-    let llm_arc      = Arc::clone(&state.llm);
-    let registry_arc = Arc::clone(&state.tool_registry);
+    let deps         = ChatDeps::from_state(&state);
     let prompt       = req.prompt.clone();
     let hist_clone   = history_text;
 
-    let response = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
-        // NeuralBridge<Arc<dyn LlmBackend + Send + Sync>> funciona gracias al
-        // impl LlmBackend for Arc<dyn LlmBackend + Send + Sync> en llm_bridge.rs.
-        let bridge = NeuralBridge::new(Arc::clone(&llm_arc))
-            .with_tools(registry_arc);
+    let (response, prepared) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
         // Paso 21: se pasa el Mutex, no un guard; el bridge solo lo bloquea
         // durante la recuperación del vecindario, no durante la inferencia.
-        bridge.query_with_memory(&*graph_arc, &prompt, &hist_clone)
-            .map_err(ApiError::from)
+        // Paso 24: conversación, memoria o investigación en la web.
+        deps.bridge().ask(&*graph_arc, &prompt, &hist_clone).map_err(ApiError::from)
     }).await??;
+
+    if prepared.mode == AnswerMode::Research {
+        spawn_research_learning(LearnDeps::from_state(&state), req.prompt.clone(), prepared.sources.clone());
+    }
 
     // ── Paso 13: Persistir turno (write-lock brevísimo) ──────
     state.sessions.push(&session_id, ChatMessage::user(&req.prompt));
     state.sessions.push(&session_id, ChatMessage::assistant(&response));
 
-    Ok(Json(QueryResponse { response, session_id }))
+    Ok(Json(QueryResponse {
+        response,
+        session_id,
+        answered_from: prepared.mode.as_str().to_string(),
+        sources: sources_json(&prepared.sources),
+    }))
 }
 
 /// POST /api/v1/chat y POST /api/v1/query_stream — Endpoint Unificado con Enrutamiento de Intención y Streaming SSE (Paso 20).
 ///
-/// Flujo (Paso 22 — dos llamadas al LLM por consulta, en vez de 3-6):
+/// Flujo (Paso 24 — responder siempre):
 /// 1. Validación temprana del prompt.
 /// 2. Planificador (1 llamada): intención, reescritura con el historial,
 ///    entidades y herramienta, todo en un JSON restringido por esquema.
-/// 3. Si Intent::Learn:
-///    - Extrae tripletas y las asimila en el grafo de memoria (SQLite).
-///    - Emite un mensaje estructurado de confirmación SSE y persiste el turno en SessionManager.
-/// 4. Si Intent::Query:
-///    - Herramienta (si el plan la pide) + contexto semántico del grafo, sin LLM.
-///    - Síntesis en streaming (2.ª llamada); tokens en tiempo real vía SSE.
-///    - Al completarse: refuerzo hebbiano de las aristas usadas como contexto
-///      y persistencia del turno en SessionManager.
-/// El evento final (`done`) incluye `timings`, `tool` y `reinforced_edges`.
+/// 3. Si Intent::Learn: extrae tripletas, las asimila y confirma por SSE.
+/// 4. Si es un saludo o charla (sin entidades ni herramienta): conversación.
+/// 5. Si es una consulta:
+///    - Herramienta (si el plan la pide) + contexto semántico del grafo.
+///    - Si alguna entidad no está en la memoria, o el modelo responde
+///      `[INVESTIGAR]`, el stream avisa (`{"status":"researching"}`), busca
+///      en la web y responde citando las fuentes [n]. Sin fuentes, responde
+///      con conocimiento general etiquetado como no verificado.
+///    - Al completarse: refuerzo hebbiano de la memoria usada, persistencia
+///      del turno y, si se investigó, aprendizaje validado en segundo plano.
+/// El evento final (`done`) incluye `answered_from`, `sources`, `timings`,
+/// `tool` y `reinforced_edges`.
 pub async fn handle_query_stream(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
@@ -460,8 +574,9 @@ pub async fn handle_query_stream(
 
     let graph_arc = Arc::clone(&state.graph);
     let graph_for_hebb = Arc::clone(&state.graph);
-    let llm_arc = Arc::clone(&state.llm);
-    let registry_arc = Arc::clone(&state.tool_registry);
+    let deps = ChatDeps::from_state(&state);
+    let deps_pre = deps.clone();
+    let learn_deps = LearnDeps::from_state(&state);
     let prompt_for_bridge = req.prompt.clone();
     let prompt_for_history = req.prompt.clone();
 
@@ -473,11 +588,14 @@ pub async fn handle_query_stream(
 
     enum RoutedStream {
         Learn(ExtractionResult, Timings),
-        Query {
-            tokens:           crate::llm_bridge::BoxedTokenStream,
-            context_edge_ids: Vec<String>,
-            tool:             Option<String>,
-            timings:          Timings,
+        Answer {
+            plan:     Plan,
+            prepared: PreparedAnswer,
+            /// `None` si hay que investigar antes de responder: la búsqueda
+            /// corre dentro del stream, después del aviso "researching".
+            tokens:   Option<BoxedTokenStream>,
+            tool:     Option<String>,
+            timings:  Timings,
         },
     }
 
@@ -485,8 +603,7 @@ pub async fn handle_query_stream(
         // Paso 21: sin lock aquí. Planificador, herramienta y extracción son
         // inferencia o red; el bridge bloquea el grafo solo para leer o escribir.
         let graph = &*graph_arc;
-        let bridge = NeuralBridge::new(Arc::clone(&llm_arc))
-            .with_tools(registry_arc);
+        let bridge = deps_pre.bridge();
 
         // Paso 22: UNA llamada decide intención, reescritura, entidades y herramienta.
         let t_plan = Instant::now();
@@ -494,27 +611,29 @@ pub async fn handle_query_stream(
         let plan_ms = t_plan.elapsed().as_millis();
 
         let t_prepare = Instant::now();
-        match plan.intent {
-            Intent::Learn => {
-                // La reescritura del plan resuelve referencias ("su capital es
-                // París" → "la capital de Francia es París") antes de extraer.
-                let extract_res = bridge.extract_and_memorize(graph, &plan.rewritten_query)
-                    .map_err(ApiError::from)?;
-                let timings = Timings { plan_ms, prepare_ms: t_prepare.elapsed().as_millis() };
-                Ok(RoutedStream::Learn(extract_res, timings))
-            }
-            Intent::Query => {
-                let prepared = bridge.prepare_answer(graph, &plan).map_err(ApiError::from)?;
-                let timings = Timings { plan_ms, prepare_ms: t_prepare.elapsed().as_millis() };
-                let tokens = bridge.answer_stream(&prepared).map_err(ApiError::from)?;
-                Ok(RoutedStream::Query {
-                    tokens,
-                    context_edge_ids: prepared.context_edge_ids,
-                    tool: plan.tool.map(|t| t.name),
-                    timings,
-                })
-            }
+        if plan.intent == Intent::Learn {
+            // La reescritura del plan resuelve referencias ("su capital es
+            // París" → "la capital de Francia es París") antes de extraer.
+            let extract_res = bridge.extract_and_memorize(graph, &plan.rewritten_query)
+                .map_err(ApiError::from)?;
+            let timings = Timings { plan_ms, prepare_ms: t_prepare.elapsed().as_millis() };
+            return Ok(RoutedStream::Learn(extract_res, timings));
         }
+
+        // Paso 24: la charla no pasa por la memoria.
+        let prepared = if plan.is_conversation() {
+            bridge.prepare_conversation(&prompt_for_bridge, &history_text)
+        } else {
+            bridge.prepare_answer(graph, &plan).map_err(ApiError::from)?
+        };
+        let timings = Timings { plan_ms, prepare_ms: t_prepare.elapsed().as_millis() };
+        let tokens = if bridge.research_first(&prepared) {
+            None
+        } else {
+            Some(bridge.answer_stream(&prepared).map_err(ApiError::from)?)
+        };
+        let tool = plan.tool.as_ref().map(|t| t.name.clone());
+        Ok(RoutedStream::Answer { plan, prepared, tokens, tool, timings })
     }).await.map_err(|e| ApiError::internal(format!("Join error: {e}")))?;
 
     let routed = routed_result?;
@@ -523,6 +642,16 @@ pub async fn handle_query_stream(
 
     let sse_stream = async_stream::stream! {
         let _fg = fg;
+        let token_event = |token: &str| Event::default().data(serde_json::json!({
+            "token": token, "session_id": sid, "done": false, "intent": "query"
+        }).to_string());
+        let error_event = |error: String| Event::default().data(serde_json::json!({
+            "error": error, "session_id": sid, "done": true, "intent": "query"
+        }).to_string());
+        let researching_event = |query: &str| Event::default().data(serde_json::json!({
+            "status": "researching", "query": query, "session_id": sid, "done": false, "intent": "query"
+        }).to_string());
+
         match routed {
             RoutedStream::Learn(res, timings) => {
                 let summary_triples = res.triples
@@ -567,53 +696,115 @@ pub async fn handle_query_stream(
                 }).to_string();
                 yield Ok(Event::default().data(done_payload));
             }
-            RoutedStream::Query { tokens: mut token_stream, context_edge_ids, tool, timings } => {
+            RoutedStream::Answer { plan, mut prepared, tokens, tool, timings } => {
                 use futures_util::StreamExt;
-                let mut full_response = String::new();
+                let mut research_ms: Option<u128> = None;
 
-                while let Some(item) = token_stream.next().await {
-                    match item {
-                        Ok(token) => {
-                            full_response.push_str(&token);
-                            let payload = serde_json::json!({
-                                "token": token,
-                                "session_id": sid,
-                                "done": false,
-                                "intent": "query"
-                            }).to_string();
-                            yield Ok(Event::default().data(payload));
+                // Paso 24: la memoria no cubre la pregunta → investigar primero.
+                let mut token_stream = match tokens {
+                    Some(tokens) => tokens,
+                    None => {
+                        yield Ok(researching_event(&plan.rewritten_query));
+                        match research_stream(&deps, &plan, &prepared).await {
+                            Ok((researched, tokens, ms)) => {
+                                prepared = researched;
+                                research_ms = Some(ms);
+                                tokens
+                            }
+                            Err(e) => {
+                                yield Ok(error_event(e.message().to_string()));
+                                return;
+                            }
                         }
-                        Err(e) => {
-                            let err_payload = serde_json::json!({
-                                "error": e.to_string(),
-                                "session_id": sid,
-                                "done": true,
-                                "intent": "query"
-                            }).to_string();
-                            yield Ok(Event::default().data(err_payload));
+                    }
+                };
+
+                // En modo memoria se retiene el comienzo hasta saber si el
+                // modelo pidió investigar (`[INVESTIGAR]`); es 1-3 tokens.
+                let mut head: Option<String> = (prepared.mode == AnswerMode::Memory).then(String::new);
+                let mut full_response = String::new();
+                loop {
+                    let item = token_stream.next().await;
+                    let finished = item.is_none();
+                    match item {
+                        Some(Ok(token)) => match head.as_mut() {
+                            Some(h) => h.push_str(&token),
+                            None => {
+                                full_response.push_str(&token);
+                                yield Ok(token_event(&token));
+                            }
+                        },
+                        Some(Err(e)) => {
+                            yield Ok(error_event(e.to_string()));
                             return;
                         }
+                        None => {}
+                    }
+                    if let Some(h) = head.as_ref() {
+                        match classify_answer_head(h, finished) {
+                            AnswerHead::NeedMore => {}
+                            AnswerHead::Answer => {
+                                let h = head.take().unwrap_or_default();
+                                if !h.is_empty() {
+                                    full_response.push_str(&h);
+                                    yield Ok(token_event(&h));
+                                }
+                            }
+                            AnswerHead::Research => {
+                                head = None;
+                                yield Ok(researching_event(&plan.rewritten_query));
+                                match research_stream(&deps, &plan, &prepared).await {
+                                    Ok((researched, tokens, ms)) => {
+                                        prepared = researched;
+                                        token_stream = tokens;
+                                        research_ms = Some(ms);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        yield Ok(error_event(e.message().to_string()));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if finished {
+                        break;
                     }
                 }
 
                 // Paso 22: refuerzo hebbiano. Solo aquí, con la respuesta
                 // completada: un stream con error o cortado no refuerza nada.
+                let edge_ids = prepared.context_edge_ids.clone();
                 let reinforced = tokio::task::spawn_blocking(move || {
-                    crate::llm_bridge::reinforce_context(&*graph_for_hebb, &context_edge_ids)
+                    crate::llm_bridge::reinforce_context(&*graph_for_hebb, &edge_ids)
                 }).await.unwrap_or(0);
 
                 // Persistir en memoria de trabajo (Paso 13)
                 sessions.push(&sid, ChatMessage::user(&prompt_for_history));
                 sessions.push(&sid, ChatMessage::assistant(&full_response));
 
+                // Paso 24: aprender de las fuentes, sin retrasar el evento final.
+                let learning = prepared.mode == AnswerMode::Research && learn_deps.search.is_some();
+                if learning {
+                    spawn_research_learning(learn_deps, plan.rewritten_query.clone(), prepared.sources.clone());
+                }
+
                 let done_payload = serde_json::json!({
                     "token": "",
                     "session_id": sid,
                     "done": true,
                     "intent": "query",
+                    "answered_from": prepared.mode.as_str(),
+                    "sources": sources_json(&prepared.sources),
+                    "learning": learning,
                     "tool": tool,
                     "reinforced_edges": reinforced,
-                    "timings": { "plan_ms": timings.plan_ms, "context_ms": timings.prepare_ms }
+                    "timings": {
+                        "plan_ms": timings.plan_ms,
+                        "context_ms": timings.prepare_ms,
+                        "research_ms": research_ms,
+                    }
                 }).to_string();
                 yield Ok(Event::default().data(done_payload));
             }
@@ -621,6 +812,24 @@ pub async fn handle_query_stream(
     };
 
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// Investiga en la web y arranca la respuesta citada (Paso 24). Devuelve lo
+/// preparado (modo y fuentes), el stream de tokens y lo que tardó la búsqueda.
+async fn research_stream(
+    deps:   &ChatDeps,
+    plan:   &Plan,
+    memory: &PreparedAnswer,
+) -> Result<(PreparedAnswer, BoxedTokenStream, u128), ApiError> {
+    let (deps, plan, memory) = (deps.clone(), plan.clone(), memory.clone());
+    tokio::task::spawn_blocking(move || {
+        let bridge = deps.bridge();
+        let t_search = Instant::now();
+        let prepared = bridge.prepare_research(&plan, &memory);
+        let search_ms = t_search.elapsed().as_millis();
+        let tokens = bridge.answer_stream(&prepared).map_err(ApiError::from)?;
+        Ok((prepared, tokens, search_ms))
+    }).await.map_err(|e| ApiError::internal(format!("Join error: {e}")))?
 }
 
 /// Alias para `POST /api/v1/chat` (Paso 20).
@@ -958,6 +1167,7 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        None,
         };
         build_router(state)
     }
@@ -979,6 +1189,7 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        None,
         };
         build_router(state)
     }
@@ -1361,6 +1572,7 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        None,
         };
         let app = build_router(state);
 
@@ -1395,6 +1607,7 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        None,
         };
 
         let (status, body) = send(
@@ -1410,6 +1623,94 @@ mod tests {
         let g = graph.lock().unwrap();
         let weight = g.get_neighbors("rust", TraversalDirection::Outgoing).unwrap().neighbors[0].0.weight;
         assert!((weight - 0.6).abs() < 1e-9, "0.5 + HEBBIAN_DELTA, obtuvo {weight}");
+    }
+
+    // ── Paso 24: responder siempre (memoria → web → aprendizaje) ─
+
+    fn research_state(graph: &Arc<Mutex<MemoryGraph>>, llm: Vec<&str>, web: Vec<&str>) -> AppState {
+        AppState {
+            graph:         Arc::clone(graph),
+            llm:           mock_llm(llm),
+            agent_id:      "test".to_string(),
+            events_tx:     dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            // Sin gracia: el aprendizaje en segundo plano no espera 1,5 s.
+            priority:      Arc::new(CognitivePriority::new(std::time::Duration::ZERO)),
+            search:        Some(BoxedSearch::new(crate::truth_filter::MockSearchBackend::new(vec![web]))),
+        }
+    }
+
+    /// Lo que la memoria no sabe se investiga, se responde citando la
+    /// fuente y se aprende (validado) en segundo plano.
+    #[tokio::test]
+    async fn test_chat_researches_unknown_topic_cites_and_learns() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = research_state(&graph, vec![
+            r#"{"i":"query","q":"¿Qué es el grafeno?","e":["grafeno"],"t":"none","p":{}}"#,
+            "El grafeno es una lámina de carbono [1].",
+            r#"{"triples":[{"subject":"grafeno","relation":"es","object":"lamina_de_carbono","weight":0.9}]}"#,
+            r#"{"status":"VERIFIED","confidence":0.95,"reasoning":"La fuente lo afirma."}"#,
+        ], vec!["El grafeno es una lámina de carbono de un átomo de grosor."]);
+
+        let (status, body) = send(build_router(state), post_json("/api/v1/chat", r#"{"prompt":"¿Qué es el grafeno?"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(r#""status":"researching""#), "{text}");
+        assert!(text.contains(r#""answered_from":"web""#), "{text}");
+        assert!(text.contains(r#""sources":[{"n":1"#), "{text}");
+        assert!(text.contains(r#""learning":true"#), "{text}");
+
+        // El aprendizaje corre en segundo plano: se espera a que llegue al grafo.
+        let mut learned = false;
+        for _ in 0..50 {
+            learned = graph.lock().unwrap().stats().unwrap().edge_count == 1;
+            if learned { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(learned, "la tripleta verificada debía consolidarse");
+    }
+
+    /// La memoria conoce la entidad pero no la respuesta: el modelo escribe
+    /// [INVESTIGAR], el stream lo oculta y responde desde la web.
+    #[tokio::test]
+    async fn test_chat_research_marker_is_hidden_and_escalates() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        {
+            let g = graph.lock().unwrap();
+            g.insert_node(&Node::new("rust", "concept", "Rust")).unwrap();
+            g.insert_node(&Node::new("wasm", "concept", "WebAssembly")).unwrap();
+            g.insert_edge("rust", "compila_a", "wasm", 0.8).unwrap();
+        }
+        let state = research_state(&graph, vec![
+            PLAN_QUERY_RUST,
+            "[INVESTIGAR]",
+            "Rust es un lenguaje de sistemas [1].",
+            r#"{"triples":[]}"#,
+        ], vec!["Rust es un lenguaje de programación de sistemas."]);
+
+        let (_, body) = send(build_router(state), post_json("/api/v1/chat", r#"{"prompt":"¿Qué es Rust?"}"#)).await;
+        let text = String::from_utf8(body).unwrap();
+        assert!(!text.contains("INVESTIGAR"), "el marcador no llega al cliente: {text}");
+        assert!(text.contains(r#""status":"researching""#));
+        assert!(text.contains("lenguaje de sistemas"));
+        assert!(text.contains(r#""answered_from":"web""#));
+        assert!(text.contains(r#""reinforced_edges":0"#), "la memoria no bastó: no se refuerza: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_chat_greeting_is_conversation() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = research_state(&graph, vec![
+            r#"{"i":"query","q":"Hola","e":[],"t":"none","p":{}}"#,
+            "¡Hola! ¿En qué te ayudo?",
+        ], vec!["no debería buscarse"]);
+
+        let (_, body) = send(build_router(state), post_json("/api/v1/chat", r#"{"prompt":"Hola"}"#)).await;
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(r#""answered_from":"conversation""#), "{text}");
+        assert!(!text.contains("researching"));
+        assert!(text.contains(r#""learning":false"#));
     }
 
     // ── Tests: POST /api/v1/federation/export ───────────────
@@ -1443,6 +1744,7 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        None,
         };
         let app = build_router(state);
         let (_, body) = send(app, post_json("/api/v1/federation/export", "{}")).await;
@@ -1566,6 +1868,7 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        None,
         };
         let app = build_router(state);
         let (status, body) = send(app, get_req("/api/v1/graph/all")).await;

@@ -31,6 +31,7 @@ mod memory_graph;
 mod ollama_backend;
 mod priority;
 mod prompts;
+mod research;
 mod subconscious;
 mod tools;
 mod truth_filter;
@@ -115,6 +116,15 @@ impl LlmBackend for ServerMock {
                 a = a_snake,
                 b = b_snake,
             ))
+        } else if s.contains("eres synaptocore, un asistente") {
+            // Paso 24: respuestas en modo memoria, investigación, conocimiento
+            // general o conversación. Sin LLM real: texto de demostración.
+            Ok("SynaptoCore es una arquitectura cognitiva autónoma implementada en Rust. \
+                Combina un grafo de conocimiento SQLite con inferencia LLM local y \
+                validación epistémica de hechos.".to_string())
+        } else if s.contains("extrae de las fuentes") {
+            // Paso 24: aprendizaje a partir de una investigación.
+            Ok(r#"{"triples": [{"subject": "synaptocore", "relation": "usa", "object": "rust", "weight": 0.9}]}"#.to_string())
         } else if u.contains("triples") || u.contains("tripleta") || u.contains("extract") {
             // Extracción de conocimiento para extract_and_memorize
             Ok(r#"{"triples": [
@@ -267,6 +277,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Paso 21: árbitro entre el usuario (primer plano) y el subconsciente (fondo).
     let priority = Arc::new(CognitivePriority::default());
 
+    // Paso 10: backend de búsqueda. Si SEARXNG_URL está definida, el cerebro
+    // valida hechos contra internet. Se construye una sola vez y fuera del
+    // runtime async, por el mismo motivo que OllamaBackend.
+    // Paso 24: el chat también lo usa para investigar lo que no sabe.
+    let search: Option<BoxedSearch> = tokio::task::spawn_blocking(|| {
+        std::env::var("SEARXNG_URL").ok().map(|url| {
+            println!("✓ Investigación web REAL (chat y subconsciente): SearXNG en {url}\n");
+            BoxedSearch(Arc::new(SearxngBackend::new(url)))
+        })
+    }).await?;
+    if search.is_none() {
+        println!("ℹ Sin SEARXNG_URL: lo que no esté en memoria se responde con conocimiento general (no verificado)\n");
+    }
+
     let state = AppState {
         graph:         Arc::clone(&graph),
         llm:           Arc::clone(&llm),
@@ -275,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions:      Arc::new(SessionManager::new()),
         tool_registry: Arc::clone(&tool_registry),
         priority:      Arc::clone(&priority),
+        search:        search.clone(),
     };
 
     // ── 4. Bucle Subconsciente en background (Paso 4 + Paso 9 + Paso 21) ────
@@ -293,17 +318,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // El loop se cancela automáticamente cuando main() termina (Ctrl+C).
 
-    // Paso 10: backend de búsqueda. Si SEARXNG_URL está definida, el cerebro
-    // valida hechos contra internet; si no, MockSearchBackend::empty() (sin red
-    // → siempre INCONCLUSIVE). Se construye una sola vez (antes, en cada ciclo)
-    // y fuera del runtime async, por el mismo motivo que OllamaBackend.
-    let search_sc: BoxedSearch = tokio::task::spawn_blocking(|| match std::env::var("SEARXNG_URL") {
-        Ok(url) => {
-            println!("✓ Subconsciente en modo epistémico REAL: SearXNG en {url}\n");
-            BoxedSearch(Arc::new(SearxngBackend::new(url)))
-        }
-        Err(_) => BoxedSearch(Arc::new(MockSearchBackend::empty())),
-    }).await?;
+    // Sin SearXNG el subconsciente valida sin fuentes (siempre INCONCLUSIVE).
+    let search_sc: BoxedSearch = search
+        .clone()
+        .unwrap_or_else(|| BoxedSearch(Arc::new(MockSearchBackend::empty())));
 
     let tx_yield = events_tx.clone();
     let llm_sc: Arc<dyn LlmBackend + Send + Sync + 'static> = Arc::new(
@@ -919,6 +937,7 @@ mod integration_tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            search:        None,
         };
 
         // Insertar desde el Arc original
