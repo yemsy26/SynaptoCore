@@ -26,6 +26,7 @@ use crate::memory_graph::{embed_texts, GraphAccess};
 use crate::prompts;
 use crate::subconscious::{consolidate_triples, consolidation_allowed};
 use crate::truth_filter::{EpistemicValidator, SearchBackend, SearchHit};
+use crate::types::{EdgeOrigin, Provenance};
 
 /// Hechos candidatos por investigación: cada uno cuesta una validación.
 const MAX_RESEARCH_TRIPLES: usize = 5;
@@ -116,11 +117,15 @@ where
     let embedder = graph.with_graph(|g| g.embedding_backend());
     let vectors = embed_texts(embedder.as_ref(), &names);
 
+    // Paso 26: lo verificado con fuentes se recuerda meses y guarda de dónde
+    // salió (cada hecho se validó contra todas las fuentes de la búsqueda).
+    let urls: Vec<&str> = hits.iter().map(|h| h.url.as_str()).filter(|u| !u.is_empty()).collect();
+    let provenance = Provenance::new(EdgeOrigin::Researched).with_source(urls.join(" "));
     let consolidated = graph.with_graph(|g| {
         accepted
             .iter()
             .flat_map(|(triple, confidence)| {
-                consolidate_triples(g, &[], std::slice::from_ref(triple), *confidence, &vectors, log)
+                consolidate_triples(g, &[], std::slice::from_ref(triple), *confidence, &provenance, &vectors, log)
             })
             .collect()
     });
@@ -134,7 +139,7 @@ where
 mod tests {
     use super::*;
     use crate::llm_bridge::mock::MockLlmBackend;
-    use crate::memory_graph::MemoryGraph;
+    use crate::memory_graph::{MemoryGraph, TraversalDirection};
     use crate::truth_filter::MockSearchBackend;
     use crate::types::Node;
 
@@ -163,6 +168,12 @@ mod tests {
         assert_eq!(learned.consolidated, ["William Gregor→descubrio→titanio"],
             "solo el VERIFIED; el extremo existente se reutiliza por id canónico");
         assert_eq!(graph.stats().unwrap().node_count, 2, "no se crea metal_pesado");
+
+        // Paso 26: consta como investigado, con la fuente de la búsqueda.
+        let hood = graph.get_neighbors("titanio", TraversalDirection::Incoming).unwrap();
+        let edge = &hood.neighbors[0].0;
+        assert_eq!(edge.origin, EdgeOrigin::Researched);
+        assert_eq!(edge.source.as_deref(), Some("https://es.wikipedia.org/wiki/Titanio"));
     }
 
     #[test]

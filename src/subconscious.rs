@@ -41,10 +41,10 @@ use std::time::Duration;
 
 use crate::error::MemoryError;
 use crate::llm_bridge::{node_name, BridgeError, ExtractedTriple, LlmBackend};
-use crate::memory_graph::{canonical_id, embed_texts, ordered_pair, GraphAccess, MemoryGraph, TraversalDirection};
+use crate::memory_graph::{canonical_id, embed_texts, ordered_pair, EdgeWrite, GraphAccess, MemoryGraph, TraversalDirection};
 use crate::prompts;
 use crate::truth_filter::{EpistemicValidator, SearchBackend, ValidationResult, ValidationStatus};
-use crate::types::{current_unix_ts, Node};
+use crate::types::{current_unix_ts, EdgeOrigin, Node, Provenance};
 
 // ── Constantes de operación ──────────────────────────────────────────────────
 
@@ -580,7 +580,8 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
     // ── Fase 3: Consolidación ────────────────────────────────────────────────
 
     /// Inserta las tripletas sintetizadas anclando sus extremos en el par
-    /// investigado (ver [`consolidate_triples`]).
+    /// investigado (ver [`consolidate_triples`]). Constan como deducidas:
+    /// si nadie las usa ni las confirma, se olvidan en semanas (Paso 26).
     fn consolidate(
         &self,
         graph:      &MemoryGraph,
@@ -589,7 +590,9 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         confidence: f64,
         vectors:    &HashMap<String, Vec<f32>>,
     ) -> Vec<String> {
-        consolidate_triples(graph, &[node_a, node_b], triples, confidence, vectors, &|msg| self.log(msg))
+        let provenance = Provenance::new(EdgeOrigin::Inferred)
+            .with_source(format!("subconsciente: {node_a} ↔ {node_b}"));
+        consolidate_triples(graph, &[node_a, node_b], triples, confidence, &provenance, vectors, &|msg| self.log(msg))
     }
 
     // ── Utilidades ────────────────────────────────────────────────────────────
@@ -683,9 +686,11 @@ fn is_near_duplicate(a: &str, b: &str) -> bool {
     !wa.is_empty() && !wb.is_empty() && (wa.is_subset(&wb) || wb.is_subset(&wa))
 }
 
-/// Inserta tripletas validadas con peso `weight × confidence`; las aristas
-/// que ya existen se omiten en silencio. Compartido por el subconsciente y
-/// por el aprendizaje de la investigación en caliente (Paso 24).
+/// Inserta tripletas validadas con peso `weight × confidence`. Compartido
+/// por el subconsciente y por el aprendizaje de la investigación en caliente
+/// (Paso 24). Una arista que ya existe solo cambia si `provenance` dura más
+/// que la suya (Paso 26): la investigación confirma lo que el subconsciente
+/// dedujo; lo contrario se omite en silencio.
 ///
 /// Cada extremo se resuelve al nodo que ya nombra ese concepto: primero los
 /// `anchors` (p. ej. el par investigado), luego cualquier nodo con la misma
@@ -699,6 +704,7 @@ pub(crate) fn consolidate_triples(
     anchors:    &[&str],
     triples:    &[ExtractedTriple],
     confidence: f64,
+    provenance: &Provenance,
     vectors:    &HashMap<String, Vec<f32>>,
     log:        &dyn Fn(&str),
 ) -> Vec<String> {
@@ -720,33 +726,25 @@ pub(crate) fn consolidate_triples(
     for triple in triples {
         let (subject, object) = (resolve(&triple.subject), resolve(&triple.object));
 
-        // No reinsertar aristas que ya existen entre estos nodos exactos.
-        let exists = graph
-            .get_neighbors(&subject, TraversalDirection::Outgoing)
-            .map(|h| h.neighbors.iter().any(|(e, n)| {
-                e.relation == triple.relation && n.id == object
-            }))
-            .unwrap_or(false);
-        if exists {
-            continue;
-        }
-
         // Insertar nodos si no existen (idempotente: MemoryGraph ignora duplicados).
         let _ = graph.insert_node(&concept(&subject));
         let _ = graph.insert_node(&concept(&object));
 
         // Peso ajustado por la confianza del validador.
         let final_weight = triple.weight * confidence;
-        match graph.insert_edge(&subject, &triple.relation, &object, final_weight) {
-            Ok(_) => {
-                let repr = format!("{}→{}→{}", subject, triple.relation, object);
+        let repr = format!("{}→{}→{}", subject, triple.relation, object);
+        match graph.learn_edge(&subject, &triple.relation, &object, final_weight, provenance) {
+            Ok(EdgeWrite::Inserted(_)) => {
                 log(&format!("✓ Consolidada: {} (w={:.3})", repr, final_weight));
                 consolidated.push(repr);
             }
-            Err(e) => {
-                // Duplicado o error de integridad — no es fatal.
-                log(&format!("⚠ Tripleta ignorada ({})", e));
+            Ok(EdgeWrite::Promoted) => {
+                log(&format!("✓ Confirmada: {} (ahora {})", repr, provenance.origin.as_str()));
+                consolidated.push(repr);
             }
+            Ok(EdgeWrite::Unchanged) => {}
+            // Error de integridad — no es fatal.
+            Err(e) => log(&format!("⚠ Tripleta ignorada ({})", e)),
         }
     }
 
@@ -960,6 +958,12 @@ mod tests {
             "El grafo debería haber crecido: {} → {}", edges_before, edges_after
         );
         assert!(!report.triples_consolidated.is_empty());
+
+        // Paso 26: lo deducido consta como tal, con el par que lo originó.
+        let snapshot = graph.get_all_graph_data(100).unwrap();
+        let learned: Vec<_> = snapshot.edges.iter().filter(|e| e.origin == EdgeOrigin::Inferred).collect();
+        assert_eq!(learned.len() as u64, edges_after - edges_before);
+        assert!(learned.iter().all(|e| e.source.as_deref().is_some_and(|s| s.starts_with("subconsciente: "))));
     }
 
     /// El ciclo aborta limpiamente cuando el TruthFilter rechaza el hallazgo.

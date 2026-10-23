@@ -53,11 +53,11 @@ pub type BoxedTokenStream = Pin<Box<dyn Stream<Item = Result<String, BridgeError
 use std::collections::HashMap;
 
 use crate::error::MemoryError;
-use crate::memory_graph::{canonical_id, embed_texts, GraphAccess, MemoryGraph, RetrievalConfig};
+use crate::memory_graph::{canonical_id, embed_texts, EdgeWrite, GraphAccess, MemoryGraph, RetrievalConfig};
 use crate::prompts;
 use crate::tools::ToolRegistry;
 use crate::truth_filter::{BoxedSearch, SearchBackend, SearchHit};
-use crate::types::Node;
+use crate::types::{EdgeOrigin, Node, Provenance};
 
 // ──────────────────────────────────────────────────────────────
 //  Constantes de configuración del motor
@@ -1024,6 +1024,9 @@ impl<B: LlmBackend> NeuralBridge<B> {
     ) -> Result<(usize, usize), BridgeError> {
         let mut nodes_created = 0usize;
         let mut edges_created = 0usize;
+        // Paso 26: lo que enseña el usuario no se olvida, y una arista que el
+        // subconsciente ya había deducido pasa a constar como enseñada.
+        let taught = Provenance::new(EdgeOrigin::Taught);
         let concept = |id: &str| {
             let name = node_name(id);
             let mut node = Node::new(id, "concept", &name);
@@ -1050,9 +1053,9 @@ impl<B: LlmBackend> NeuralBridge<B> {
 
             // Insertar la arista (relación semántica).
             let weight = triple.weight.clamp(0.0, 1.0);
-            match graph.insert_edge(&triple.subject, &triple.relation, &triple.object, weight) {
-                Ok(_) => edges_created += 1,
-                Err(MemoryError::DuplicateEdge { .. }) => {} // Ya existe, OK.
+            match graph.learn_edge(&triple.subject, &triple.relation, &triple.object, weight, &taught) {
+                Ok(EdgeWrite::Inserted(_)) => edges_created += 1,
+                Ok(_) => {} // Ya existía, OK.
                 Err(MemoryError::InvalidWeight { .. }) => {
                     // El LLM produjo un peso inválido; lo ignoramos en lugar
                     // de fallar: mejor perder una arista que abortar toda la extracción.
@@ -1574,6 +1577,10 @@ Espero que sea útil."#;
         assert_eq!(result.edges_created, 3);
         assert_eq!(result.llm_attempts, 1);
         assert_eq!(bridge.backend.call_count(), 1);
+
+        // Paso 26: lo que enseña el usuario no se olvida.
+        let hood = graph.get_neighbors("cortisol", crate::memory_graph::TraversalDirection::Outgoing).unwrap();
+        assert!(hood.neighbors.iter().all(|(e, _)| e.origin == EdgeOrigin::Taught && e.source.is_none()));
     }
 
     #[test]

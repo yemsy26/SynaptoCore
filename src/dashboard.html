@@ -369,6 +369,7 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
 .rel-dir { color: var(--text-3); font-family: var(--mono); }
 .rel-txt { min-width: 0; }
 .rel-txt i { display: block; font: normal 10.5px var(--mono); color: var(--cyan-2); }
+.rel-origin { color: var(--text-3); }
 .rel-txt button { padding: 0; border: 0; background: none; text-align: left; color: var(--text); overflow-wrap: anywhere; }
 .rel-txt button:hover { color: var(--cyan-2); text-decoration: underline; }
 .wbar { width: 46px; height: 4px; border-radius: 4px; background: rgba(255,255,255,.07); overflow: hidden; }
@@ -888,6 +889,22 @@ const clock = (d = new Date()) => d.toLocaleTimeString('es-ES', { hour12: false 
 const norm = s => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 const shorten = (s, n = 22) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 
+// Paso 26: de dónde vino cada relación (decide cuánto tarda en olvidarse).
+const ORIGIN_LABEL = {
+  taught: 'enseñado · no se olvida',
+  system: 'sistema · no se olvida',
+  researched: 'investigado',
+  federated: 'federado',
+  inferred: 'deducido',
+};
+
+function originTag(e) {
+  const label = ORIGIN_LABEL[e.data('origin')];
+  if (!label) return '';
+  const src = e.data('source');
+  return ` <span class="rel-origin"${src ? ` title="${escapeHtml(src)}"` : ''}>· ${label}</span>`;
+}
+
 function relTime(unixSecs) {
   if (!unixSecs) return '—';
   const d = Math.max(0, Date.now() / 1000 - unixSecs);
@@ -1084,6 +1101,7 @@ function applySnapshot(data) {
       const ex = cy.getElementById(e.id);
       if (ex.nonempty()) {
         ex.removeClass('dying');
+        ex.data({ origin: e.origin, source: e.source });
         const prev = ex.data('weight');
         if (Math.abs(prev - e.weight) > 1e-4) {
           ex.data('weight', e.weight);
@@ -1093,7 +1111,7 @@ function applySnapshot(data) {
       }
       addedEdges.merge(cy.add({
         group: 'edges',
-        data: { id: e.id, source: e.source_id, target: e.target_id, weight: e.weight, relation: e.relation, created: e.created_at, accessed: e.last_accessed },
+        data: { id: e.id, source: e.source_id, target: e.target_id, weight: e.weight, relation: e.relation, created: e.created_at, accessed: e.last_accessed, origin: e.origin, source: e.source },
       }));
     }
   });
@@ -1242,7 +1260,7 @@ function showInspector(n) {
     const wv = e.data('weight') || 0;
     return `<div class="rel">
       <span class="rel-dir" title="${out ? 'saliente' : 'entrante'}">${out ? '→' : '←'}</span>
-      <span class="rel-txt"><i>${escapeHtml(e.data('relation'))}</i><button data-focus="${escapeHtml(other.id())}">${escapeHtml(other.data('name'))}</button></span>
+      <span class="rel-txt"><i>${escapeHtml(e.data('relation'))}${originTag(e)}</i><button data-focus="${escapeHtml(other.id())}">${escapeHtml(other.data('name'))}</button></span>
       <span class="wbar" title="peso ${wv.toFixed(3)}"><i style="width:${Math.round(wv * 100)}%"></i></span>
     </div>`;
   }).join('');

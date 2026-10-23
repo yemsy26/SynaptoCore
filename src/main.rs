@@ -47,11 +47,11 @@ use llm_bridge::{BridgeError, LlmBackend};
 use ollama_backend::OllamaBackend;
 use priority::{BackgroundLlm, CognitivePriority, YieldEvent};
 use truth_filter::{BoxedSearch, MockSearchBackend, SearxngBackend};
-use forgetting_curve::{ForgettingConfig, ForgettingCurve};
+use forgetting_curve::{DecayPolicy, ForgettingConfig, ForgettingCurve};
 use subconscious::{CuriosityEngine, CuriosityError, CycleBackoff};
 use api_server::{build_router, AppState, SubconsciousEvent};
 use tools::{TimeTool, ToolRegistry, WebhookTool};
-use types::Node;
+use types::{EdgeOrigin, Node, Provenance};
 use working_memory::SessionManager;
 
 // ── Mock LLM para el binario del servidor ────────────────────────────────────
@@ -218,10 +218,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ] {
             let _ = g.insert_node(&Node::new(*id, "concept", *name));
         }
-        let _ = g.insert_edge("synaptocore", "implementado_en", "rust",         0.99);
-        let _ = g.insert_edge("synaptocore", "usa_como_db",     "sqlite",       0.98);
-        let _ = g.insert_edge("synaptocore", "expone_api_con",  "axum",         0.95);
-        let _ = g.insert_edge("synaptocore", "gestiona",        "conocimiento", 0.97);
+        // Paso 26: conocimiento del sistema, que no se olvida.
+        let system = Provenance::new(EdgeOrigin::System);
+        for (relation, target, weight) in [
+            ("implementado_en", "rust",         0.99),
+            ("usa_como_db",     "sqlite",       0.98),
+            ("expone_api_con",  "axum",         0.95),
+            ("gestiona",        "conocimiento", 0.97),
+        ] {
+            let _ = g.learn_edge("synaptocore", relation, target, weight, &system);
+        }
         println!("✓ Conocimiento base insertado en el grafo\n");
     }
 
@@ -462,8 +468,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let graph_ref = Arc::clone(&graph_fc);
             tokio::task::spawn_blocking(move || {
                 let Ok(graph) = graph_ref.lock() else { return; };
+                // Paso 26: cada arista se olvida según su procedencia (lo
+                // enseñado nunca; lo deducido por el subconsciente, en semanas).
                 let fc = ForgettingCurve::new(ForgettingConfig {
-                    decay_rate:      0.00001, // λ: decae lentamente (~3 días a w=1.0)
+                    policy:          DecayPolicy::ByOrigin,
                     prune_threshold: 0.05,    // θ: poda aristas con peso < 5%
                 });
                 match fc.run_nightly_cleanup(&graph) {
@@ -607,7 +615,7 @@ mod integration_tests {
     use llm_bridge::NeuralBridge;
     use truth_filter::{EpistemicValidator, MockSearchBackend, ValidationStatus};
     use subconscious::CuriosityEngine;
-    use forgetting_curve::{ForgettingConfig, ForgettingCurve};
+    use forgetting_curve::{DecayPolicy, ForgettingConfig, ForgettingCurve};
     use federated_memory::{FederationHub, MemoryDelta, DeltaOperation};
     use memory_graph::TraversalDirection;
     use types::{Node, Edge};
@@ -825,7 +833,7 @@ mod integration_tests {
 
         graph.reinforce_edge("a", "rel2", "c_node").unwrap();
 
-        let report = graph.apply_decay_and_prune(1.0, 0.10).unwrap();
+        let report = graph.apply_decay_and_prune(&|_| Some(1.0), 0.10).unwrap();
         assert!(report.edges_pruned >= 1, "La arista antigua debe podarse");
 
         let hood = graph.get_neighbors("a", TraversalDirection::Outgoing).unwrap();
@@ -854,7 +862,7 @@ mod integration_tests {
 
         graph.reinforce_edge("cortisol", "eleva", "glucosa").unwrap();
 
-        let fc = ForgettingCurve::new(ForgettingConfig { decay_rate: 0.00001, prune_threshold: 0.10 });
+        let fc = ForgettingCurve::new(ForgettingConfig { policy: DecayPolicy::Uniform(0.00001), prune_threshold: 0.10 });
         let report = fc.run_nightly_cleanup(&graph).unwrap();
 
         let hood = graph.get_neighbors("cortisol", TraversalDirection::Outgoing).unwrap();

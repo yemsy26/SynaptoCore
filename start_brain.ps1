@@ -91,8 +91,8 @@ Write-Host "  Memoria DB: $($env:SC_DB_PATH)" -ForegroundColor DarkGray
 if ($env:SYNAPTOCORE_MODEL_PATH) {
     Write-Host "  Modelo LLM: $($env:SYNAPTOCORE_MODEL_PATH)" -ForegroundColor DarkGray
 }
-if ($env:FENIX_FLOW_API_URL) {
-    Write-Host "  Fénix Flow: $($env:FENIX_FLOW_API_URL)" -ForegroundColor DarkGray
+if ($env:SYNAPTOCORE_CONNECTORS) {
+    Write-Host "  Conectores: $($env:SYNAPTOCORE_CONNECTORS)" -ForegroundColor DarkGray
 }
 if ($env:SEARXNG_URL) {
     Write-Host "  SearXNG   : $($env:SEARXNG_URL)" -ForegroundColor DarkGray

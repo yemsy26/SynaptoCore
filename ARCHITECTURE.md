@@ -156,10 +156,9 @@ respuesta → usuario
 |--------|-----------|-------------|
 | `TimeTool` | `{}` | Fecha/hora actual del sistema (LLMs no tienen noción del tiempo) |
 | `WebhookTool` | `{"url": "..."}` | GET HTTP a sistemas externos. Timeout 10s. |
-| `InventoryTool` | `{"producto": "..."}` | Stock y precio en Fénix Flow ERP (mock si env var ausente) |
-| `ClientTool` | `{"telefono_o_cedula": "..."}` | Historial de cliente en Fénix Flow (mock si env var ausente) |
+| Conectores (`connectors.rs`) | los `params` declarados | Cualquier API HTTP declarada en `conectores.json` (Paso 25) |
 
-Añadir una herramienta nueva: implementar `trait Tool` en un nuevo struct y llamar `tool_registry.register(MiHerramienta)` en `main.rs`. Cero cambios en el bucle ReAct.
+Conectar un sistema externo no requiere código: se declara en `conectores.json` (ver README, «Conectores externos»). Para una herramienta con lógica propia, implementar `trait Tool` y llamar `tool_registry.register(MiHerramienta)` en `main.rs`.
 
 ---
 
@@ -171,20 +170,25 @@ $$w(t) = w_0 \cdot e^{-\lambda t}$$
 
 donde:
 - $w_0$ = peso actual de la arista
-- $\lambda$ = `decay_rate` configurable por perfil (`ForgettingConfig`)
+- $\lambda$ = tasa de olvido de la **procedencia** de la arista (Paso 26)
 - $t$ = segundos desde `last_accessed`
 
-Parámetros predefinidos:
+Cada arista guarda de dónde vino (`edges.origin`) y su fuente (`edges.source`: URLs, el par que exploró el subconsciente…). En producción `DecayPolicy::ByOrigin` fija λ a partir de una vida media:
 
-| Perfil | `decay_rate` (λ) | Uso |
-|--------|----------------|-----|
-| `short_term()` | `0.001` | Conocimiento episódico reciente |
-| `long_term()` | `0.0001` | Conocimiento semántico consolidado |
-| `demo()` | `0.0005` | Balance para demostraciones |
+| Procedencia | Quién la escribe | Vida media sin uso |
+|-------------|------------------|--------------------|
+| `taught` | `/learn` y la intención «aprender» del chat | no se olvida |
+| `system` | conocimiento base sembrado al arrancar | no se olvida |
+| `researched` | aprendizaje de la investigación en caliente (con URLs) | 90 días |
+| `unknown` | aristas anteriores al Paso 26 | 90 días |
+| `federated` | otro agente, vía federación | 30 días |
+| `inferred` | consolidación del subconsciente | 14 días |
+
+Si una arista se vuelve a aprender con una procedencia más duradera (`learn_edge`), sube de categoría y su reloj se reinicia: lo que el subconsciente dedujo pasa a «investigado» cuando una fuente lo confirma, y a «enseñado» si lo enseña el usuario; nunca baja. `DecayPolicy::Uniform(λ)` aplica el mismo λ a todo (demos y tests).
 
 **Refuerzo Hebbiano**: cuando un nodo se consulta exitosamente (`semantic_search` retorna hit), se llama `MemoryGraph::reinforce_edge()` que incrementa `weight` y resetea `last_accessed`. Implementa "las neuronas que se activan juntas, se conectan."
 
-**Poda**: aristas con $w(t) < \text{prune\_threshold}$ (default 0.15) se eliminan en el cleanup nocturno.
+**Poda**: aristas con $w(t) < \text{prune\_threshold}$ (0.05 en producción) se eliminan en la limpieza horaria; lo que no se olvida nunca se poda.
 
 ---
 

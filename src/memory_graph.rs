@@ -15,7 +15,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::error::MemoryError;
-use crate::types::{current_unix_ts, Edge, Neighborhood, Node};
+use crate::types::{current_unix_ts, Edge, EdgeOrigin, Neighborhood, Node, Provenance};
 
 // ── Constantes de comportamiento cognitivo ────────────────────────────────────
 
@@ -687,6 +687,14 @@ impl MemoryGraph {
             [],
         );
 
+        // v0.26: procedencia de cada arista (Paso 26). Las anteriores quedan
+        // como 'unknown', que se olvida tan despacio como lo verificado.
+        let _ = self.conn.execute(
+            "ALTER TABLE edges ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        );
+        let _ = self.conn.execute("ALTER TABLE edges ADD COLUMN source TEXT", []);
+
         Ok(())
     }
 
@@ -810,6 +818,18 @@ impl MemoryGraph {
         target_id: &str,
         weight:    f64,
     ) -> Result<String, MemoryError> {
+        self.insert_edge_from(source_id, relation, target_id, weight, &Provenance::default())
+    }
+
+    /// `insert_edge` registrando de dónde vino la relación (Paso 26).
+    pub fn insert_edge_from(
+        &self,
+        source_id:  &str,
+        relation:   &str,
+        target_id:  &str,
+        weight:     f64,
+        provenance: &Provenance,
+    ) -> Result<String, MemoryError> {
         // Validación de peso antes de tocar la DB.
         if !(0.0..=1.0).contains(&weight) {
             return Err(MemoryError::InvalidWeight { weight });
@@ -838,9 +858,10 @@ impl MemoryGraph {
         // `INSERT OR IGNORE` no haría distinción de error semántico;
         // usamos INSERT directo para capturar la violación de UNIQUE.
         let result = self.conn.execute(
-            "INSERT INTO edges (id, source_id, relation, target_id, weight, properties, created_at, last_accessed)
-             VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?6)",
-            params![edge_id, source_id, relation, target_id, weight, now],
+            "INSERT INTO edges (id, source_id, relation, target_id, weight, properties, created_at, last_accessed, origin, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?6, ?7, ?8)",
+            params![edge_id, source_id, relation, target_id, weight, now,
+                    provenance.origin.as_str(), provenance.source],
         );
 
         match result {
@@ -855,6 +876,43 @@ impl MemoryGraph {
                 })
             }
             Err(e) => Err(MemoryError::Database(e)),
+        }
+    }
+
+    /// Aprende una relación (Paso 26): la inserta o, si ya existía, mejora
+    /// su procedencia cuando la nueva dura más (ver [`EdgeOrigin::supersedes`]).
+    /// Al mejorar, el peso sube al mayor de los dos y el reloj del olvido se
+    /// reinicia: volver a aprender algo es la mejor forma de recordarlo.
+    pub fn learn_edge(
+        &self,
+        source_id:  &str,
+        relation:   &str,
+        target_id:  &str,
+        weight:     f64,
+        provenance: &Provenance,
+    ) -> Result<EdgeWrite, MemoryError> {
+        match self.insert_edge_from(source_id, relation, target_id, weight, provenance) {
+            Ok(id) => Ok(EdgeWrite::Inserted(id)),
+            Err(MemoryError::DuplicateEdge { .. }) => {
+                let current: String = self.conn.query_row(
+                    "SELECT origin FROM edges WHERE source_id = ?1 AND relation = ?2 AND target_id = ?3",
+                    params![source_id, relation, target_id],
+                    |row| row.get(0),
+                )?;
+                if !provenance.origin.supersedes(EdgeOrigin::parse(&current)) {
+                    return Ok(EdgeWrite::Unchanged);
+                }
+                self.conn.execute(
+                    "UPDATE edges
+                     SET origin = ?1, source = COALESCE(?2, source),
+                         weight = MAX(weight, ?3), last_accessed = ?4
+                     WHERE source_id = ?5 AND relation = ?6 AND target_id = ?7",
+                    params![provenance.origin.as_str(), provenance.source, weight, current_unix_ts(),
+                            source_id, relation, target_id],
+                )?;
+                Ok(EdgeWrite::Promoted)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1398,7 +1456,7 @@ impl MemoryGraph {
         let edge_limit = (node_limit * 10).min(20_000);
         let mut edge_stmt = self.conn.prepare(
             "SELECT id, source_id, relation, target_id, weight, properties,
-                    created_at, last_accessed
+                    created_at, last_accessed, origin, source
              FROM edges
              ORDER BY weight DESC
              LIMIT ?1",
@@ -1415,17 +1473,20 @@ impl MemoryGraph {
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .filter(|(_, src, _, tgt, _, _, _, _)| {
+            .filter(|(_, src, _, tgt, ..)| {
                 visible_ids.contains(src.as_str()) && visible_ids.contains(tgt.as_str())
             })
-            .map(|(id, source_id, relation, target_id, weight, props_str, created_at, last_accessed)| {
+            .map(|(id, source_id, relation, target_id, weight, props_str, created_at, last_accessed, origin, source)| {
                 let properties = serde_json::from_str(&props_str)
                     .unwrap_or_default();
-                Edge { id, source_id, relation, target_id, weight, properties, created_at, last_accessed }
+                let origin = EdgeOrigin::parse(&origin);
+                Edge { id, source_id, relation, target_id, weight, properties, created_at, last_accessed, origin, source }
             })
             .collect();
 
@@ -1467,7 +1528,8 @@ impl MemoryGraph {
             "SELECT
                 e.id, e.source_id, e.relation, e.target_id, e.weight, e.properties,
                 e.created_at, e.last_accessed,
-                n.id, n.label, n.name, n.properties, n.created_at
+                n.id, n.label, n.name, n.properties, n.created_at,
+                e.origin, e.source
              FROM edges e
              INNER JOIN nodes n ON n.id = e.target_id
              WHERE e.source_id = ?1
@@ -1484,7 +1546,8 @@ impl MemoryGraph {
             "SELECT
                 e.id, e.source_id, e.relation, e.target_id, e.weight, e.properties,
                 e.created_at, e.last_accessed,
-                n.id, n.label, n.name, n.properties, n.created_at
+                n.id, n.label, n.name, n.properties, n.created_at,
+                e.origin, e.source
              FROM edges e
              INNER JOIN nodes n ON n.id = e.source_id
              WHERE e.target_id = ?1
@@ -1521,9 +1584,14 @@ impl MemoryGraph {
                 let node_props: String = row.get(11)?;
                 let node_ts:    i64    = row.get(12)?;
 
+                // Columnas 13-14: procedencia de la arista (Paso 26)
+                let origin: String         = row.get(13)?;
+                let source: Option<String> = row.get(14)?;
+
                 Ok((
                     (edge_id, source_id, relation, target_id, weight, edge_props, edge_ts, last_accessed),
                     (node_id, node_label, node_name, node_props, node_ts),
+                    (origin, source),
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1532,7 +1600,7 @@ impl MemoryGraph {
         // de serde se conviertan en MemoryError::Serialization.
         pairs
             .into_iter()
-            .map(|(e_raw, n_raw)| {
+            .map(|(e_raw, n_raw, (origin, source))| {
                 let edge = Edge {
                     id:            e_raw.0,
                     source_id:     e_raw.1,
@@ -1542,6 +1610,8 @@ impl MemoryGraph {
                     properties:    serde_json::from_str(&e_raw.5)?,
                     created_at:    e_raw.6,
                     last_accessed: e_raw.7,
+                    origin:        EdgeOrigin::parse(&origin),
+                    source,
                 };
                 let node = Node {
                     id:         n_raw.0,
@@ -1600,7 +1670,9 @@ impl MemoryGraph {
     ///
     /// donde:
     /// - `W_0` es el peso actual de la arista
-    /// - `λ` (`decay_rate`) es la tasa de decaimiento (ej. 0.0001 por segundo)
+    /// - `λ` es la tasa de decaimiento por segundo de la procedencia de la
+    ///   arista (Paso 26): `rate_for` devuelve `None` para lo que no se
+    ///   olvida (lo enseñado, lo del sistema), que ni decae ni se poda
     /// - `Δt = now − last_accessed` es el tiempo transcurrido en segundos
     ///
     /// ## Implementación Rust-side (no SQLite-side)
@@ -1624,7 +1696,7 @@ impl MemoryGraph {
     /// [`DecayReport`] con conteos de aristas actualizadas, podadas y nodos limpiados.
     pub fn apply_decay_and_prune(
         &self,
-        decay_rate:      f64,   // λ en la fórmula (por segundo)
+        rate_for:        &dyn Fn(EdgeOrigin) -> Option<f64>, // λ por segundo
         prune_threshold: f64,   // peso mínimo para sobrevivir
     ) -> Result<DecayReport, MemoryError> {
         let now = current_unix_ts();
@@ -1641,7 +1713,12 @@ impl MemoryGraph {
         // ── 2. Calcular nuevo peso para cada arista ──────────────────────
         // `since` = el más reciente entre último acceso y última pasada
         // (Paso 22): el peso guardado ya incluye el decaimiento anterior.
-        for (edge_id, current_weight, since) in &edges_raw {
+        let mut permanent = 0u64;
+        for (edge_id, current_weight, since, origin) in &edges_raw {
+            let Some(decay_rate) = rate_for(*origin) else {
+                permanent += 1;
+                continue;
+            };
             let delta_t  = (now - since).max(0) as f64;           // Δt en segundos
             let new_weight = current_weight * (-decay_rate * delta_t).exp();
 
@@ -1673,21 +1750,26 @@ impl MemoryGraph {
             edges_decayed:  updated_count as u64,
             edges_pruned:   pruned_count  as u64,
             nodes_removed:  orphans_removed as u64,
-            decay_rate,
+            edges_permanent: permanent,
             prune_threshold,
         })
     }
 
-    /// Lee `(id, weight, desde)` de todas las aristas, donde `desde` es el
-    /// instante más reciente entre el último acceso y la última pasada de
-    /// decaimiento: el intervalo que aún no se ha descontado del peso.
-    fn fetch_edges_for_decay(&self) -> Result<Vec<(String, f64, i64)>, MemoryError> {
+    /// Lee `(id, weight, desde, procedencia)` de todas las aristas, donde
+    /// `desde` es el instante más reciente entre el último acceso y la última
+    /// pasada de decaimiento: el intervalo que aún no se ha descontado del peso.
+    fn fetch_edges_for_decay(&self) -> Result<Vec<(String, f64, i64, EdgeOrigin)>, MemoryError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, weight, MAX(last_accessed, COALESCE(decayed_at, 0)) FROM edges",
+            "SELECT id, weight, MAX(last_accessed, COALESCE(decayed_at, 0)), origin FROM edges",
         )?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    EdgeOrigin::parse(&row.get::<_, String>(3)?),
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -1816,6 +1898,17 @@ pub struct GraphSnapshot {
     pub edges: Vec<Edge>,
 }
 
+/// Resultado de [`MemoryGraph::learn_edge`] (Paso 26).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EdgeWrite {
+    /// Arista nueva, con su id.
+    Inserted(String),
+    /// Ya existía y su procedencia mejoró (p. ej. deducida → investigada).
+    Promoted,
+    /// Ya existía con una procedencia igual o más duradera.
+    Unchanged,
+}
+
 /// Reporte del ciclo de decaimiento y poda (Paso 5).
 ///
 /// Devuelto por [`MemoryGraph::apply_decay_and_prune`].
@@ -1827,8 +1920,8 @@ pub struct DecayReport {
     pub edges_pruned:    u64,
     /// Nodos huérfanos eliminados tras la poda de aristas.
     pub nodes_removed:   u64,
-    /// Tasa de decaimiento λ usada.
-    pub decay_rate:      f64,
+    /// Aristas que no decaen por su procedencia (enseñadas, del sistema).
+    pub edges_permanent: u64,
     /// Umbral de poda usado.
     pub prune_threshold: f64,
 }
@@ -2524,13 +2617,13 @@ mod tests {
         let past = current_unix_ts() - 1000;
         g.conn_execute_for_test("UPDATE edges SET last_accessed = ?1", [past]).unwrap();
 
-        g.apply_decay_and_prune(0.001, 0.01).unwrap();
+        g.apply_decay_and_prune(&|_| Some(0.001), 0.01).unwrap();
         let first = weight_of(&g, "a", "b");
         assert!((first - (-1.0f64).exp()).abs() < 0.01, "1.ª pasada: {first}");
 
         // 2.ª pasada inmediata: no ha pasado tiempo desde la anterior. Antes
         // del Paso 22 volvía a aplicar e^-1 (≈ 0.135).
-        g.apply_decay_and_prune(0.001, 0.01).unwrap();
+        g.apply_decay_and_prune(&|_| Some(0.001), 0.01).unwrap();
         let second = weight_of(&g, "a", "b");
         assert!((second - first).abs() < 0.01, "2.ª pasada: {first} → {second}");
     }
@@ -2599,5 +2692,64 @@ mod tests {
 
         g.delete_node("b").unwrap();
         assert_eq!(g.gap_attempts("a", "b").unwrap(), 0, "ON DELETE CASCADE");
+    }
+
+    // ─────────────── PROCEDENCIA (Paso 26) ───────────────
+
+    fn provenance_of(g: &MemoryGraph, from: &str, to: &str) -> (EdgeOrigin, Option<String>, f64) {
+        let hood = g.get_neighbors(from, TraversalDirection::Outgoing).unwrap();
+        let (edge, _) = hood.neighbors.into_iter().find(|(_, n)| n.id == to).unwrap();
+        (edge.origin, edge.source, edge.weight)
+    }
+
+    #[test]
+    fn test_learn_edge_promotes_only_to_more_durable_origin() {
+        let g = in_memory_graph();
+        for id in ["titanio", "implantes"] {
+            g.insert_node(&Node::new(id, "concept", id)).unwrap();
+        }
+        let inferred = Provenance::new(EdgeOrigin::Inferred).with_source("subconsciente: titanio ↔ implantes");
+        let url = "https://ejemplo.org/titanio".to_string();
+        let researched = Provenance::new(EdgeOrigin::Researched).with_source(url.clone());
+
+        assert!(matches!(g.learn_edge("titanio", "se_usa_en", "implantes", 0.4, &inferred).unwrap(), EdgeWrite::Inserted(_)));
+        g.conn_execute_for_test("UPDATE edges SET last_accessed = 0", []).unwrap();
+
+        assert_eq!(g.learn_edge("titanio", "se_usa_en", "implantes", 0.8, &researched).unwrap(), EdgeWrite::Promoted);
+        assert_eq!(provenance_of(&g, "titanio", "implantes"), (EdgeOrigin::Researched, Some(url.clone()), 0.8));
+        assert_eq!(g.conn_query_row_for_test("SELECT COUNT(*) FROM edges WHERE last_accessed = 0").unwrap(), 0,
+            "confirmar un hecho reinicia su reloj del olvido");
+
+        // El subconsciente vuelve a deducirlo: no degrada lo verificado.
+        assert_eq!(g.learn_edge("titanio", "se_usa_en", "implantes", 0.3, &inferred).unwrap(), EdgeWrite::Unchanged);
+        // El usuario lo enseña: no se olvidará; se conservan el mayor peso y la fuente.
+        assert_eq!(g.learn_edge("titanio", "se_usa_en", "implantes", 0.5, &Provenance::new(EdgeOrigin::Taught)).unwrap(),
+            EdgeWrite::Promoted);
+        assert_eq!(provenance_of(&g, "titanio", "implantes"), (EdgeOrigin::Taught, Some(url), 0.8));
+        assert_eq!(g.stats().unwrap().edge_count, 1);
+    }
+
+    #[test]
+    fn test_legacy_edges_migrate_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("previa_paso26.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("
+                CREATE TABLE nodes (id TEXT PRIMARY KEY, label TEXT NOT NULL, name TEXT NOT NULL,
+                    properties TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL) STRICT;
+                CREATE TABLE edges (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, relation TEXT NOT NULL,
+                    target_id TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1.0,
+                    properties TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL,
+                    last_accessed INTEGER NOT NULL, UNIQUE (source_id, relation, target_id)) STRICT;
+                INSERT INTO nodes VALUES ('a', 'concept', 'A', '{}', 1), ('b', 'concept', 'B', '{}', 1);
+                INSERT INTO edges VALUES ('e1', 'a', 'r', 'b', 0.7, '{}', 1, 1);
+            ").unwrap();
+        }
+        let g = MemoryGraph::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(provenance_of(&g, "a", "b"), (EdgeOrigin::Unknown, None, 0.7));
+        assert_eq!(g.get_all_graph_data(10).unwrap().edges[0].origin, EdgeOrigin::Unknown);
+        assert_eq!(g.learn_edge("a", "r", "b", 0.5, &Provenance::new(EdgeOrigin::Researched)).unwrap(),
+            EdgeWrite::Promoted, "al confirmarse, pasa a tener procedencia conocida");
     }
 }

@@ -38,6 +38,7 @@
 // ============================================================
 
 use crate::memory_graph::{DecayReport, MemoryGraph};
+use crate::types::EdgeOrigin;
 
 // ── Constantes de calibración ─────────────────────────────────────────────────
 
@@ -57,15 +58,39 @@ pub const DEFAULT_PRUNE_THRESHOLD: f64 = 0.10;
 
 // ── Tipos públicos ────────────────────────────────────────────────────────────
 
+/// Cómo se elige λ para cada arista.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DecayPolicy {
+    /// El mismo λ (por segundo) para todas, sin excepciones: demos y tests.
+    Uniform(f64),
+    /// λ según la vida media de la procedencia de cada arista (Paso 26);
+    /// lo enseñado y lo del sistema no decaen.
+    ByOrigin,
+}
+
+impl DecayPolicy {
+    /// λ por segundo para una procedencia; `None` = no se olvida.
+    pub fn rate(self, origin: EdgeOrigin) -> Option<f64> {
+        match self {
+            Self::Uniform(lambda) => Some(lambda),
+            Self::ByOrigin => origin.half_life_days().map(lambda_for_half_life),
+        }
+    }
+}
+
+/// λ (por segundo) con la que un peso se reduce a la mitad en `days` días.
+pub fn lambda_for_half_life(days: f64) -> f64 {
+    std::f64::consts::LN_2 / (days * 86_400.0)
+}
+
 /// Parámetros configurables del ciclo de olvido.
 ///
 /// Permite ajustar el comportamiento sin recompilar:
 /// un agente médico puede requerir retención más larga que uno de noticias.
 #[derive(Debug, Clone)]
 pub struct ForgettingConfig {
-    /// Tasa de decaimiento λ (por segundo).
-    /// Valores típicos: ver constantes `LAMBDA_*`.
-    pub decay_rate:      f64,
+    /// Tasa de decaimiento de cada arista.
+    pub policy:          DecayPolicy,
 
     /// Aristas con peso post-decay < `prune_threshold` son eliminadas.
     pub prune_threshold: f64,
@@ -74,7 +99,7 @@ pub struct ForgettingConfig {
 impl Default for ForgettingConfig {
     fn default() -> Self {
         Self {
-            decay_rate:      LAMBDA_SHORT_TERM,
+            policy:          DecayPolicy::ByOrigin,
             prune_threshold: DEFAULT_PRUNE_THRESHOLD,
         }
     }
@@ -83,12 +108,12 @@ impl Default for ForgettingConfig {
 impl ForgettingConfig {
     /// Configuración agresiva para demos: λ=1.0, threshold=0.1.
     pub fn demo() -> Self {
-        Self { decay_rate: LAMBDA_DEMO, prune_threshold: DEFAULT_PRUNE_THRESHOLD }
+        Self { policy: DecayPolicy::Uniform(LAMBDA_DEMO), prune_threshold: DEFAULT_PRUNE_THRESHOLD }
     }
 
     /// Configuración para memoria semántica a largo plazo.
     pub fn long_term() -> Self {
-        Self { decay_rate: LAMBDA_LONG_TERM, prune_threshold: DEFAULT_PRUNE_THRESHOLD }
+        Self { policy: DecayPolicy::Uniform(LAMBDA_LONG_TERM), prune_threshold: DEFAULT_PRUNE_THRESHOLD }
     }
 }
 
@@ -113,7 +138,8 @@ impl ForgettingCurve {
     /// al método `apply_decay_and_prune` de `MemoryGraph`, que lo resuelve
     /// en una sola transacción SQLite.
     pub fn run_nightly_cleanup(&self, graph: &MemoryGraph) -> Result<DecayReport, crate::error::MemoryError> {
-        graph.apply_decay_and_prune(self.config.decay_rate, self.config.prune_threshold)
+        let policy = self.config.policy;
+        graph.apply_decay_and_prune(&|origin| policy.rate(origin), self.config.prune_threshold)
     }
 
     /// Calcula el peso decaído dado peso inicial, tasa λ y Δt en segundos.
@@ -241,7 +267,7 @@ mod tests {
         // λ = 0.001: W_t = 0.9 × e^(-0.001 × 1000) = 0.9 × e^(-1) ≈ 0.331
         let expected = 0.9 * (-0.001 * 1000.0_f64).exp();
 
-        let report = g.apply_decay_and_prune(0.001, 0.05).unwrap();
+        let report = g.apply_decay_and_prune(&|_| Some(0.001), 0.05).unwrap();
 
         assert_eq!(report.edges_pruned, 0, "No debe podarse (peso > 0.05)");
         assert_eq!(report.edges_decayed, 1);
@@ -266,7 +292,7 @@ mod tests {
             ("tierra", "orbita", "sol",    0.9, now),        // reciente → sobrevive
         ]);
 
-        let report = g.apply_decay_and_prune(0.0001, 0.10).unwrap();
+        let report = g.apply_decay_and_prune(&|_| Some(0.0001), 0.10).unwrap();
 
         assert!(report.edges_pruned >= 1, "La arista antigua debe podarse");
 
@@ -290,7 +316,7 @@ mod tests {
         assert!(g.get_node("huerfano_b").unwrap().is_some());
 
         // λ=1.0: con Δt=100000, el peso decae a prácticamente 0 → se poda.
-        let report = g.apply_decay_and_prune(1.0, 0.10).unwrap();
+        let report = g.apply_decay_and_prune(&|_| Some(1.0), 0.10).unwrap();
 
         assert!(report.edges_pruned >= 1);
         assert!(report.nodes_removed >= 1, "Los nodos huérfanos deben eliminarse");
@@ -309,7 +335,7 @@ mod tests {
             ("nuevo_a", "rel", "nuevo_b", 0.8, now),
         ]);
 
-        let report = g.apply_decay_and_prune(1.0, 0.10).unwrap();
+        let report = g.apply_decay_and_prune(&|_| Some(1.0), 0.10).unwrap();
 
         assert_eq!(report.edges_pruned, 0, "Arista reciente no debe podarse");
 
@@ -398,7 +424,7 @@ mod tests {
         ]);
 
         // Insertar nodo "b" explícitamente (ya lo hace setup_graph).
-        let report = g.apply_decay_and_prune(1.0, 0.10).unwrap();
+        let report = g.apply_decay_and_prune(&|_| Some(1.0), 0.10).unwrap();
 
         assert!(report.edges_pruned >= 1, "La arista débil debe podarse");
 
@@ -434,8 +460,63 @@ mod tests {
         let g   = setup_graph_with_timestamps(&[
             ("p", "r", "q", 0.9, now),
         ]);
-        let report = g.apply_decay_and_prune(0.001, 0.05).unwrap();
-        assert_eq!(report.decay_rate, 0.001);
+        let report = g.apply_decay_and_prune(&|_| Some(0.001), 0.05).unwrap();
+        assert_eq!(report.edges_permanent, 0);
         assert_eq!(report.prune_threshold, 0.05);
+    }
+
+    // ── Paso 26: olvido según la procedencia ─────────────────────────────────
+
+    #[test]
+    fn test_half_life_lambda_halves_weight() {
+        let lambda = lambda_for_half_life(14.0);
+        let w = ForgettingCurve::decayed_weight(0.8, lambda, 14.0 * 86_400.0);
+        assert!((w - 0.4).abs() < 1e-9, "a los 14 días debe quedar la mitad, quedó {w}");
+    }
+
+    #[test]
+    fn test_by_origin_rates() {
+        let p = DecayPolicy::ByOrigin;
+        assert_eq!(p.rate(EdgeOrigin::Taught), None, "lo enseñado no se olvida");
+        assert_eq!(p.rate(EdgeOrigin::System), None);
+        assert!(p.rate(EdgeOrigin::Inferred).unwrap() > p.rate(EdgeOrigin::Federated).unwrap());
+        assert!(p.rate(EdgeOrigin::Federated).unwrap() > p.rate(EdgeOrigin::Researched).unwrap());
+        assert_eq!(p.rate(EdgeOrigin::Unknown), p.rate(EdgeOrigin::Researched),
+            "lo anterior al Paso 26 se olvida como lo verificado");
+        assert_eq!(DecayPolicy::Uniform(0.5).rate(EdgeOrigin::Taught), Some(0.5));
+    }
+
+    /// 60 días sin uso: lo deducido por el subconsciente se poda, lo
+    /// investigado sigue (más débil) y lo enseñado queda intacto.
+    #[test]
+    fn test_by_origin_cleanup_keeps_taught_and_prunes_inferred() {
+        use crate::types::Provenance;
+        let g = MemoryGraph::open(":memory:").unwrap();
+        for id in ["a", "b", "c", "d"] {
+            g.insert_node(&Node::new(id, "concept", id)).unwrap();
+        }
+        g.insert_edge_from("a", "r", "b", 0.9, &Provenance::new(EdgeOrigin::Taught)).unwrap();
+        g.insert_edge_from("a", "r", "c", 0.9, &Provenance::new(EdgeOrigin::Researched)).unwrap();
+        g.insert_edge_from("a", "r", "d", 0.4, &Provenance::new(EdgeOrigin::Inferred)).unwrap();
+        let sixty_days_ago = crate::types::current_unix_ts() - 60 * 86_400;
+        g.conn_execute_for_test("UPDATE edges SET last_accessed = ?1", rusqlite::params![sixty_days_ago]).unwrap();
+
+        let report = ForgettingCurve::new(ForgettingConfig { policy: DecayPolicy::ByOrigin, prune_threshold: 0.05 })
+            .run_nightly_cleanup(&g)
+            .unwrap();
+
+        assert_eq!(report.edges_permanent, 1);
+        assert_eq!(report.edges_pruned, 1, "0.4 tras 60 días con vida media de 14 → 0.02");
+        let weights: std::collections::HashMap<String, f64> = g
+            .get_neighbors("a", crate::memory_graph::TraversalDirection::Outgoing)
+            .unwrap()
+            .neighbors
+            .into_iter()
+            .map(|(e, n)| (n.id, e.weight))
+            .collect();
+        assert_eq!(weights["b"], 0.9, "lo enseñado no decae");
+        let expected = 0.9 * 0.5_f64.powf(60.0 / 90.0);
+        assert!((weights["c"] - expected).abs() < 1e-3, "investigado: {} ≠ {expected}", weights["c"]);
+        assert!(!weights.contains_key("d"));
     }
 }

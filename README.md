@@ -58,7 +58,7 @@ SynaptoCore es un sistema de memoria semántica persistente con razonamiento aut
 | **LLM Bridge** | `llm_bridge.rs` | Córtex Prefrontal | Extracción de entidades, síntesis de respuesta, bucle ReAct multi-paso. |
 | **Session Manager** | `working_memory.rs` | Lóbulo Frontal | Memoria de trabajo en RAM. Ventana deslizante de 6 mensajes por sesión. Resolución de correferencia. |
 | **Curiosity Engine** | `subconscious.rs` | Subconsciente / sueño REM | Bucle autónomo: muestrea pares de nodos, formula hipótesis, valida via SearXNG, consolida tripletas. |
-| **Forgetting Curve** | `forgetting_curve.rs` | Olvido de Ebbinghaus | Decaimiento exponencial de aristas. Poda de conexiones débiles. Refuerzo Hebbiano en consulta. |
+| **Forgetting Curve** | `forgetting_curve.rs` | Olvido de Ebbinghaus | Decaimiento exponencial según la procedencia de cada arista (lo enseñado no se olvida). Poda de conexiones débiles. Refuerzo Hebbiano en consulta. |
 | **Truth Filter** | `truth_filter.rs` | Corteza Frontal (inhibición) | Validación epistémica 3-way (Verificado / Contradictorio / Inconcluso) antes de consolidar. |
 | **Tool Registry** | `tools.rs` | Córtex Motor | Trait `Tool`. ReAct loop: decide herramienta → ejecuta → acumula en scratchpad → sintetiza. |
 | **Federated Memory** | `federated_memory.rs` | Red Neuronal Distribuida | Intercambio de deltas entre agentes via archivos `.synapse`. |
@@ -310,7 +310,7 @@ curl http://localhost:8080/api/v1/graph/all
 Vecinos directos de un nodo (útil para explorar el grafo localmente).
 
 ```bash
-curl "http://localhost:8080/api/v1/graph/neighbors/fénix_flow"
+curl "http://localhost:8080/api/v1/graph/neighbors/postgresql"
 ```
 
 ### `POST /api/v1/federation/export`
@@ -329,7 +329,7 @@ WebSocket de telemetría en tiempo real. Emite eventos del bucle subconsciente:
 ws://localhost:8080/ws/subconscious
 ```
 ```json
-{"event_type": "sleep_cycle", "message": "Consolidé: fénix_flow→implementado_en→python (0.80)", "timestamp": 1729651234}
+{"event_type": "sleep_cycle", "message": "Consolidé: postgresql→usa→mvcc (0.80)", "timestamp": 1729651234}
 {"event_type": "decay",       "message": "Podé 3 aristas con peso < 0.15", "timestamp": 1729651290}
 ```
 
@@ -426,9 +426,9 @@ Un `.synapse` es JSON con la siguiente estructura:
     },
     {
       "type": "UpsertEdge",
-      "source_id": "fénix_flow",
-      "relation": "implementado_en",
-      "target_id": "python",
+      "source_id": "postgresql",
+      "relation": "escrito_en",
+      "target_id": "c",
       "weight": 0.87
     }
   ]

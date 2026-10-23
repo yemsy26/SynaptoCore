@@ -64,7 +64,7 @@ use uuid::Uuid;
 
 use crate::error::MemoryError;
 use crate::memory_graph::{MemoryGraph, TraversalDirection};
-use crate::types::{current_unix_ts, Edge, Node};
+use crate::types::{current_unix_ts, Edge, EdgeOrigin, Node, Provenance};
 
 // ──────────────────────────────────────────────────────────────
 //  CONSTANTES
@@ -607,11 +607,13 @@ impl FederationHub {
         ));
 
         // Intentar insertar la arista.
-        match graph.insert_edge(
+        // Paso 26: lo que llega de otro agente consta como federado.
+        match graph.insert_edge_from(
             &remote.source_id,
             &remote.relation,
             &remote.target_id,
             remote.weight,
+            &Provenance::new(EdgeOrigin::Federated),
         ) {
             Ok(_) => {
                 report.edges_inserted += 1;
