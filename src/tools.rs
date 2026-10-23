@@ -103,6 +103,22 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
+    /// Nombres registrados, ordenados (esquema del planificador, Paso 22).
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Nombre canónico de una herramienta, sin distinguir mayúsculas
+    /// ("inventorytool" → "InventoryTool"). `None` si no está registrada.
+    pub fn resolve(&self, name: &str) -> Option<String> {
+        if self.tools.contains_key(name) {
+            return Some(name.to_string());
+        }
+        self.tools.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned()
+    }
+
     /// Genera una descripción compacta de todas las herramientas para
     /// inyectarla en el prompt de decisión de herramientas.
     ///

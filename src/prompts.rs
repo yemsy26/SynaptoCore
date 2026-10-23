@@ -53,29 +53,6 @@ Texto: "El estrés crónico eleva el cortisol, que daña el hipocampo y reduce l
 Salida: {"triples": [{"subject": "estres_cronico", "relation": "eleva", "object": "cortisol", "weight": 0.95}, {"subject": "cortisol", "relation": "daña", "object": "hipocampo", "weight": 0.9}, {"subject": "cortisol", "relation": "reduce", "object": "memoria", "weight": 0.85}]}"#
 }
 
-/// Genera el prompt del sistema para identificación de entidad en una pregunta.
-///
-/// Paso 1 del flujo `query_with_memory`: extraemos la entidad principal
-/// para anclarla en el grafo y recuperar contexto relevante.
-///
-/// Por qué un LLM para esto en lugar de regex/NER local:
-///   El modelo ya está cargado en VRAM; hacer un segundo paso de NER
-///   con un modelo separado sería un desperdicio. Una query de 15-20
-///   tokens al contexto existente cuesta microsegundos de prefill.
-pub fn entity_extraction_system_prompt() -> &'static str {
-    r#"Eres un extractor de entidades minimalista. Dada una pregunta, responde ÚNICAMENTE con el identificador de la entidad principal en snake_case sin tildes. Sin texto adicional, sin puntuación, solo el identificador.
-
-EJEMPLOS:
-Pregunta: "¿Qué efectos tiene el cortisol en el cerebro?"
-Respuesta: cortisol
-
-Pregunta: "¿Cómo afecta el estrés al sueño?"
-Respuesta: estres
-
-Pregunta: "¿Qué relación tiene la inteligencia artificial con el empleo?"
-Respuesta: inteligencia_artificial"#
-}
-
 /// Construye el prompt de síntesis de respuesta con contexto del grafo.
 ///
 /// Inyecta el sub-grafo recuperado como "memoria externa" del agente.
@@ -110,7 +87,7 @@ pub fn format_graph_context(entity: &str, neighbors: &[(String, String, String, 
 
     let mut ctx = format!("Conocimiento verificado sobre '{}':\n", entity);
     for (subject, relation, object, weight) in neighbors {
-        if *weight >= 0.3 {
+        if *weight >= MIN_CONTEXT_WEIGHT {
             let certainty = if *weight >= 0.8 {
                 "establecido"
             } else if *weight >= 0.5 {
@@ -302,109 +279,106 @@ REGLAS:
 }
 
 // ──────────────────────────────────────────────────────────────
-//  Paso 13 — Correferencia y Reescritura de Contexto
+//  Paso 22 — Planificador Cognitivo (una sola llamada al LLM)
 // ──────────────────────────────────────────────────────────────
 
-/// Prompt del sistema para el paso de resolución de correferencia.
+/// Peso mínimo para que una arista entre en el contexto del LLM.
 ///
-/// MISIÓN: dado el historial de conversación + nueva pregunta del usuario,
-/// reescribir la pregunta de forma **autocontenida** (standalone) sin pronombres
-/// ni referencias implícitas, para que el motor de búsqueda en el grafo
-/// pueda entenderla sin contexto adicional.
-///
-/// ESTRATEGIA:
-///   • Si la pregunta ya es autocontenida, devuélvela sin cambios.
-///   • Si contiene referencias ("él", "eso", "ese software", etc.) resolverlas
-///     con la entidad del historial.
-///   • Respuesta: SOLO la pregunta reescrita, en lenguaje natural, sin JSON.
-///   • Parámetros: baja temperatura (0.1), pocos tokens (64).
-pub fn coreference_system_prompt() -> &'static str {
-    r#"Eres un resolutor de correferencia minimalista. Tu única tarea es reescribir la última pregunta del usuario de forma AUTOCONTENIDA, resolviendo cualquier pronombre o referencia implícita usando el historial de conversación previo.
+/// Por debajo, la asociación es especulativa y contamina la respuesta.
+/// El bridge usa el mismo umbral para decidir qué aristas refuerza (Hebb):
+/// solo se fortalece lo que de verdad llegó al prompt.
+pub const MIN_CONTEXT_WEIGHT: f64 = 0.3;
 
-REGLAS ESTRICTAS:
-1. Responde ÚNICAMENTE con la pregunta reescrita. Sin explicaciones, sin "Claro:", sin puntos adicionales.
-2. Si la pregunta ya es autocontenida (no tiene pronombres ni referencias ambiguas), devuélvela EXACTAMENTE igual.
-3. Resuelve SOLO referencias claras. Si la referencia es ambigua, deja la pregunta como está.
-4. Mantén el idioma original de la pregunta.
+/// Prompt del sistema del planificador.
+///
+/// Sustituye a cuatro llamadas en serie (clasificador de intención,
+/// correferencia, decisión de herramienta y extracción de entidad). El
+/// modelo lee el mensaje una sola vez y resuelve las cuatro tareas en la
+/// misma pasada: unas decenas de tokens de salida más, en lugar de cuatro
+/// ciclos completos de prefill + decode.
+///
+/// El esquema se refuerza en `planner_json_schema` (structured outputs de
+/// Ollama); el prompt sigue siendo necesario para la semántica de cada campo
+/// y para backends que no restringen la salida.
+///
+/// Claves cortas y JSON compacto: `i` (intent), `q` (rewritten_query),
+/// `e` (entities), `t` (tool), `p` (tool_params). Ollama decodifica también
+/// los tokens que el esquema ya fija, y con qwen3.5:2b el esqueleto del JSON
+/// era la mitad de la salida. El modelo imita el estilo de los ejemplos:
+/// sin espacios, 45 → 33 tokens de media (12/12 aciertos en la sonda del
+/// Paso 22). `parse_plan` acepta también las claves largas.
+pub fn planner_system_prompt(tool_descriptions: &str) -> String {
+    format!(
+r#"Eres el planificador de SynaptoCore. Analiza el último mensaje del usuario y responde ÚNICAMENTE con un objeto JSON con este esquema exacto:
+{{"i":"query" | "learn","q":"...","e":["..."],"t":"none" | "NombreHerramienta","p":{{...}}}}
+
+CAMPOS:
+1. "i" (intención): por defecto "query". Usa "learn" SOLO si el mensaje afirma un hecho nuevo ("Rust es un lenguaje compilado", "Fénix Flow usa PostgreSQL") o pide memorizar algo ("Memoriza que la sucursal abre a las 9"). Preguntas (aunque no lleven signos), peticiones ("Explícame…", "Háblame de…", "Dime…", "Cuéntame…"), saludos y conversación son SIEMPRE "query". Si dudas, "query".
+2. "q" (consulta reescrita): el mensaje reescrito de forma autocontenida, sustituyendo pronombres, referencias ("eso", "ese producto") o el sujeto omitido ("Y cómo afecta al sueño") por lo que indique el historial. Si ya es autocontenido, cópialo igual. Mismo idioma.
+3. "e" (entidades): de 1 a 4 conceptos clave del mensaje, en minúsculas y sin artículos ("fénix flow", "cortisol", "inteligencia artificial"). Lista vacía si no hay ninguno (por ejemplo, un saludo).
+4. "t" (herramienta): usa una herramienta SOLO si piden datos en tiempo real: precios, stock de inventario, facturación, datos de clientes o fecha/hora actual. Para conocimiento general responde "none".
+5. "p" (parámetros): parámetros de la herramienta según su esquema, o {{}} si "t" es "none".
+
+HERRAMIENTAS DISPONIBLES:
+{tool_descriptions}
 
 EJEMPLOS:
-Historial: "User: ¿Qué es Fénix Flow?\nAssistant: Es un software de facturación."
-Pregunta: "¿En qué lenguaje está hecho?"
-Reescritura: "¿En qué lenguaje está hecho Fénix Flow?"
-
-Historial: "User: ¿Cuál es la capital de Francia?\nAssistant: París."
-Pregunta: "¿Cuántos habitantes tiene?"
-Reescritura: "¿Cuántos habitantes tiene París?"
+Historial: (vacío)
+Mensaje: "¿Qué efectos tiene el cortisol en el cerebro?"
+{{"i":"query","q":"¿Qué efectos tiene el cortisol en el cerebro?","e":["cortisol","cerebro"],"t":"none","p":{{}}}}
 
 Historial: (vacío)
-Pregunta: "¿Qué es Rust?"
-Reescritura: "¿Qué es Rust?"
-"#
+Mensaje: "El titanio es un metal ligero usado en implantes."
+{{"i":"learn","q":"El titanio es un metal ligero usado en implantes.","e":["titanio","implantes"],"t":"none","p":{{}}}}
+
+Historial: (vacío)
+Mensaje: "Explícame qué hace Fénix Flow"
+{{"i":"query","q":"Explícame qué hace Fénix Flow","e":["fénix flow"],"t":"none","p":{{}}}}
+
+Historial: User: ¿Qué es Fénix Flow? / Assistant: Un ERP de facturación.
+Mensaje: "¿En qué lenguaje está hecho?"
+{{"i":"query","q":"¿En qué lenguaje está hecho Fénix Flow?","e":["fénix flow","lenguaje de programación"],"t":"none","p":{{}}}}
+
+Historial: (vacío)
+Mensaje: "Hola, buenos días"
+{{"i":"query","q":"Hola, buenos días","e":[],"t":"none","p":{{}}}}"#
+    )
 }
 
-/// Construye el prompt de usuario para la reescritura de correferencia.
+/// Prompt de usuario del planificador: historial (para la correferencia)
+/// más el mensaje a planificar.
+pub fn format_planner_user_prompt(history_text: &str, message: &str) -> String {
+    let history = history_text.trim();
+    let history = if history.is_empty() { "(vacío)" } else { history };
+    format!("Historial:\n{history}\n\nMensaje: \"{}\"", message.trim())
+}
+
+/// Esquema JSON del plan para structured outputs (`format` en Ollama).
 ///
-/// # Parámetros
-/// - `history_text`: Historial formateado (salida de `format_history_as_text`).
-///   Puede ser string vacío si es el primer turno.
-/// - `new_question`: La nueva pregunta del usuario sin procesar.
-pub fn format_coreference_user_prompt(history_text: &str, new_question: &str) -> String {
-    if history_text.is_empty() {
-        // Sin historial → la pregunta ya es autocontenida por definición.
-        format!("Pregunta: {}", new_question)
-    } else {
-        format!(
-            "Historial:\n{}\n\nPregunta: {}",
-            history_text, new_question
-        )
-    }
+/// Con el esquema, el muestreo solo puede producir JSON válido y la
+/// herramienta queda restringida a las registradas (o "none"): un modelo
+/// de 2B deja de inventar nombres de herramienta o de romper el formato.
+pub fn planner_json_schema(tool_names: &[&str]) -> serde_json::Value {
+    let mut tools = vec!["none"];
+    tools.extend_from_slice(tool_names);
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "i": { "type": "string", "enum": ["query", "learn"] },
+            "q": { "type": "string" },
+            "e": { "type": "array", "items": { "type": "string" }, "maxItems": 4 },
+            "t": { "type": "string", "enum": tools },
+            "p": { "type": "object" }
+        },
+        "required": ["i", "q", "e", "t", "p"]
+    })
 }
-
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-//  Paso 20 â€” Enrutador Cognitivo de IntenciÃ³n (Intent Routing)
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-/// Prompt del sistema para clasificar si el usuario enseÃ±a (LEARN) o consulta (QUERY).
-pub fn intent_classification_system_prompt() -> &'static str {
-    r#"Eres un clasificador semÃ¡ntico de intenciÃ³n ultra-rÃ¡pido.
-Tu tarea es clasificar el mensaje del usuario en exactamente UNA de dos categorÃ­as:
-
-- LEARN: El usuario estÃ¡ ENSEÃ‘ANDO un hecho, declarando informaciÃ³n nueva, corrigiendo conocimiento o instruyendo explÃ­citamente a memorizar algo.
-  Ejemplos: "Rust es un lenguaje compilado", "El cliente Juan PÃ©rez tiene cÃ©dula 12345", "Memoriza que la sucursal abre a las 9am", "FÃ©nix Flow usa PostgreSQL".
-
-- QUERY: El usuario estÃ¡ PREGUNTANDO algo, pidiendo un anÃ¡lisis, saludando o manteniendo una conversaciÃ³n interactiva.
-  Ejemplos: "Â¿QuÃ© es Rust?", "Â¿CuÃ¡ntos clientes tenemos?", "Hola, Â¿cÃ³mo estÃ¡s?", "Dime el stock del iPhone 15", "ExplÃ­came quÃ© hace FÃ©nix Flow".
-
-REGLAS ESTRICTAS:
-1. Responde ÃšNICAMENTE con una sola palabra: LEARN o QUERY.
-2. Si tienes dudas o el mensaje es ambiguo, responde QUERY.
-3. Cero puntuaciÃ³n, cero explicaciones."#
-}
-
-/// Construye el prompt de usuario para la clasificaciÃ³n de intenciÃ³n.
-pub fn format_intent_user_prompt(input: &str) -> String {
-    format!("Mensaje: \"{}\"", input.trim())
-}
-
 
 // ──────────────────────────────────────────────────────────────
 //  Tests de prompts (verifican formato, no el LLM)
 // ──────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_intent_classification_prompt_contains_rules() {
-        let p = intent_classification_system_prompt();
-        assert!(p.contains("LEARN"));
-        assert!(p.contains("QUERY"));
-        assert!(p.contains("REGLAS ESTRICTAS"));
-    }
-
-    #[test]
-    fn test_format_intent_user_prompt() {
-        let u = format_intent_user_prompt("Rust es rÃ¡pido");
-        assert_eq!(u, "Mensaje: \"Rust es rÃ¡pido\"");
-    }
     use super::*;
 
     #[test]
@@ -519,166 +493,60 @@ mod tests {
         assert!(p.contains("snake_case"));
     }
 
-    // ─────────────── Paso 13 — Correferencia ───────────────
+    // ─────────────── Paso 22 — Planificador ───────────────
 
     #[test]
-    fn test_coreference_system_prompt_exists() {
-        let p = coreference_system_prompt();
-        assert!(!p.is_empty());
-        // Debe mencionar el concepto de reescritura autocontenida.
-        assert!(p.contains("autocontenida") || p.contains("standalone") || p.contains("reescri"));
+    fn test_planner_prompt_declares_schema_and_tools() {
+        let p = planner_system_prompt("- TimeTool: Devuelve la hora.");
+        for field in ["\"i\" (intención)", "\"q\" (consulta reescrita)", "\"e\" (entidades)",
+                      "\"t\" (herramienta)", "\"p\" (parámetros)"] {
+            assert!(p.contains(field), "falta {field} en el prompt");
+        }
+        assert!(p.contains("TimeTool"));
+        assert!(p.contains("ÚNICAMENTE"));
     }
 
     #[test]
-    fn test_format_coreference_user_prompt_contains_history_and_question() {
-        let history = "User: ¿Qué es Fénix Flow?\nAssistant: Es un software de facturación.";
-        let question = "¿En qué lenguaje está hecho?";
-        let p = format_coreference_user_prompt(history, question);
-        assert!(p.contains("Fénix Flow") || p.contains("facturación"));
-        assert!(p.contains("lenguaje"));
+    fn test_planner_prompt_examples_match_schema_and_are_compact() {
+        // El modelo imita los ejemplos few-shot: deben ser JSON válido, con
+        // las claves del esquema y sin espacios (cada espacio es un token más).
+        let p = planner_system_prompt("No hay herramientas disponibles.");
+        let schema = planner_json_schema(&[]);
+        let mut required: Vec<&str> = schema["required"].as_array().unwrap()
+            .iter().map(|k| k.as_str().unwrap()).collect();
+        required.sort_unstable();
+
+        let (_, examples) = p.split_once("EJEMPLOS:").expect("sección de ejemplos");
+        let examples: Vec<&str> = examples.lines().filter(|l| l.starts_with('{')).collect();
+        assert_eq!(examples.len(), 5);
+        for ex in examples {
+            let v: serde_json::Value = serde_json::from_str(ex).expect(ex);
+            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, required, "{ex}");
+            assert!(v["e"].is_array());
+            assert!(!ex.contains("\": ") && !ex.contains("\", \""), "ejemplo no compacto: {ex}");
+        }
     }
 
     #[test]
-    fn test_format_coreference_user_prompt_no_history() {
-        // Sin historial previo, la pregunta no necesita reescritura.
-        let p = format_coreference_user_prompt("", "¿Qué es Rust?");
-        assert!(p.contains("Rust"));
-    }
-}
+    fn test_planner_user_prompt_with_and_without_history() {
+        let empty = format_planner_user_prompt("", "¿Qué es Rust?");
+        assert!(empty.contains("(vacío)"));
+        assert!(empty.contains("Mensaje: \"¿Qué es Rust?\""));
 
-// ──────────────────────────────────────────────────────────────
-//  Paso 14: Prompts para decisión de herramientas (ReAct)
-// ──────────────────────────────────────────────────────────────
-
-/// Prompt de sistema para la fase de decisión de herramientas (Tool Use).
-///
-/// Recibe las descripciones de las herramientas disponibles y le indica
-/// al LLM cómo responder con JSON estructurado para invocar una herramienta
-/// o pasar directamente a síntesis.
-///
-/// # Parámetros
-/// - `tool_descriptions`: texto generado por `ToolRegistry::describe_all()`.
-/// - `scratchpad`:        acumulado de ejecuciones previas en este turno
-///   (Paso 15). Vacío en la primera iteración del bucle ReAct.
-pub fn tool_decision_system_prompt(tool_descriptions: &str, scratchpad: &str) -> String {
-    // Sección dinámica del scratchpad: solo se añade si hay ejecuciones previas.
-    // El separador es una línea en blanco para que el LLM lo detecte visualmente.
-    let scratchpad_section = if scratchpad.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nSCRATCHPAD — Herramientas ya ejecutadas en este turno:\n\
-             {scratchpad}\n\
-             Revisa el scratchpad. Si con esos resultados ya puedes responder la pregunta, \
-             indica {{\"tool\": \"none\"}}. Si necesitas consultar otra herramienta diferente \
-             basándote en lo que obtuviste, indícala.\n"
-        )
-    };
-
-    format!(
-        "Eres el sistema de decisión de herramientas de SynaptoCore.\n\
-         REGLA ESTRICTA DE USO DE HERRAMIENTAS:\n\
-         SOLO debes usar herramientas si el usuario explícitamente pregunta por precios, stock de inventario, facturación, fecha/hora actual o datos de clientes.\n\
-         Para preguntas de conocimiento general, características de productos o charlas, DEBES responder obligatoriamente {{\"tool\": \"none\"}} para usar la memoria interna y responder con el conocimiento del grafo.\n\
-         \n\
-         Responde SOLO con JSON válido, sin texto adicional:\n\
-         {{\"tool\": \"NombreDeLaHerramienta\", \"params\": {{...}}}}  → para usar una herramienta\n\
-         {{\"tool\": \"none\"}}                                        → para responder directamente con conocimiento del grafo\n\
-         {scratchpad_section}\n\
-         HERRAMIENTAS DISPONIBLES:\n\
-         {tool_descriptions}"
-    )
-}
-
-/// Prompt de usuario para la fase de decisión de herramientas.
-///
-/// Presenta la pregunta del usuario (ya resuelta la correferencia)
-/// para que el LLM decida si usar una herramienta o no.
-///
-/// # Parámetros
-/// - `question`: pregunta autocontenida del usuario.
-pub fn format_tool_decision_user_prompt(question: &str) -> String {
-    format!("Pregunta del usuario: {question}")
-}
-
-// ──────────────────────────────────────────────────────────────
-//  Tests de prompts de decisión de herramientas (Paso 14 / Paso 15)
-// ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tool_decision_prompt_tests {
-    use super::*;
-
-    #[test]
-    fn test_tool_decision_prompt_contains_json_schema() {
-        let prompt = tool_decision_system_prompt("- TimeTool: retorna la hora.", "");
-        // Debe explicar el formato JSON esperado.
-        assert!(prompt.contains("\"tool\""), "Debe mostrar el campo 'tool'");
-        assert!(prompt.contains("\"none\""), "Debe explicar la opción 'none'");
+        let with = format_planner_user_prompt("User: ¿Qué es Fénix Flow?", "¿Y su precio?");
+        assert!(with.contains("Fénix Flow"));
+        assert!(!with.contains("(vacío)"));
     }
 
     #[test]
-    fn test_tool_decision_prompt_contains_tool_descriptions() {
-        let desc = "- TimeTool: retorna la hora.\n- WebhookTool: hace GET.";
-        let prompt = tool_decision_system_prompt(desc, "");
-        assert!(prompt.contains("TimeTool"), "Debe incluir el nombre de la herramienta");
-        assert!(prompt.contains("WebhookTool"), "Debe incluir ambas herramientas");
-    }
-
-    #[test]
-    fn test_format_tool_decision_user_prompt_contains_question() {
-        let prompt = format_tool_decision_user_prompt("¿Qué hora es?");
-        assert!(prompt.contains("¿Qué hora es?"), "Debe contener la pregunta del usuario");
-    }
-
-    #[test]
-    fn test_tool_decision_prompt_instructs_direct_response() {
-        let prompt = tool_decision_system_prompt("", "");
-        // Debe indicar cuándo responder directamente.
-        assert!(
-            prompt.contains("conocimiento del grafo"),
-            "Debe explicar la alternativa de responder sin herramienta"
-        );
-    }
-
-    // ── Paso 15: scratchpad ───────────────────────────────────
-
-    #[test]
-    fn test_tool_decision_prompt_empty_scratchpad_has_no_scratchpad_section() {
-        // Sin resultados previos → no aparece la sección SCRATCHPAD.
-        let prompt = tool_decision_system_prompt("- TimeTool: hora.", "");
-        assert!(
-            !prompt.contains("SCRATCHPAD"),
-            "Sin historial previo el prompt no debe incluir la sección SCRATCHPAD"
-        );
-    }
-
-    #[test]
-    fn test_tool_decision_prompt_nonempty_scratchpad_is_injected() {
-        // Con resultados previos → aparece el scratchpad.
-        let scratchpad = "[Tool: TimeTool] Current datetime: 2026-10-22T20:00:00-0400";
-        let prompt = tool_decision_system_prompt("- TimeTool: hora.", scratchpad);
-        assert!(
-            prompt.contains("SCRATCHPAD"),
-            "Con historial debe incluir la sección SCRATCHPAD"
-        );
-        assert!(
-            prompt.contains("TimeTool"),
-            "El scratchpad debe estar presente en el prompt"
-        );
-        assert!(
-            prompt.contains("Revisa el scratchpad"),
-            "Debe instruir al LLM a revisar el scratchpad"
-        );
-    }
-
-    #[test]
-    fn test_tool_decision_prompt_scratchpad_contains_result_text() {
-        let scratchpad = "[Tool: WebhookTool] HTTP GET http://api.example.com → {\"status\": \"ok\"}";
-        let prompt = tool_decision_system_prompt("- WebhookTool: hace GET.", scratchpad);
-        assert!(
-            prompt.contains("api.example.com"),
-            "El resultado de la herramienta debe aparecer en el prompt"
-        );
+    fn test_planner_schema_restricts_tools_and_requires_fields() {
+        let s = planner_json_schema(&["InventoryTool", "TimeTool"]);
+        let tools: Vec<&str> = s["properties"]["t"]["enum"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(tools, ["none", "InventoryTool", "TimeTool"]);
+        assert_eq!(s["required"], serde_json::json!(["i", "q", "e", "t", "p"]));
+        assert_eq!(s["properties"]["i"]["enum"], serde_json::json!(["query", "learn"]));
     }
 }

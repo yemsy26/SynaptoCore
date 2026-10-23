@@ -77,25 +77,25 @@ impl LlmBackend for ServerMock {
         let u = user.to_lowercase();
         let s = system.to_lowercase();
 
-        if s.contains("clasificador") {
-            // Paso 20: Enrutador de intencion (ServerMock)
-            if u.contains("es un") || u.contains("es una") || u.contains("recuerda") || u.contains("memoriza") || u.contains("tiene") {
-                Ok("LEARN".to_string())
-            } else {
-                Ok("QUERY".to_string())
-            }
-        } else if u.contains("herramientas disponibles") || u.contains("pregunta del usuario:") {
-            // Paso 14: decisión de herramientas (tool_decision prompt).
-            // En demo sin LLM real, no usamos ninguna herramienta.
-            Ok(r#"{"tool": "none"}"#.to_string())
-        } else if u.contains("historial") || u.contains("pregunta:") && u.contains('\n') {
-            // Paso 13: correferencia — devuelve el texto tras "Pregunta:" sin cambios.
-            // En demo sin LLM real, la pregunta se retorna tal cual (ya es autocontenida).
-            let q = user.lines()
-                .find(|l| l.starts_with("Pregunta:"))
-                .map(|l| l.trim_start_matches("Pregunta:").trim())
-                .unwrap_or(user);
-            Ok(q.to_string())
+        if s.contains("planificador de synaptocore") {
+            // Paso 22: planificador. Heurística de intención; sin herramientas
+            // ni reescritura (sin LLM real no hay correferencia que resolver).
+            let message = user
+                .lines()
+                .find_map(|l| l.strip_prefix("Mensaje: "))
+                .unwrap_or(user)
+                .trim()
+                .trim_matches('"');
+            let m = message.to_lowercase();
+            let learn = !message.starts_with('¿')
+                && ["es un", "es una", "recuerda", "memoriza", "tiene"].iter().any(|k| m.contains(k));
+            Ok(serde_json::json!({
+                "i": if learn { "learn" } else { "query" },
+                "q": message,
+                "e": [],
+                "t": "none",
+                "p": {}
+            }).to_string())
         } else if s.contains("síntesis de conocimiento") || s.contains("sintesis de conocimiento") {
             // Paso 4 — CuriosityEngine: síntesis de tripletas del bucle subconsciente.
             // El system prompt es curiosity_synthesis_system_prompt(node_a, node_b).
@@ -115,9 +115,6 @@ impl LlmBackend for ServerMock {
                 a = a_snake,
                 b = b_snake,
             ))
-        } else if u.contains("entidad") || u.contains("entity") || u.contains("identif") {
-            // Extracción de entidad para query_with_memory
-            Ok(r#"{"entity": "synaptocore"}"#.to_string())
         } else if u.contains("triples") || u.contains("tripleta") || u.contains("extract") {
             // Extracción de conocimiento para extract_and_memorize
             Ok(r#"{"triples": [
@@ -179,8 +176,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╚════════════════════════════════════════════════════════════════════╝\n");
 
     // ── 1. Inicializar el grafo de memoria ────────────────────────────────────
-    let graph = Arc::new(Mutex::new(MemoryGraph::open("synaptocore_memory.db")?));
+    let graph = MemoryGraph::open("synaptocore_memory.db")?;
     println!("✓ Memory graph inicializado (synaptocore_memory.db)\n");
+
+    // ── 1b. Memoria semántica (Paso 22) ──────────────────────────────────────
+    // Carga del modelo (y descarga la primera vez) en spawn_blocking: es E/S
+    // y CPU bloqueante. Si falla (sin red en el primer arranque, sin la
+    // feature), el sistema sigue en modo léxico en lugar de no arrancar.
+    let graph = Arc::new(Mutex::new(attach_embeddings(graph).await));
+
+    // Backfill en segundo plano de los nodos sin vector (anteriores al modelo
+    // o cuyo embedding falló). Por lotes y sin retener el lock al vectorizar.
+    let graph_bf = Arc::clone(&graph);
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || memory_graph::backfill_embeddings(&*graph_bf, 64)).await {
+            Ok(Ok(n)) if n > 0 => println!("✓ Backfill semántico: {n} nodos vectorizados"),
+            Ok(Err(e)) => eprintln!("⚠ Backfill semántico interrumpido: {e}"),
+            _ => {}
+        }
+    });
 
     // ── 2. Poblar el grafo con conocimiento inicial (idempotente) ─────────────
     {
@@ -440,6 +454,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n✓ SynaptoCore detenido limpiamente. Base de datos guardada.");
     Ok(())
+}
+
+/// Conecta el motor de embeddings al grafo (Paso 22) y carga el índice
+/// vectorial en RAM. Todo en `spawn_blocking`: cargar el modelo ONNX y leer
+/// los BLOBs es bloqueante.
+#[cfg(feature = "embeddings")]
+async fn attach_embeddings(graph: MemoryGraph) -> MemoryGraph {
+    let loaded = tokio::task::spawn_blocking(move || {
+        match memory_graph::FastEmbedBackend::new() {
+            Ok(backend) => Ok(graph.with_embedding(Arc::new(backend))),
+            Err(e) => Err((graph, e)),
+        }
+    }).await;
+    match loaded {
+        Ok(Ok(graph)) => {
+            println!(
+                "✓ Memoria semántica: fastembed multilingüe ({} vectores en RAM)\n",
+                graph.vector_index_len()
+            );
+            graph
+        }
+        Ok(Err((graph, e))) => {
+            println!("⚠ Modelo de embeddings no disponible: {e}");
+            println!("  Recuperación de contexto en modo léxico (LIKE)\n");
+            graph
+        }
+        Err(e) => panic!("La carga del modelo de embeddings abortó: {e}"),
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+async fn attach_embeddings(graph: MemoryGraph) -> MemoryGraph {
+    println!("ℹ Compilado sin la feature 'embeddings': recuperación léxica (LIKE)\n");
+    graph
 }
 
 /// Espera la señal Ctrl+C para shutdown graceful.
@@ -916,7 +964,7 @@ mod integration_tests {
         graph.lock().unwrap().insert_node(&Node::new("rust", "concept", "Rust")).unwrap();
         let llm = LockProbeLlm::new(&graph, vec![
             r#"{"triples":[{"subject":"rust","relation":"es","object":"lenguaje","weight":0.9}]}"#,
-            "rust",                              // extracción de entidad
+            r#"{"i":"query","q":"¿Qué es Rust?","e":["rust"],"t":"none","p":{}}"#,
             "Rust es un lenguaje de sistemas.",  // síntesis
         ]);
         let bridge = NeuralBridge::new(llm.clone());

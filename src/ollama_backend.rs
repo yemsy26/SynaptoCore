@@ -130,11 +130,50 @@ impl LlmBackend for OllamaBackend {
         max_tokens:    i32,
         temperature:   f32,
     ) -> Result<String, BridgeError> {
+        self.chat(system_prompt, user_prompt, max_tokens, temperature, None)
+    }
+
+    /// Structured outputs (Paso 22): Ollama ≥ 0.5 acepta un JSON Schema en
+    /// `format` y restringe el muestreo para que solo pueda emitir JSON que lo
+    /// cumpla. Con un modelo de 2B elimina el JSON roto y las herramientas
+    /// inventadas en el planificador.
+    fn complete_json(
+        &self,
+        system_prompt: &str,
+        user_prompt:   &str,
+        schema:        &serde_json::Value,
+        max_tokens:    i32,
+        temperature:   f32,
+    ) -> Result<String, BridgeError> {
+        self.chat(system_prompt, user_prompt, max_tokens, temperature, Some(schema))
+    }
+
+    fn stream_synthesis(
+        &self,
+        system_prompt: &str,
+        user_prompt:   &str,
+        max_tokens:    i32,
+        temperature:   f32,
+    ) -> Result<BoxedTokenStream, BridgeError> {
+        self.chat_stream(system_prompt, user_prompt, max_tokens, temperature)
+    }
+}
+
+impl OllamaBackend {
+    /// POST /api/chat sin streaming; `format` opcional (JSON Schema).
+    fn chat(
+        &self,
+        system_prompt: &str,
+        user_prompt:   &str,
+        max_tokens:    i32,
+        temperature:   f32,
+        format:        Option<&serde_json::Value>,
+    ) -> Result<String, BridgeError> {
         // /api/chat con stream=false y think=false.
         // `think: false` desactiva el modo razonamiento en modelos que lo soportan
         // (qwen3.5, deepseek-r1). Sin esto, el modelo emite texto de pensamiento
         // antes del JSON esperado, rompiendo el parsing del bridge.
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model":  self.model,
             "stream": false,
             "think":  false,
@@ -147,6 +186,9 @@ impl LlmBackend for OllamaBackend {
                 {"role": "user",   "content": user_prompt}
             ]
         });
+        if let Some(schema) = format {
+            body["format"] = schema.clone();
+        }
 
         let url = format!("{}/api/chat", self.base_url);
 
@@ -199,7 +241,9 @@ impl LlmBackend for OllamaBackend {
 
         Ok(content)
     }
-    fn stream_synthesis(
+
+    /// POST /api/chat con streaming de tokens (NDJSON).
+    fn chat_stream(
         &self,
         system_prompt: &str,
         user_prompt:   &str,
@@ -239,22 +283,26 @@ impl LlmBackend for OllamaBackend {
             }
 
             let mut byte_stream = resp.bytes_stream();
-            let mut buffer = String::new();
+            // Buffer de BYTES (Paso 22): un carácter multibyte (ñ, á) puede
+            // quedar partido entre dos fragmentos HTTP. Decodificar cada
+            // fragmento por separado lo convertía en '�'. Se decodifica por
+            // líneas NDJSON completas, que siempre son UTF-8 válido.
+            let mut buffer: Vec<u8> = Vec::new();
 
             while let Some(chunk_res) = byte_stream.next().await {
                 let chunk = chunk_res.map_err(|e| BridgeError::OllamaHttp(format!("Error leyendo stream: {e}")))?;
-                let chunk_str = String::from_utf8_lossy(&chunk);
-                buffer.push_str(&chunk_str);
+                buffer.extend_from_slice(&chunk);
 
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
+                while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let line = line.trim();
 
                     if line.is_empty() {
                         continue;
                     }
 
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                         if let Some(content) = val["message"]["content"].as_str() {
                             if !content.is_empty() {
                                 yield content.to_string();
@@ -267,7 +315,8 @@ impl LlmBackend for OllamaBackend {
                 }
             }
 
-            let trimmed = buffer.trim();
+            let rest = String::from_utf8_lossy(&buffer);
+            let trimmed = rest.trim();
             if !trimmed.is_empty() {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     if let Some(content) = val["message"]["content"].as_str() {

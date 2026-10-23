@@ -18,18 +18,20 @@
 //       ▼ Vec<ExtractedTriple>
 //   [MemoryGraph]      ← insert_node + insert_edge por cada triple
 //
-//   Pregunta
+//   Mensaje (Paso 22 — pipeline O(1) en llamadas al LLM)
 //       │
 //       ▼
-//   [LLM: entity extraction]  ← prompt minimalista → "cortisol"
+//   [LLM: planificador]  ← 1 llamada, JSON restringido por esquema:
+//       │                  intent · rewritten_query · entities · tool
+//       ▼ Plan
+//   [Herramienta]        ← 0-1 ejecución (HTTP), sin LLM
 //       │
-//       ▼ entity_id: String
-//   [MemoryGraph::get_neighbors] ← travesía < 5ms
+//   [fastembed + VectorIndex] ← sondas → semillas por coseno → 1 salto
+//       │                       (lock del grafo solo para esta lectura)
+//       ▼ aristas de contexto
+//   [LLM: síntesis fundamentada] ← streaming de tokens
 //       │
-//       ▼ Neighborhood
-//   [LLM: grounded synthesis]  ← contexto del grafo en el prompt
-//       │
-//       ▼ Respuesta final basada en memoria verificada
+//       ▼ Respuesta completada → refuerzo hebbiano de esas aristas
 //
 // DISEÑO DE CONCURRENCIA:
 //   LlamaModel y LlamaContext de llama-cpp-4 NO son Send/Sync.
@@ -48,8 +50,10 @@ use std::pin::Pin;
 /// Alias para un stream dinÃ¡mico de tokens/fragmentos de texto asÃ­ncrono.
 pub type BoxedTokenStream = Pin<Box<dyn Stream<Item = Result<String, BridgeError>> + Send>>;
 
+use std::collections::HashMap;
+
 use crate::error::MemoryError;
-use crate::memory_graph::{GraphAccess, MemoryGraph, TraversalDirection};
+use crate::memory_graph::{canonical_id, embed_texts, GraphAccess, MemoryGraph, RetrievalConfig};
 use crate::prompts;
 use crate::tools::ToolRegistry;
 use crate::types::Node;
@@ -87,12 +91,25 @@ const EXTRACTION_TEMPERATURE: f32 = 0.1;
 /// Temperatura para síntesis: 0.3 = algo de fluidez, pocos inventos.
 const SYNTHESIS_TEMPERATURE: f32 = 0.3;
 
-/// Límite de iteraciones del bucle ReAct multi-paso (Paso 15).
-///
-/// Evita bucles infinitos cuando el LLM alucina nombres de herramientas
-/// o nunca emite `{"tool": "none"}`. Tras MAX_TOOL_ITERATIONS, el bucle
-/// se rompe y la síntesis usa el scratchpad acumulado hasta ese punto.
-const MAX_TOOL_ITERATIONS: u8 = 3;
+/// Tokens de salida del planificador (Paso 22). Un plan típico ocupa
+/// 40-90 tokens; el margen cubre reescrituras largas.
+const PLANNER_MAX_TOKENS: i32 = 256;
+
+/// Temperatura 0: el plan es una decisión, no texto creativo.
+const PLANNER_TEMPERATURE: f32 = 0.0;
+
+/// Máximo de entidades del plan: cada una es una sonda semántica, y más
+/// sondas diluyen el contexto en lugar de enriquecerlo.
+const MAX_PLAN_ENTITIES: usize = 4;
+
+/// Longitud máxima de una entidad: más larga suele ser una frase copiada,
+/// no un concepto.
+const MAX_ENTITY_CHARS: usize = 80;
+
+/// Incremento hebbiano por uso en una respuesta (Paso 22). Menor que el
+/// refuerzo federado (`REINFORCE_DELTA` = 0.20): una consulta es una señal
+/// más débil que una confirmación de otro agente.
+pub const HEBBIAN_DELTA: f64 = 0.10;
 
 // ──────────────────────────────────────────────────────────────
 //  Tipos de datos de la interfaz LLM → Grafo
@@ -141,6 +158,52 @@ pub enum Intent {
     Query,
 }
 
+/// Plan de una sola llamada al LLM (Paso 22). Ver `NeuralBridge::plan`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    pub intent:          Intent,
+    /// Mensaje autocontenido (correferencia resuelta con el historial).
+    pub rewritten_query: String,
+    /// Conceptos clave: sondas de la búsqueda semántica en el grafo.
+    pub entities:        Vec<String>,
+    /// Herramienta a ejecutar antes de responder, si alguna.
+    pub tool:            Option<ToolCall>,
+    /// `true` si se usó el plan por defecto (LLM sin respuesta o JSON
+    /// irrecuperable).
+    pub fallback:        bool,
+}
+
+impl Plan {
+    /// Plan seguro: consulta sin herramienta, con el mensaje original como
+    /// sonda semántica. Nunca escribe en memoria ni llama a sistemas externos.
+    pub fn fallback(message: &str) -> Self {
+        Self {
+            intent:          Intent::Query,
+            rewritten_query: message.to_string(),
+            entities:        Vec::new(),
+            tool:            None,
+            fallback:        true,
+        }
+    }
+}
+
+/// Herramienta elegida por el planificador, con nombre ya validado contra
+/// el registro.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub name:   String,
+    pub params: serde_json::Value,
+}
+
+/// Prompt de síntesis listo, más las aristas que lo fundamentan.
+#[derive(Debug, Clone)]
+pub struct PreparedAnswer {
+    pub user_prompt:      String,
+    /// Aristas inyectadas como contexto: se refuerzan (Hebb) cuando la
+    /// respuesta se completa con éxito.
+    pub context_edge_ids: Vec<String>,
+}
+
 /// Resultado de una operacion de extraccion y memorizacion.
 #[derive(Debug, Clone)]
 pub struct ExtractionResult {
@@ -186,6 +249,24 @@ pub trait LlmBackend {
         max_tokens:    i32,
         temperature:   f32,
     ) -> Result<String, BridgeError>;
+
+    /// Completación con la salida restringida por un JSON Schema
+    /// ("structured outputs", Paso 22).
+    ///
+    /// Por defecto delega en `complete` (mocks, backends sin soporte): el
+    /// prompt sigue describiendo el esquema y el parser es tolerante, así que
+    /// la restricción es un refuerzo, no un requisito.
+    fn complete_json(
+        &self,
+        system_prompt: &str,
+        user_prompt:   &str,
+        schema:        &serde_json::Value,
+        max_tokens:    i32,
+        temperature:   f32,
+    ) -> Result<String, BridgeError> {
+        let _ = schema;
+        self.complete(system_prompt, user_prompt, max_tokens, temperature)
+    }
 
     /// Genera un stream asÃ­ncrono de tokens para la sÃ­ntesis final de respuesta.
     fn stream_synthesis(
@@ -391,41 +472,42 @@ impl<B: LlmBackend> NeuralBridge<B> {
         self
     }
 
-    /// Clasifica rÃ¡pidamente la intenciÃ³n del usuario entre aprender (Learn) o consultar (Query).
+    /// **Planificador cognitivo** (Paso 22): una sola llamada al LLM decide
+    /// la intención, reescribe el mensaje de forma autocontenida (resuelve la
+    /// correferencia con el historial), extrae las entidades clave y elige
+    /// herramienta. Sustituye a las 3-6 llamadas en serie anteriores
+    /// (intención → correferencia → decisión ReAct ×N → entidad).
     ///
-    /// # Estrategia
-    /// - Mensajes vacÃ­os o que empiezan con `Â¿` / `?` se enrutan inmediatamente como `Query`.
-    /// - Utiliza `intent_classification_system_prompt()` con 8 tokens max y temperatura 0.0.
-    /// - Fallback seguro: cualquier fallo, ambigÃ¼edad o salida no 'LEARN' devuelve `Query`.
-    pub fn route_intent(&self, input: &str) -> Intent {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            return Intent::Query;
+    /// La salida se restringe con el esquema JSON del plan (structured outputs
+    /// en Ollama) y además se interpreta de forma tolerante (`parse_plan`).
+    ///
+    /// Nunca falla: si el LLM no responde o el JSON es irrecuperable, devuelve
+    /// `Plan::fallback` (consulta sin herramienta, con la pregunta original
+    /// como sonda semántica), que siempre es una respuesta segura.
+    pub fn plan(&self, message: &str, history_text: &str) -> Plan {
+        let message = message.trim();
+        if message.is_empty() {
+            return Plan::fallback(message);
         }
 
-        // Heurística rápida de prefijo: preguntas directas con interrogación
-        if trimmed.starts_with('\u{00BF}') || trimmed.starts_with('?') {
-            return Intent::Query;
-        }
+        let (descriptions, names) = match &self.tool_registry {
+            Some(registry) if !registry.is_empty() => (registry.describe_all(), registry.names()),
+            _ => ("No hay herramientas disponibles.".to_string(), Vec::new()),
+        };
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
 
-        let user_prompt = prompts::format_intent_user_prompt(trimmed);
-        match self.backend.complete(
-            prompts::intent_classification_system_prompt(),
-            &user_prompt,
-            8,
-            0.0,
-        ) {
-            Ok(resp) => {
-                let cleaned = resp.trim().to_uppercase();
-                if cleaned.contains("LEARN") {
-                    Intent::Learn
-                } else {
-                    Intent::Query
-                }
-            }
+        let raw = self.backend.complete_json(
+            &prompts::planner_system_prompt(&descriptions),
+            &prompts::format_planner_user_prompt(history_text, message),
+            &prompts::planner_json_schema(&names),
+            PLANNER_MAX_TOKENS,
+            PLANNER_TEMPERATURE,
+        );
+        match raw {
+            Ok(raw) => parse_plan(&raw, message, self.tool_registry.as_deref()),
             Err(e) => {
-                log::warn!("route_intent fallÃ³: {e}; fallback a Intent::Query");
-                Intent::Query
+                log::warn!("Planificador sin respuesta ({e}); se usa el plan por defecto");
+                Plan::fallback(message)
             }
         }
     }
@@ -517,9 +599,19 @@ impl<B: LlmBackend> NeuralBridge<B> {
             }
         };
 
+        // ── Embeddings de los conceptos, FUERA del lock (Paso 22) ─────
+        let mut names: Vec<String> = triples
+            .iter()
+            .flat_map(|t| [node_name(&t.subject), node_name(&t.object)])
+            .collect();
+        names.sort();
+        names.dedup();
+        let embedder = graph.with_graph(|g| g.embedding_backend());
+        let vectors = embed_texts(embedder.as_ref(), &names);
+
         // ── Persistencia en el grafo (único tramo con lock) ──────────
         let (nodes_created, edges_created) =
-            graph.with_graph(|g| self.write_triples_to_graph(g, &triples))?;
+            graph.with_graph(|g| self.write_triples_to_graph(g, &triples, &vectors))?;
 
         log::info!(
             "Extracted {} triples → {} new nodes, {} new edges (attempts: {})",
@@ -534,288 +626,122 @@ impl<B: LlmBackend> NeuralBridge<B> {
         })
     }
 
-    /// **Consulta fundamentada en memoria (Grounded QA).**
+    /// **Preparación de la respuesta** (Paso 22): ejecuta la herramienta del
+    /// plan (si hay) y recupera el contexto semántico del grafo. Cero
+    /// llamadas al LLM.
     ///
-    /// Implementa el patrón RAG (Retrieval-Augmented Generation) sobre
-    /// nuestro grafo de memoria en lugar de un vector store.
+    /// Alcance del lock: la vectorización de las sondas (fastembed, CPU) y la
+    /// herramienta (HTTP) corren sin tocar el grafo; solo `retrieve_context`
+    /// lo bloquea, unos milisegundos.
     ///
-    /// Paso 13: acepta `history_text` (historial de conversación pre-formateado).
-    /// Si el historial no está vacío, realiza un paso previo de **resolución de
-    /// correferencia** para reescribir la pregunta de forma autocontenida antes
-    /// de anclarla en el grafo. Si está vacío, se omite la llamada LLM extra
-    /// para no añadir latencia en el primer turno.
-    ///
-    /// # Parámetros
-    /// - `graph`:        Grafo de memoria a largo plazo.
-    /// - `question`:     Pregunta del usuario (puede tener pronombres/refs).
-    /// - `history_text`: Historial formateado por `format_history_as_text`.
-    ///   Pasar `""` si es el primer mensaje de la sesión.
-    /// Prepara el contexto fundamentado (correferencia, ReAct y vecindario del grafo)
-    /// devolviendo el user prompt listo para la sÃ­ntesis de respuesta.
-    ///
-    /// Alcance del lock (Paso 21): correferencia, bucle ReAct y extracción de
-    /// entidad (hasta 5 llamadas LLM + herramientas HTTP) corren sin tocar el
-    /// grafo; solo la recuperación del vecindario lo bloquea, unos milisegundos.
-    pub fn prepare_synthesis_prompt<G: GraphAccess>(
+    /// Sondas semánticas: las entidades del plan o, si no hay, la pregunta
+    /// reescrita completa.
+    pub fn prepare_answer<G: GraphAccess>(
         &self,
-        graph:        &G,
-        question:     &str,
-        history_text: &str,
-    ) -> Result<String, BridgeError> {
-        log::debug!("Processing query: {}", question);
+        graph: &G,
+        plan:  &Plan,
+    ) -> Result<PreparedAnswer, BridgeError> {
+        // ── 1. Herramienta (una sola: el planificador ya eligió) ────────
+        let tool_output = plan.tool.as_ref().map(|call| self.run_tool(call));
 
-        // ── Paso 0 (Paso 13): Reescritura de correferencia ──────────────
-        // Solo si hay historial previo (primer turno → omitir para reducir latencia).
-        let resolved_question: std::borrow::Cow<str> = if history_text.is_empty() {
-            std::borrow::Cow::Borrowed(question)
+        // ── 2. Vectorizar las sondas fuera del lock ─────────────────────
+        let probes = if plan.entities.is_empty() {
+            vec![plan.rewritten_query.clone()]
         } else {
-            let coref_user = prompts::format_coreference_user_prompt(history_text, question);
-            let rewritten = self.backend.complete(
-                prompts::coreference_system_prompt(),
-                &coref_user,
-                64,  // Máximo 64 tokens: solo la pregunta reescrita.
-                0.1, // Temperatura muy baja: operación de precisión, no creativa.
-            )?;
-            let trimmed = rewritten.trim().to_string();
-            log::debug!("Correferencia resuelta: '{}' → '{}'", question, trimmed);
-            // Si el LLM devuelve algo vacío, usar la pregunta original como fallback.
-            if trimmed.is_empty() {
-                std::borrow::Cow::Borrowed(question)
-            } else {
-                std::borrow::Cow::Owned(trimmed)
-            }
+            plan.entities.clone()
         };
+        let embedder = graph.with_graph(|g| g.embedding_backend());
+        let vectors = embed_texts(embedder.as_ref(), &probes);
+        // Todas o ninguna: sin vector para alguna sonda → fallback léxico.
+        let probe_vecs: Option<Vec<Vec<f32>>> =
+            probes.iter().map(|p| vectors.get(p).cloned()).collect();
 
-        let effective_question = resolved_question.as_ref();
-
-        // ── Paso 1 (Paso 15): Bucle ReAct multi-paso ─────────────────
-        //
-        // El LLM puede encadenar hasta MAX_TOOL_ITERATIONS herramientas antes
-        // de responder. En cada iteración:
-        //   a) Se inyecta el scratchpad acumulado en el prompt de decisión.
-        //   b) El LLM decide: usar otra herramienta O responder directamente.
-        //   c) Si usa herramienta: su resultado se añade al scratchpad.
-        //   d) Si decide "none" o JSON inválido: se rompe el bucle.
-        //   e) Si se alcanza MAX_TOOL_ITERATIONS: se fuerza la salida.
-        //
-        // El scratchpad se construye con `push_str` (sin clonaciones extra):
-        // los resultados se concatenan con '\n' como separador.
-        let mut scratchpad = String::new();
-
-        if let Some(ref registry) = self.tool_registry {
-            if !registry.is_empty() {
-                let tool_descriptions = registry.describe_all();
-                let tool_user = prompts::format_tool_decision_user_prompt(effective_question);
-                let mut iteration: u8 = 0;
-
-                while iteration < MAX_TOOL_ITERATIONS {
-                    iteration += 1;
-
-                    // Reconstruimos el system prompt en cada iteración para que
-                    // incluya el scratchpad actualizado. La reconstrucción es
-                    // barata (el scratchpad es pequeño — típicamente < 500 chars).
-                    let tool_system =
-                        prompts::tool_decision_system_prompt(&tool_descriptions, &scratchpad);
-
-                    let tool_decision_raw = self.backend.complete(
-                        &tool_system,
-                        &tool_user,
-                        128, // Máximo 128 tokens: solo el JSON de decisión.
-                        0.0, // Temperatura 0 = determinístico (JSON estructurado).
-                    )?;
-
-                    log::debug!(
-                        "[ReAct iter {}] Tool decision raw: {}",
-                        iteration, tool_decision_raw
-                    );
-
-                    match parse_tool_decision(&tool_decision_raw) {
-                        Some(ToolDecision { tool, params }) if tool != "none" => {
-                            log::debug!(
-                                "[ReAct iter {}] Tool requested: '{}' params: {}",
-                                iteration, tool, params
-                            );
-
-                            let result = match registry.get(&tool) {
-                                Some(t) => match t.execute(params) {
-                                    Ok(output) => {
-                                        log::debug!(
-                                            "[ReAct iter {}] '{}' → {}",
-                                            iteration, tool, output
-                                        );
-                                        format!("[Tool: {tool}] {output}")
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "[ReAct iter {}] '{}' failed: {}",
-                                            iteration, tool, e
-                                        );
-                                        format!("[Tool: {tool}] Error: {e}")
-                                    }
-                                },
-                                None => {
-                                    log::warn!(
-                                        "[ReAct iter {}] '{}' not found in registry",
-                                        iteration, tool
-                                    );
-                                    format!("[Tool: {tool}] Error: Tool '{tool}' not found")
-                                }
-                            };
-
-                            // Acumular en el scratchpad sin clonar el historial previo.
-                            if !scratchpad.is_empty() {
-                                scratchpad.push('\n');
-                            }
-                            scratchpad.push_str(&result);
-                            // Continuar el bucle: el LLM puede decidir otra herramienta.
-                        }
-                        Some(_) => {
-                            // LLM decidió "none" → síntesis directa.
-                            log::debug!(
-                                "[ReAct iter {}] Decision 'none' → saliendo del bucle",
-                                iteration
-                            );
-                            break;
-                        }
-                        None => {
-                            // JSON inválido → tratar como "none", no hacer crash.
-                            log::warn!(
-                                "[ReAct iter {}] JSON inválido '{}', tratando como 'none'",
-                                iteration, tool_decision_raw
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                if iteration >= MAX_TOOL_ITERATIONS && !scratchpad.is_empty() {
-                    log::warn!(
-                        "[ReAct] Límite de {} iteraciones alcanzado; forzando síntesis",
-                        MAX_TOOL_ITERATIONS
-                    );
-                }
-            }
-        }
-
-        // El scratchpad vacío significa "ninguna herramienta usada" → None.
-        let tool_context: Option<String> = if scratchpad.is_empty() {
-            None
-        } else {
-            Some(scratchpad)
+        // ── 3. Recuperación semántica (único tramo con lock) ────────────
+        let cfg = RetrievalConfig {
+            min_edge_weight: prompts::MIN_CONTEXT_WEIGHT,
+            ..RetrievalConfig::default()
         };
+        let context = graph
+            .with_graph(|g| g.retrieve_context(&probes, probe_vecs.as_deref(), &cfg))
+            .map_err(|e| BridgeError::GraphTraversal(e.to_string()))?;
+        log::debug!(
+            "Contexto: {} semillas, {} aristas para {:?}",
+            context.seeds.len(), context.edges.len(), probes
+        );
 
-        // ── Paso 2: Identificar entidad principal ────────────────────
-        let entity_id = self
-            .backend
-            .complete(
-                prompts::entity_extraction_system_prompt(),
-                effective_question,
-                32, // Máximo 32 tokens: solo un identificador corto.
-                0.0, // Temperatura 0 = completamente determinístico.
-            )?
-            .trim()
-            .to_lowercase()
-            .replace(' ', "_");
-
-        log::debug!("Extracted entity: '{}'", entity_id);
-
-        // ── Paso 2: Recuperar vecinos del grafo ──────────────────────
-        // TraversalDirection::Both nos da tanto causas como efectos,
-        // que es el contexto más rico para razonar sobre la pregunta.
-        // NodeNotFound es esperado cuando la entidad aún no está en el grafo:
-        // en ese caso usamos un vecindario vacío (respuesta sin contexto local).
-        let neighborhood = graph.with_graph(|graph| {
-            match graph.get_neighbors(&entity_id, TraversalDirection::Both) {
-                Ok(n) => Ok(n),
-                Err(MemoryError::NodeNotFound(_)) => {
-                    // Entidad desconocida → intentamos búsqueda semántica (Paso 12)
-                    // para encontrar conceptos relacionados en el grafo.
-                    log::debug!("Entidad '{}' no encontrada; intentando semantic_search", entity_id);
-                    let semantic_hits = graph.semantic_search(&entity_id, 5).unwrap_or_default();
-                    if semantic_hits.is_empty() {
-                        // Sin resultados semánticos → contexto completamente vacío.
-                        Ok(crate::types::Neighborhood {
-                            root:      crate::types::Node::new(&entity_id, "concept", &entity_id),
-                            neighbors: vec![],
-                        })
-                    } else {
-                        // Construimos un vecindario sintético desde los resultados semánticos.
-                        // El root es el nodo más cercano; los demás son sus "vecinos".
-                        let (root_node, _score) = semantic_hits.into_iter().next().unwrap();
-                        // Obtenemos el vecindario real del nodo más cercano.
-                        Ok(graph.get_neighbors(&root_node.id, TraversalDirection::Both)
-                            .unwrap_or(crate::types::Neighborhood {
-                                root:      root_node,
-                                neighbors: vec![],
-                            }))
-                    }
-                },
-                Err(e) => Err(BridgeError::GraphTraversal(e.to_string())),
-            }
-        })?;
-
-        // Convertimos Neighborhood a formato para el formateador de prompts.
-        let context_triples: Vec<(String, String, String, f64)> = neighborhood
-            .neighbors
+        // ── 4. Prompt de síntesis fundamentada ──────────────────────────
+        let triples: Vec<(String, String, String, f64)> = context.edges
             .iter()
-            .map(|(edge, node)| {
-                (
-                    edge.source_id.clone(),
-                    edge.relation.clone(),
-                    node.name.clone(),
-                    edge.weight,
-                )
-            })
+            .map(|e| (e.source.clone(), e.relation.clone(), e.target.clone(), e.weight))
             .collect();
-
-        let context = prompts::format_graph_context(&entity_id, &context_triples);
-        log::debug!("Graph context ({} neighbors):\n{}", context_triples.len(), context);
-
-        // ── Paso 3 (Paso 14): Síntesis de respuesta fundamentada ────────
-        // Si una herramienta fue ejecutada, anteponemos su resultado al
-        // contexto del grafo para enriquecer la respuesta del LLM.
-        let user_prompt = match tool_context {
-            Some(ref tool_result) => format!(
-                "Información en tiempo real:\n{tool_result}\n\nContexto del grafo:\n{context}\n\nPregunta: {effective_question}"
+        let graph_context = prompts::format_graph_context(&probes.join(", "), &triples);
+        let question = &plan.rewritten_query;
+        let user_prompt = match tool_output {
+            Some(tool_result) => format!(
+                "Información en tiempo real:\n{tool_result}\n\nContexto del grafo:\n{graph_context}\n\nPregunta: {question}"
             ),
-            None => format!(
-                "Contexto:\n{context}\n\nPregunta: {effective_question}"
-            ),
+            None => format!("Contexto:\n{graph_context}\n\nPregunta: {question}"),
         };
 
-        Ok(user_prompt)
+        Ok(PreparedAnswer {
+            user_prompt,
+            context_edge_ids: context.edges.into_iter().map(|e| e.edge_id).collect(),
+        })
     }
 
-    /// Consulta fundamentada en memoria devolviendo la respuesta completa en una sola llamada.
+    /// Ejecuta la herramienta del plan. Los errores se devuelven como texto
+    /// para la síntesis ("no pude consultar el inventario"), nunca como fallo.
+    fn run_tool(&self, call: &ToolCall) -> String {
+        let name = &call.name;
+        let Some(tool) = self.tool_registry.as_ref().and_then(|r| r.get(name)) else {
+            return format!("[Tool: {name}] Error: herramienta no registrada");
+        };
+        match tool.execute(call.params.clone()) {
+            Ok(output) => format!("[Tool: {name}] {output}"),
+            Err(e) => {
+                log::warn!("Herramienta '{name}' falló: {e}");
+                format!("[Tool: {name}] Error: {e}")
+            }
+        }
+    }
+
+    /// Inferencia final (sin streaming).
+    pub fn answer(&self, prepared: &PreparedAnswer) -> Result<String, BridgeError> {
+        self.backend.complete(
+            prompts::synthesis_system_prompt(),
+            &prepared.user_prompt,
+            MAX_SYNTHESIS_TOKENS,
+            SYNTHESIS_TEMPERATURE,
+        )
+    }
+
+    /// Inferencia final como stream de tokens (SSE).
+    pub fn answer_stream(&self, prepared: &PreparedAnswer) -> Result<BoxedTokenStream, BridgeError> {
+        self.backend.stream_synthesis(
+            prompts::synthesis_system_prompt(),
+            &prepared.user_prompt,
+            MAX_SYNTHESIS_TOKENS,
+            SYNTHESIS_TEMPERATURE,
+        )
+    }
+
+    /// **Consulta fundamentada completa** (sin streaming): planificador →
+    /// herramienta → contexto semántico → respuesta → refuerzo hebbiano.
+    /// Dos llamadas al LLM en total.
+    ///
+    /// Siempre responde como consulta aunque el plan diga "learn": el
+    /// enrutado aprender/consultar es cosa del endpoint `/chat`.
     pub fn query_with_memory<G: GraphAccess>(
         &self,
         graph:        &G,
         question:     &str,
         history_text: &str,
     ) -> Result<String, BridgeError> {
-        let user_prompt = self.prepare_synthesis_prompt(graph, question, history_text)?;
-        self.backend.complete(
-            prompts::synthesis_system_prompt(),
-            &user_prompt,
-            MAX_SYNTHESIS_TOKENS,
-            SYNTHESIS_TEMPERATURE,
-        )
-    }
-
-    /// Consulta fundamentada en memoria devolviendo un stream asÃ­ncrono de tokens para Server-Sent Events.
-    pub fn query_with_memory_stream<G: GraphAccess>(
-        &self,
-        graph:        &G,
-        question:     &str,
-        history_text: &str,
-    ) -> Result<BoxedTokenStream, BridgeError> {
-        let user_prompt = self.prepare_synthesis_prompt(graph, question, history_text)?;
-        self.backend.stream_synthesis(
-            prompts::synthesis_system_prompt(),
-            &user_prompt,
-            MAX_SYNTHESIS_TOKENS,
-            SYNTHESIS_TEMPERATURE,
-        )
+        let plan = self.plan(question, history_text);
+        let prepared = self.prepare_answer(graph, &plan)?;
+        let answer = self.answer(&prepared)?;
+        reinforce_context(graph, &prepared.context_edge_ids);
+        Ok(answer)
     }
 
     // ──────────────────────────────────────────────────────────
@@ -823,22 +749,26 @@ impl<B: LlmBackend> NeuralBridge<B> {
     // ──────────────────────────────────────────────────────────
 
     /// Persiste un vector de triples en el grafo de memoria.
+    /// `vectors` (nombre de nodo → embedding) se calculó fuera del lock.
     /// Retorna (nodos_creados, aristas_creadas).
     fn write_triples_to_graph(
         &self,
         graph:   &MemoryGraph,
         triples: &[ExtractedTriple],
+        vectors: &HashMap<String, Vec<f32>>,
     ) -> Result<(usize, usize), BridgeError> {
         let mut nodes_created = 0usize;
         let mut edges_created = 0usize;
+        let concept = |id: &str| {
+            let name = node_name(id);
+            let mut node = Node::new(id, "concept", &name);
+            node.embedding = vectors.get(&name).cloned();
+            node
+        };
 
         for triple in triples {
             // Asegurar que subject existe como nodo.
-            let subject_node = Node::new(
-                &triple.subject,
-                "concept",
-                &triple.subject.replace('_', " "),
-            );
+            let subject_node = concept(&triple.subject);
             match graph.insert_node(&subject_node) {
                 Ok(_) => nodes_created += 1,
                 Err(MemoryError::DuplicateNode(_)) => {} // Ya existe, OK.
@@ -846,11 +776,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             }
 
             // Asegurar que object existe como nodo.
-            let object_node = Node::new(
-                &triple.object,
-                "concept",
-                &triple.object.replace('_', " "),
-            );
+            let object_node = concept(&triple.object);
             match graph.insert_node(&object_node) {
                 Ok(_) => nodes_created += 1,
                 Err(MemoryError::DuplicateNode(_)) => {}
@@ -939,6 +865,13 @@ fn parse_json_response<T: for<'de> Deserialize<'de>>(
     serde_json::from_str::<T>(raw)
 }
 
+/// Nombre legible de un nodo a partir de su id snake_case. Es el texto que
+/// se vectoriza, así que debe coincidir entre quien precalcula el embedding
+/// y quien inserta el nodo.
+pub fn node_name(id: &str) -> String {
+    id.replace('_', " ")
+}
+
 /// Valida que una triple extraída sea semánticamente coherente.
 fn validate_triple(triple: &ExtractedTriple) -> bool {
     !triple.subject.is_empty()
@@ -953,54 +886,149 @@ fn validate_triple(triple: &ExtractedTriple) -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────
-//  Paso 14: Parseo de decisión de herramientas (ReAct)
+//  Paso 22: Interpretación tolerante del plan
 // ──────────────────────────────────────────────────────────────
 
-/// Resultado del parseo de la decisión de herramienta del LLM.
-#[derive(Debug)]
-struct ToolDecision {
-    /// Nombre de la herramienta a invocar, o "none" para responder directo.
-    tool: String,
-    /// Parámetros JSON para pasar a `Tool::execute`. Vacío si `tool == "none"`.
-    params: serde_json::Value,
-}
+/// Interpreta la salida del planificador sin fallar nunca.
+///
+/// Acepta las claves cortas del esquema (`i`, `q`, `e`, `t`, `p`) y las
+/// largas (`intent`, `rewritten_query`, `entities`, `tool`, `tool_params`):
+/// backends sin structured outputs o modelos que ignoren los ejemplos pueden
+/// producir cualquiera de las dos.
+///
+/// Tolera lo que un modelo de 2B hace en la práctica: texto o ``` alrededor
+/// del JSON, campos ausentes o con otro tipo, mayúsculas, `"params"` en vez de
+/// `"tool_params"`, entidades como cadena, herramientas inventadas. Cualquier
+/// campo irrecuperable toma su valor seguro; si no hay ningún objeto JSON,
+/// se devuelve `Plan::fallback`.
+fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan {
+    use serde_json::Value;
 
-/// Parsea el JSON de decisión de herramienta producido por el LLM.
-///
-/// Formato esperado:
-/// ```json
-/// {"tool": "TimeTool", "params": {}}
-/// {"tool": "none"}
-/// ```
-///
-/// Si el JSON es inválido o el campo `tool` falta, retorna `None`
-/// (el ciclo ReAct tratará esto como "none" y continuará sin herramienta).
-fn parse_tool_decision(raw: &str) -> Option<ToolDecision> {
-    // Reutilizamos parse_json_response para extraer el bloque JSON.
-    let value: serde_json::Value = {
-        // Intento directo.
-        if let Ok(v) = serde_json::from_str(raw) {
-            v
-        } else if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) {
-            if start <= end {
-                if let Ok(v) = serde_json::from_str(&raw[start..=end]) {
-                    v
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        }
+    let Ok(Value::Object(obj)) = parse_json_response::<Value>(raw) else {
+        log::warn!("Plan no interpretable; se usa el plan por defecto. Salida: {raw}");
+        return Plan::fallback(message);
+    };
+    let field = |short: &str, long: &str| obj.get(short).or_else(|| obj.get(long));
+    let text = |short: &str, long: &str| {
+        field(short, long).and_then(Value::as_str).map(str::trim).unwrap_or("")
     };
 
-    let tool = value["tool"].as_str()?.to_string();
-    // `params` es opcional; si no existe usamos un objeto vacío.
-    let params = value.get("params").cloned().unwrap_or(serde_json::json!({}));
+    // Asimetría de riesgo: un falso "learn" escribe en la memoria a largo
+    // plazo; un falso "query" solo responde. Preguntas y peticiones nunca
+    // se memorizan, diga lo que diga el modelo.
+    let intent = if text("i", "intent").eq_ignore_ascii_case("learn") && !is_question_or_request(message) {
+        Intent::Learn
+    } else {
+        Intent::Query
+    };
 
-    Some(ToolDecision { tool, params })
+    // Una reescritura vacía o desbocada (el modelo "responde" en lugar de
+    // reescribir) no es fiable: mejor el mensaje original.
+    let rewritten = text("q", "rewritten_query");
+    let max_len = message.chars().count() * 3 + 200;
+    let rewritten_query = if rewritten.is_empty() || rewritten.chars().count() > max_len {
+        message.to_string()
+    } else {
+        rewritten.to_string()
+    };
+
+    let raw_entities: Vec<&str> = match field("e", "entities") {
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+        Some(Value::String(s)) => s.split(',').collect(),
+        _ => Vec::new(),
+    };
+    let mut entities: Vec<String> = Vec::new();
+    for entity in raw_entities.into_iter().map(str::trim) {
+        let duplicate = entities.iter().any(|e| e.eq_ignore_ascii_case(entity));
+        if !entity.is_empty() && entity.chars().count() <= MAX_ENTITY_CHARS && !duplicate {
+            entities.push(entity.to_string());
+        }
+        if entities.len() == MAX_PLAN_ENTITIES {
+            break;
+        }
+    }
+
+    let tool = match text("t", "tool") {
+        "" => None,
+        t if ["none", "ninguna", "null"].iter().any(|n| t.eq_ignore_ascii_case(n)) => None,
+        t => match registry.and_then(|r| r.resolve(t)) {
+            Some(name) => {
+                let params = field("p", "tool_params").or_else(|| obj.get("params"))
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                Some(ToolCall { name, params })
+            }
+            None => {
+                log::warn!("El planificador pidió la herramienta desconocida '{t}'; se ignora");
+                None
+            }
+        },
+    };
+
+    Plan { intent, rewritten_query, entities, tool, fallback: false }
+}
+
+/// Imperativos de petición que abren un mensaje, sin tildes ("explícame" →
+/// "explicame"). Se omiten los que también son sustantivos o abren
+/// afirmaciones ("lista", "muestra", "cuenta", "list").
+const REQUEST_VERBS: &[&str] = &[
+    "explica", "explicame", "explicanos", "hablame", "hablanos", "dime", "dinos",
+    "cuentame", "cuentanos", "describe", "describeme", "resume", "resumeme", "define",
+    "compara", "busca", "buscame", "muestrame", "enumera", "dame", "ayudame", "analiza",
+    "calcula", "traduce", "puedes", "podrias",
+    "explain", "tell", "summarize", "compare", "give", "help",
+];
+
+/// Interrogativos que abren una pregunta sin signos. En español solo con
+/// tilde: "como" o "cuando" también abren afirmaciones ("Como el titanio
+/// es ligero, …"). En inglés, solo los que no abren subordinadas.
+const INTERROGATIVES: &[&str] = &[
+    "qué", "cómo", "cuál", "cuáles", "cuándo", "dónde", "quién", "quiénes",
+    "cuánto", "cuánta", "cuántos", "cuántas", "what", "how", "why",
+];
+
+/// Conectores que pueden preceder a la pregunta ("Y cómo afecta al sueño").
+const LEADING_CONNECTORS: &[&str] = &["y", "e", "o", "pero", "entonces", "and", "but", "so"];
+
+/// ¿Es el mensaje una pregunta o una petición? (Paso 22)
+///
+/// Red de seguridad del planificador: con la salida restringida al esquema,
+/// un modelo de 2B etiqueta como "learn" peticiones como "Háblame del
+/// titanio", y la extracción inventa tripletas a partir de ellas.
+fn is_question_or_request(message: &str) -> bool {
+    if message.contains('?') || message.contains('¿') {
+        return true;
+    }
+    let lower = message.to_lowercase();
+    let mut words = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .skip_while(|w| LEADING_CONNECTORS.contains(w));
+    let Some(first) = words.next() else { return false };
+    if first == "por" {
+        return words.next() == Some("qué");
+    }
+    INTERROGATIVES.contains(&first) || REQUEST_VERBS.contains(&canonical_id(first).as_str())
+}
+
+/// Refuerzo hebbiano del contexto usado en una respuesta completada (Paso 22).
+///
+/// "Neuronas que se disparan juntas, se conectan más fuerte": cada arista
+/// que fundamentó la respuesta sube `HEBBIAN_DELTA` y reinicia su curva del
+/// olvido. Best-effort: un fallo aquí no invalida una respuesta ya
+/// entregada. Devuelve cuántas aristas se reforzaron.
+pub fn reinforce_context<G: GraphAccess>(graph: &G, edge_ids: &[String]) -> usize {
+    if edge_ids.is_empty() {
+        return 0;
+    }
+    match graph.with_graph(|g| g.reinforce_edges(edge_ids, HEBBIAN_DELTA)) {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("Refuerzo hebbiano fallido: {e}");
+            0
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1088,6 +1116,17 @@ impl LlmBackend for std::sync::Arc<dyn LlmBackend + Send + Sync + 'static> {
         (**self).complete(system_prompt, user_prompt, max_tokens, temperature)
     }
 
+    fn complete_json(
+        &self,
+        system_prompt: &str,
+        user_prompt:   &str,
+        schema:        &serde_json::Value,
+        max_tokens:    i32,
+        temperature:   f32,
+    ) -> Result<String, BridgeError> {
+        (**self).complete_json(system_prompt, user_prompt, schema, max_tokens, temperature)
+    }
+
     fn stream_synthesis(
         &self,
         system_prompt: &str,
@@ -1112,6 +1151,8 @@ pub mod mock {
     pub struct MockLlmBackend {
         responses: Arc<Mutex<Vec<String>>>,
         call_count: Arc<Mutex<u32>>,
+        /// Prompts de usuario recibidos, en orden (para inspeccionar el contexto).
+        user_prompts: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockLlmBackend {
@@ -1121,11 +1162,17 @@ pub mod mock {
                     responses.into_iter().map(|s| s.into()).collect(),
                 )),
                 call_count: Arc::new(Mutex::new(0)),
+                user_prompts: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         pub fn call_count(&self) -> u32 {
             *self.call_count.lock().unwrap()
+        }
+
+        /// Prompts de usuario recibidos hasta ahora, en orden.
+        pub fn user_prompts(&self) -> Vec<String> {
+            self.user_prompts.lock().unwrap().clone()
         }
     }
 
@@ -1133,10 +1180,11 @@ pub mod mock {
         fn complete(
             &self,
             _system_prompt: &str,
-            _user_prompt:   &str,
+            user_prompt:    &str,
             _max_tokens:    i32,
             _temperature:   f32,
         ) -> Result<String, BridgeError> {
+            self.user_prompts.lock().unwrap().push(user_prompt.to_string());
             let mut count = self.call_count.lock().unwrap();
             *count += 1;
 
@@ -1346,105 +1394,6 @@ Espero que sea útil."#;
         assert_eq!(result.triples[0].subject, "valida");
     }
 
-    // ── Query with Memory ─────────────────────────────────────
-
-    #[test]
-    fn test_query_with_memory_full_flow() {
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        // Seed del grafo (sin pasar por LLM en este test).
-        use crate::types::Node;
-        graph.insert_node(&Node::new("cortisol", "concept", "Cortisol")).unwrap();
-        graph.insert_node(&Node::new("memoria",  "concept", "Memoria")).unwrap();
-        graph.insert_edge("cortisol", "reduce", "memoria", 0.85).unwrap();
-
-        // Mock: primera llamada = entity extraction → "cortisol"
-        //       segunda llamada = synthesis → respuesta final
-        // (sin historial → no hay llamada de correferencia)
-        let mock = MockLlmBackend::new(vec![
-            "cortisol".to_string(),
-            "El cortisol reduce la memoria al dañar el hipocampo.".to_string(),
-        ]);
-
-        let bridge  = NeuralBridge::new(mock);
-        let answer  = bridge
-            .query_with_memory(&graph, "¿Qué efecto tiene el cortisol?", "")
-            .expect("Query should succeed");
-
-        assert!(!answer.is_empty());
-        assert_eq!(bridge.backend.call_count(), 2);
-    }
-
-    #[test]
-    fn test_query_with_memory_unknown_entity() {
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        // El LLM identifica "oxitocina" pero no está en el grafo.
-        // Comportamiento esperado (v0.7+): NodeNotFound se absorbe → vecindario vacío
-        // → la síntesis responde sin contexto local, sin propagar error.
-        let mock = MockLlmBackend::new(vec![
-            "oxitocina".to_string(),
-            "respuesta síntesis".to_string(),
-        ]);
-
-        let bridge = NeuralBridge::new(mock);
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué hace la oxitocina?", "")
-            .expect("Entidad desconocida no debe producir error; responde sin contexto");
-
-        // La síntesis devuelve la segunda respuesta del mock.
-        assert!(!answer.is_empty());
-        assert_eq!(bridge.backend.call_count(), 2);
-    }
-
-    // ── Correferencia con historial ───────────────────────────
-
-    #[test]
-    fn test_query_with_memory_uses_coreference_when_history_present() {
-        let graph = MemoryGraph::open(":memory:").unwrap();
-        use crate::types::Node;
-        graph.insert_node(&Node::new("fenix_flow", "concept", "Fénix Flow")).unwrap();
-        graph.insert_node(&Node::new("rust", "concept", "Rust")).unwrap();
-        graph.insert_edge("fenix_flow", "escrito_en", "rust", 0.9).unwrap();
-
-        // Con historial: 3 llamadas LLM esperadas:
-        //   1. correferencia  → pregunta reescrita
-        //   2. entity extract → "fenix_flow"
-        //   3. synthesis      → respuesta final
-        let mock = MockLlmBackend::new(vec![
-            "¿En qué lenguaje está hecho Fénix Flow?".to_string(),
-            "fenix_flow".to_string(),
-            "Fénix Flow está escrito en Rust.".to_string(),
-        ]);
-
-        let history = "User: ¿Qué es Fénix Flow?\nAssistant: Es un software de facturación.";
-        let bridge  = NeuralBridge::new(mock);
-        let answer  = bridge
-            .query_with_memory(&graph, "¿En qué lenguaje está hecho?", history)
-            .expect("Debe resolver correferencia y responder");
-
-        assert!(!answer.is_empty());
-        assert_eq!(bridge.backend.call_count(), 3);
-    }
-
-    #[test]
-    fn test_query_with_memory_skips_coreference_when_no_history() {
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        // Sin historial: 2 llamadas (entity + synthesis, SIN correferencia).
-        let mock = MockLlmBackend::new(vec![
-            "rust".to_string(),
-            "Rust es un lenguaje de sistemas.".to_string(),
-        ]);
-
-        let bridge = NeuralBridge::new(mock);
-        let _answer = bridge
-            .query_with_memory(&graph, "¿Qué es Rust?", "")
-            .expect("Sin historial debe funcionar igual");
-
-        assert_eq!(bridge.backend.call_count(), 2, "Sin historial: solo 2 llamadas LLM");
-    }
-
     // ── Extracción JSON con peso default ──────────────────────
 
     #[test]
@@ -1486,348 +1435,312 @@ Espero que sea útil."#;
         assert_eq!(result2.edges_created, 0);
     }
 
-    // ── Paso 14: ReAct / Tool Use ──────────────────────────────
+    // ── Paso 22: helpers de test ───────────────────────────────
+
+    use crate::memory_graph::MockEmbeddingBackend;
+    use crate::tools::{TimeTool, ToolRegistry};
+    use crate::types::Node;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn plan_json(intent: &str, rewritten: &str, entities: &[&str], tool: &str) -> String {
+        serde_json::json!({ "i": intent, "q": rewritten, "e": entities, "t": tool, "p": {} }).to_string()
+    }
+
+    fn time_registry() -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::new();
+        registry.register(TimeTool);
+        Arc::new(registry)
+    }
+
+    /// Grafo con cortisol --reduce--> memoria (w=0.85) y una arista ajena.
+    fn cortisol_graph() -> MemoryGraph {
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        for (id, name) in [("cortisol", "Cortisol"), ("memoria", "Memoria"), ("rust", "Rust"), ("wasm", "WebAssembly")] {
+            graph.insert_node(&Node::new(id, "concept", name)).unwrap();
+        }
+        graph.insert_edge("cortisol", "reduce", "memoria", 0.85).unwrap();
+        graph.insert_edge("rust", "compila_a", "wasm", 0.9).unwrap();
+        graph
+    }
+
+    fn edge_weight(graph: &MemoryGraph, source: &str, target: &str) -> f64 {
+        graph.get_neighbors(source, crate::memory_graph::TraversalDirection::Outgoing)
+            .unwrap()
+            .neighbors
+            .into_iter()
+            .find(|(_, n)| n.id == target)
+            .map(|(e, _)| e.weight)
+            .unwrap()
+    }
+
+    /// Backend que devuelve el plan en la 1.ª llamada y falla en las demás.
+    struct PlanThenFail {
+        plan:  String,
+        calls: AtomicUsize,
+    }
+
+    impl LlmBackend for PlanThenFail {
+        fn complete(&self, _: &str, _: &str, _: i32, _: f32) -> Result<String, BridgeError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(self.plan.clone()),
+                _ => Err(BridgeError::OllamaHttp("Ollama caído".into())),
+            }
+        }
+    }
+
+    // ── Paso 22: interpretación tolerante del plan ─────────────
 
     #[test]
-    fn test_query_skips_tools_when_no_registry() {
-        // Sin tool_registry → comportamiento idéntico al Paso 13.
-        // Solo 2 llamadas LLM: entity + synthesis.
-        let graph = MemoryGraph::open(":memory:").unwrap();
+    fn test_parse_plan_happy_path() {
+        let raw = plan_json("query", "¿Qué es Rust?", &["rust", "lenguaje"], "none");
+        let plan = parse_plan(&raw, "¿Qué es Rust?", None);
+        assert_eq!(plan.intent, Intent::Query);
+        assert_eq!(plan.rewritten_query, "¿Qué es Rust?");
+        assert_eq!(plan.entities, ["rust", "lenguaje"]);
+        assert_eq!(plan.tool, None);
+        assert!(!plan.fallback);
+    }
 
+    #[test]
+    fn test_parse_plan_accepts_long_keys() {
+        let registry = time_registry();
+        let raw = r#"{"intent":"learn","rewritten_query":"La sucursal abre a las 9.","entities":["sucursal"],
+                     "tool":"TimeTool","tool_params":{"tz":"UTC"}}"#;
+        let plan = parse_plan(raw, "Abre a las 9.", Some(&registry));
+        assert_eq!(plan.intent, Intent::Learn);
+        assert_eq!(plan.rewritten_query, "La sucursal abre a las 9.");
+        assert_eq!(plan.entities, ["sucursal"]);
+        assert_eq!(plan.tool, Some(ToolCall { name: "TimeTool".into(), params: serde_json::json!({"tz": "UTC"}) }));
+    }
+
+    #[test]
+    fn test_parse_plan_extracts_json_from_preamble_and_fences() {
+        let raw = format!("Claro, aquí está:\n```json\n{}\n```", plan_json("query", "¿Qué es Rust?", &["rust"], "none"));
+        let plan = parse_plan(&raw, "¿Qué es Rust?", None);
+        assert!(!plan.fallback);
+        assert_eq!(plan.entities, ["rust"]);
+    }
+
+    #[test]
+    fn test_parse_plan_malformed_json_falls_back_safely() {
+        let msg = "¿Qué es Rust?";
+        for raw in ["", "esto no es json", r#"{"intent": "query", "#, "[1, 2, 3]", r#""solo texto""#] {
+            let plan = parse_plan(raw, msg, None);
+            assert_eq!(plan, Plan::fallback(msg), "salida: {raw:?}");
+            assert!(plan.fallback);
+            assert_eq!(plan.intent, Intent::Query, "el fallback nunca escribe en memoria");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_tolerates_missing_and_mistyped_fields() {
+        let raw = r#"{"intent": 42, "entities": "rust, ownership , Rust,", "tool": null}"#;
+        let plan = parse_plan(raw, "Háblame de Rust", None);
+        assert_eq!(plan.intent, Intent::Query);
+        assert_eq!(plan.rewritten_query, "Háblame de Rust");
+        assert_eq!(plan.entities, ["rust", "ownership"], "deduplicadas sin distinguir mayúsculas");
+        assert_eq!(plan.tool, None);
+        assert!(!plan.fallback);
+    }
+
+    #[test]
+    fn test_parse_plan_never_learns_from_questions_or_requests() {
+        let raw = plan_json("LEARN", "", &["rust"], "none");
+        for msg in ["¿Rust es seguro?", "Rust es seguro? no lo sé", "Háblame del titanio",
+                    "Explicame qué es SynaptoCore", "¡Dime la capital de Francia!", "Cómo se compila Rust",
+                    "Y cómo afecta al sueño", "Por qué Rust no tiene GC", "Tell me about Rust"] {
+            assert_eq!(parse_plan(&raw, msg, None).intent, Intent::Query, "{msg}");
+        }
+        for msg in ["Rust es seguro.", "Memoriza que la sucursal abre a las 9",
+                    "Como el titanio es ligero, se usa en implantes", "Por eso Rust no tiene GC",
+                    "Muestra 5 tiene pH 7"] {
+            assert_eq!(parse_plan(&raw, msg, None).intent, Intent::Learn, "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_resolves_tools_and_drops_unknown_ones() {
+        let registry = time_registry();
+        let raw = r#"{"intent":"query","rewritten_query":"¿Hora?","entities":[],"tool":"timetool","params":{"tz":"UTC"}}"#;
+        let plan = parse_plan(raw, "¿Hora?", Some(&registry));
+        assert_eq!(plan.tool, Some(ToolCall { name: "TimeTool".into(), params: serde_json::json!({"tz": "UTC"}) }));
+
+        let invented = plan_json("query", "¿Stock?", &[], "InventarioMagico");
+        assert_eq!(parse_plan(&invented, "¿Stock?", Some(&registry)).tool, None);
+        assert_eq!(parse_plan(&plan_json("query", "x", &[], "TimeTool"), "x", None).tool, None,
+            "sin registro no se ejecuta ninguna herramienta");
+    }
+
+    #[test]
+    fn test_parse_plan_caps_entities_and_runaway_rewrites() {
+        let long_entity = "x".repeat(MAX_ENTITY_CHARS + 1);
+        let entities = ["a", "b", long_entity.as_str(), "c", "d", "e"];
+        let runaway = "palabra ".repeat(200);
+        let plan = parse_plan(&plan_json("query", &runaway, &entities, "none"), "¿Qué es Rust?", None);
+        assert_eq!(plan.entities, ["a", "b", "c", "d"]);
+        assert_eq!(plan.rewritten_query, "¿Qué es Rust?");
+    }
+
+    #[test]
+    fn test_plan_falls_back_when_llm_is_down() {
+        let bridge = NeuralBridge::new(PlanThenFail { plan: String::new(), calls: AtomicUsize::new(1) });
+        let plan = bridge.plan("¿Qué es Rust?", "");
+        assert!(plan.fallback);
+        assert_eq!(plan.rewritten_query, "¿Qué es Rust?");
+    }
+
+    #[test]
+    fn test_planner_sees_history_for_coreference() {
         let mock = MockLlmBackend::new(vec![
-            "synaptocore".to_string(),
-            "SynaptoCore es una IA neurosimbólica.".to_string(),
+            plan_json("query", "¿En qué lenguaje está hecho Fénix Flow?", &["fénix flow"], "none"),
         ]);
-
         let bridge = NeuralBridge::new(mock);
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué es SynaptoCore?", "")
-            .expect("Sin registry debe funcionar igual que Paso 13");
-
-        assert!(!answer.is_empty());
-        // Sin tool_registry: exactamente 2 llamadas LLM.
-        assert_eq!(bridge.backend.call_count(), 2, "Sin registry: 2 llamadas (entity + synthesis)");
+        let plan = bridge.plan("¿En qué lenguaje está hecho?", "User: ¿Qué es Fénix Flow?\nAssistant: Un ERP.");
+        assert_eq!(plan.rewritten_query, "¿En qué lenguaje está hecho Fénix Flow?");
+        assert!(bridge.backend.user_prompts()[0].contains("Fénix Flow"));
+        assert_eq!(bridge.backend.call_count(), 1);
     }
 
+    // ── Paso 22: pipeline de consulta en dos llamadas ──────────
+
     #[test]
-    fn test_query_uses_tool_when_llm_requests_it() {
-        // Paso 15: con bucle ReAct.
-        //   Iter 1: tool_decision → pide TimeTool → ejecuta → scratchpad acumula.
-        //   Iter 2: tool_decision (con scratchpad) → "none" → rompe bucle.
-        //   Entity extraction → synthesis.
-        // Total: 4 llamadas LLM (2×tool_decision + entity + synthesis).
-        use crate::tools::{TimeTool, ToolRegistry};
-        use std::sync::Arc;
-
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
+    fn test_query_uses_exactly_two_llm_calls() {
+        let graph = cortisol_graph();
         let mock = MockLlmBackend::new(vec![
-            // iter 1: pide TimeTool
-            r#"{"tool": "TimeTool", "params": {}}"#.to_string(),
-            // iter 2: con scratchpad → "none"
-            r#"{"tool": "none"}"#.to_string(),
-            // entity extraction
-            "synaptocore".to_string(),
-            // synthesis (recibe scratchpad con resultado de TimeTool)
-            "Ahora mismo son las 12:00. SynaptoCore es una IA.".to_string(),
+            plan_json("query", "¿Qué efecto tiene el cortisol?", &["cortisol"], "none"),
+            "El cortisol reduce la memoria.".to_string(),
         ]);
+        let bridge = NeuralBridge::new(mock).with_tools(time_registry());
 
-        let mut registry = ToolRegistry::new();
-        registry.register(TimeTool);
+        let answer = bridge.query_with_memory(&graph, "¿Qué efecto tiene el cortisol?", "").unwrap();
 
-        let bridge = NeuralBridge::new(mock).with_tools(Arc::new(registry));
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué hora es?", "")
-            .expect("Con TimeTool debe responder");
-
-        assert!(!answer.is_empty());
-        // Bucle ReAct: 2×tool_decision + entity + synthesis = 4 llamadas.
-        assert_eq!(bridge.backend.call_count(), 4);
+        assert_eq!(answer, "El cortisol reduce la memoria.");
+        assert_eq!(bridge.backend.call_count(), 2, "planificador + síntesis");
+        let synthesis = &bridge.backend.user_prompts()[1];
+        assert!(synthesis.contains("Cortisol reduce Memoria"), "contexto del grafo: {synthesis}");
+        assert!(!synthesis.contains("compila_a"), "las aristas ajenas no entran");
     }
 
     #[test]
-    fn test_query_skips_tools_when_llm_decides_none() {
-        // El LLM decide NO usar herramienta → sigue flujo normal.
-        use crate::tools::{TimeTool, ToolRegistry};
-        use std::sync::Arc;
-
+    fn test_query_with_history_is_still_two_calls() {
         let graph = MemoryGraph::open(":memory:").unwrap();
-
-        let mock = MockLlmBackend::new(vec![
-            // 1. tool_decision → ninguna herramienta
-            r#"{"tool": "none"}"#.to_string(),
-            // 2. entity extraction
-            "rust".to_string(),
-            // 3. synthesis
-            "Rust es un lenguaje de sistemas.".to_string(),
-        ]);
-
-        let mut registry = ToolRegistry::new();
-        registry.register(TimeTool);
-
-        let bridge = NeuralBridge::new(mock).with_tools(Arc::new(registry));
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué es Rust?", "")
-            .expect("Decisión 'none' debe funcionar correctamente");
-
-        assert!(!answer.is_empty());
-        assert_eq!(bridge.backend.call_count(), 3);
-    }
-
-    #[test]
-    fn test_query_falls_back_when_tool_unknown() {
-        // El LLM pide una herramienta que no existe → inyecta error en contexto,
-        // continúa con síntesis sin hacer crash.
-        use crate::tools::ToolRegistry;
-        use std::sync::Arc;
-
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        // Registry vacío → is_empty() → el bloque ReAct se salta completamente.
-        let registry_empty = ToolRegistry::new();
-
-        // Nota: para probar el "tool not found" necesitamos al menos una herramienta
-        // en el registry. Usamos TimeTool pero el LLM pide una diferente.
-        use crate::tools::TimeTool;
-        let mut registry_with_time = ToolRegistry::new();
-        registry_with_time.register(TimeTool);
-
-        let mock2 = MockLlmBackend::new(vec![
-            // iter 1: herramienta inexistente → error en scratchpad, bucle continúa
-            r#"{"tool": "HerramientaInventada", "params": {}}"#.to_string(),
-            // iter 2: con scratchpad de error → "none" → break
-            r#"{\"tool\": \"none\"}"#.to_string(),
-            // entity extraction
-            "synaptocore".to_string(),
-            // synthesis (recibe scratchpad con el error de herramienta desconocida)
-            "No pude usar esa herramienta, pero aquí mi respuesta.".to_string(),
-        ]);
-
-        let bridge = NeuralBridge::new(mock2).with_tools(Arc::new(registry_with_time));
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué hace HerramientaInventada?", "")
-            .expect("Herramienta desconocida no debe hacer crash");
-
-        // La síntesis debe completarse igualmente.
-        assert!(!answer.is_empty());
-                // 2×tool_decision + entity + synthesis = 4 llamadas.
-        assert_eq!(bridge.backend.call_count(), 4);
-
-        // Registry vacío → is_empty() → ReAct se salta → solo 2 llamadas LLM.
-        let mock3 = MockLlmBackend::new(vec![
-            "synaptocore".to_string(),
-            "Respuesta directa.".to_string(),
-        ]);
-        let bridge3 = NeuralBridge::new(mock3).with_tools(Arc::new(registry_empty));
-        let _ = bridge3
-            .query_with_memory(&graph, "¿Qué es SynaptoCore?", "")
-            .expect("Registry vacío salta ReAct → 2 llamadas");
-        assert_eq!(bridge3.backend.call_count(), 2);
-    }
-
-    #[test]
-    fn test_query_handles_invalid_tool_json_gracefully() {
-        // El LLM produce JSON inválido en la decisión → se trata como "none".
-        use crate::tools::{TimeTool, ToolRegistry};
-        use std::sync::Arc;
-
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        let mock = MockLlmBackend::new(vec![
-            // 1. tool_decision → JSON inválido (LLM alucinó)
-            "esto no es json válido!!!".to_string(),
-            // 2. entity extraction (continúa sin herramienta)
-            "rust".to_string(),
-            // 3. synthesis
-            "Rust es un lenguaje de sistemas.".to_string(),
-        ]);
-
-        let mut registry = ToolRegistry::new();
-        registry.register(TimeTool);
-
-        let bridge = NeuralBridge::new(mock).with_tools(Arc::new(registry));
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué es Rust?", "")
-            .expect("JSON inválido en tool_decision no debe hacer crash");
-
-        assert!(!answer.is_empty());
-        // JSON inválido → parse_tool_decision retorna None → trata como "none".
-        // Igualmente consume 3 llamadas (tool_decision + entity + synthesis).
-        assert_eq!(bridge.backend.call_count(), 3);
-    }
-
-    #[test]
-    fn test_parse_tool_decision_valid_json() {
-        // Verificamos el helper de parsing directamente.
-        let raw = r#"{"tool": "TimeTool", "params": {"foo": "bar"}}"#;
-        let decision = parse_tool_decision(raw).expect("Debe parsear correctamente");
-        assert_eq!(decision.tool, "TimeTool");
-        assert_eq!(decision.params["foo"], "bar");
-    }
-
-    #[test]
-    fn test_parse_tool_decision_none_variant() {
-        let raw = r#"{"tool": "none"}"#;
-        let decision = parse_tool_decision(raw).expect("Debe parsear 'none'");
-        assert_eq!(decision.tool, "none");
-    }
-
-    #[test]
-    fn test_parse_tool_decision_with_surrounding_text() {
-        // El LLM puede añadir texto alrededor del JSON.
-        let raw = "Aquí está mi decisión: {\"tool\": \"TimeTool\", \"params\": {}} — fin.";
-        let decision = parse_tool_decision(raw).expect("Debe extraer JSON del texto");
-        assert_eq!(decision.tool, "TimeTool");
-    }
-
-    #[test]
-    fn test_parse_tool_decision_invalid_returns_none() {
-        assert!(parse_tool_decision("no json aquí").is_none());
-        assert!(parse_tool_decision("").is_none());
-        assert!(parse_tool_decision("{\"otro_campo\": 42}").is_none());
-    }
-    // ── Paso 15: Tests del bucle ReAct multi-paso ─────────────
-
-    #[test]
-    fn test_query_chains_two_tools_in_sequence() {
-        // El LLM encadena dos herramientas antes de responder.
-        // Iter 1: TimeTool → resultado en scratchpad.
-        // Iter 2: WebhookTool (con scratchpad visible) → resultado añadido.
-        // Iter 3: "none" → break.
-        // Total: 3×tool_decision + entity + synthesis = 5 llamadas LLM.
-        use crate::tools::{TimeTool, ToolRegistry, WebhookTool};
-        use std::sync::Arc;
-
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        let mock = MockLlmBackend::new(vec![
-            // iter 1: pide TimeTool
-            r#"{"tool": "TimeTool", "params": {}}"#.to_string(),
-            // iter 2: pide WebhookTool (con scratchpad de TimeTool)
-            r#"{"tool": "WebhookTool", "params": {"url": "http://localhost:19999/noop"}}"#
-                .to_string(),
-            // iter 3: "none" → salir del bucle
-            r#"{"tool": "none"}"#.to_string(),
-            // entity extraction
-            "synaptocore".to_string(),
-            // synthesis
-            "Respuesta con datos de dos herramientas.".to_string(),
-        ]);
-
-        let mut registry = ToolRegistry::new();
-        registry.register(TimeTool);
-        registry.register(WebhookTool);
-
-        let bridge = NeuralBridge::new(mock).with_tools(Arc::new(registry));
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué hora es y qué dice el endpoint?", "")
-            .expect("Encadenamiento de dos herramientas debe funcionar");
-
-        assert!(!answer.is_empty());
-        // 3×tool_decision + entity + synthesis = 5.
-        assert_eq!(bridge.backend.call_count(), 5);
-    }
-
-    #[test]
-    fn test_react_loop_stops_at_max_iterations() {
-        // El LLM siempre pide TimeTool → el bucle se fuerza a parar
-        // después de MAX_TOOL_ITERATIONS (3) sin que el LLM diga "none".
-        // 3×tool_decision + entity + synthesis = 5 llamadas.
-        use crate::tools::{TimeTool, ToolRegistry};
-        use std::sync::Arc;
-
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        let mock = MockLlmBackend::new(vec![
-            // iter 1, 2, 3: siempre pide TimeTool (nunca "none")
-            r#"{"tool": "TimeTool", "params": {}}"#.to_string(),
-            r#"{"tool": "TimeTool", "params": {}}"#.to_string(),
-            r#"{"tool": "TimeTool", "params": {}}"#.to_string(),
-            // entity extraction (el bucle se forzó a terminar en iter 3)
-            "synaptocore".to_string(),
-            // synthesis con el scratchpad de 3 ejecuciones de TimeTool
-            "La hora es... (datos repetidos).".to_string(),
-        ]);
-
-        let mut registry = ToolRegistry::new();
-        registry.register(TimeTool);
-
-        let bridge = NeuralBridge::new(mock).with_tools(Arc::new(registry));
-        let answer = bridge
-            .query_with_memory(&graph, "¿Qué hora es? (LLM entra en bucle)", "")
-            .expect("El límite de iteraciones debe forzar la síntesis sin crash");
-
-        assert!(!answer.is_empty());
-        // Exactamente MAX_TOOL_ITERATIONS(3)×tool_decision + entity + synthesis = 5.
-        assert_eq!(
-            bridge.backend.call_count(),
-            5,
-            "MAX_TOOL_ITERATIONS=3 debe detener el bucle exactamente ahí"
-        );
-    }
-
-    #[test]
-    fn test_scratchpad_accumulates_multiple_results() {
-        // 2 herramientas ejecutadas → "none" → 3 tool_decision total.
-        // Verifica que el call_count es correcto para el scratchpad acumulado.
-        use crate::tools::{TimeTool, ToolRegistry};
-        use std::sync::Arc;
-
-        let graph = MemoryGraph::open(":memory:").unwrap();
-
-        let mock = MockLlmBackend::new(vec![
-            r#"{"tool": "TimeTool", "params": {}}"#.to_string(), // iter 1
-            r#"{"tool": "TimeTool", "params": {}}"#.to_string(), // iter 2
-            r#"{"tool": "none"}"#.to_string(),                    // iter 3 → break
-            "synaptocore".to_string(),                             // entity
-            "Respuesta con scratchpad de 2 entradas.".to_string(), // synthesis
-        ]);
-
-        let mut registry = ToolRegistry::new();
-        registry.register(TimeTool);
-
-        let bridge = NeuralBridge::new(mock).with_tools(Arc::new(registry));
-        let _ = bridge
-            .query_with_memory(&graph, "Pregunta con 2 herramientas", "")
-            .expect("2 herramientas + none debe funcionar");
-
-        // 3×tool_decision + entity + synthesis = 5 llamadas.
-        assert_eq!(bridge.backend.call_count(), 5);
-    }
-
-    #[test]
-    fn test_react_loop_with_history_coreference_plus_tools() {
-        // Correferencia (Paso 13) + bucle ReAct (Paso 15) coexisten.
-        // Con historial: 1×coref + 1×tool_decision(none) + entity + synthesis = 4.
-        use crate::tools::{TimeTool, ToolRegistry};
-        use crate::types::Node;
-        use std::sync::Arc;
-
-        let graph = MemoryGraph::open(":memory:").unwrap();
+        graph.insert_node(&Node::new("fenix_flow", "concept", "Fénix Flow")).unwrap();
         graph.insert_node(&Node::new("rust", "concept", "Rust")).unwrap();
+        graph.insert_edge("fenix_flow", "escrito_en", "rust", 0.9).unwrap();
 
         let mock = MockLlmBackend::new(vec![
-            // correferencia (hay historial)
-            "¿En qué lenguaje está hecho Rust?".to_string(),
-            // iter 1: tool_decision → "none" (la pregunta puede responderse del grafo)
-            r#"{"tool": "none"}"#.to_string(),
-            // entity extraction
-            "rust".to_string(),
-            // synthesis
-            "Rust es un lenguaje de sistemas de bajo nivel.".to_string(),
+            plan_json("query", "¿En qué lenguaje está hecho Fénix Flow?", &["fénix flow"], "none"),
+            "Fénix Flow está escrito en Rust.".to_string(),
         ]);
+        let bridge = NeuralBridge::new(mock);
+        let history = "User: ¿Qué es Fénix Flow?\nAssistant: Un ERP.";
+        bridge.query_with_memory(&graph, "¿En qué lenguaje está hecho?", history).unwrap();
 
-        let mut registry = ToolRegistry::new();
-        registry.register(TimeTool);
+        assert_eq!(bridge.backend.call_count(), 2, "la correferencia ya no cuesta una llamada");
+        let synthesis = &bridge.backend.user_prompts()[1];
+        assert!(synthesis.contains("Pregunta: ¿En qué lenguaje está hecho Fénix Flow?"));
+        assert!(synthesis.contains("escrito_en"), "'fénix flow' ancla en fenix_flow: {synthesis}");
+    }
 
-        let history = "User: ¿Qué es Rust?\nAssistant: Es un lenguaje de sistemas.";
-        let bridge  = NeuralBridge::new(mock).with_tools(Arc::new(registry));
-        let answer  = bridge
-            .query_with_memory(&graph, "¿En qué lenguaje está hecho?", history)
-            .expect("Coref + ReAct deben coexistir");
+    #[test]
+    fn test_query_runs_the_planned_tool_once() {
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué hora es?", &[], "TimeTool"),
+            "Son las 12:00.".to_string(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_tools(time_registry());
+        bridge.query_with_memory(&graph, "¿Qué hora es?", "").unwrap();
 
-        assert!(!answer.is_empty());
-        // coref + 1×tool_decision + entity + synthesis = 4.
-        assert_eq!(bridge.backend.call_count(), 4);
+        assert_eq!(bridge.backend.call_count(), 2, "la herramienta no consume llamadas al LLM");
+        assert!(bridge.backend.user_prompts()[1].contains("[Tool: TimeTool]"));
+    }
+
+    #[test]
+    fn test_query_survives_malformed_plan() {
+        let graph = cortisol_graph();
+        let mock = MockLlmBackend::new(vec!["{{ basura no json", "Respuesta igualmente."]);
+        let bridge = NeuralBridge::new(mock).with_tools(time_registry());
+
+        let answer = bridge.query_with_memory(&graph, "cortisol", "").unwrap();
+
+        assert_eq!(answer, "Respuesta igualmente.");
+        assert_eq!(bridge.backend.call_count(), 2);
+        // Plan por defecto: la pregunta es la sonda (aquí ancla por id exacto).
+        assert!(bridge.backend.user_prompts()[1].contains("reduce"));
+    }
+
+    #[test]
+    fn test_query_unknown_entity_answers_without_context() {
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué hace la oxitocina?", &["oxitocina"], "none"),
+            "No lo sé.".to_string(),
+        ]);
+        let bridge = NeuralBridge::new(mock);
+        bridge.query_with_memory(&graph, "¿Qué hace la oxitocina?", "").unwrap();
+        assert!(bridge.backend.user_prompts()[1].contains("No se encontró información"));
+    }
+
+    // ── Paso 22: memoria semántica + refuerzo hebbiano ─────────
+
+    #[test]
+    fn test_query_anchors_by_embedding_similarity() {
+        // El nodo "hormona_del_estres" se llama "Cortisol": ni su id ni un LIKE
+        // sobre "estrés crónico" lo encuentran; solo el vector del nombre.
+        // MockEmbeddingBackend da el mismo vector a textos idénticos.
+        let graph = MemoryGraph::open(":memory:").unwrap()
+            .with_embedding(Arc::new(MockEmbeddingBackend::new(16)));
+        graph.insert_node(&Node::new("hormona_del_estres", "concept", "Cortisol")).unwrap();
+        graph.insert_node(&Node::new("memoria", "concept", "Memoria")).unwrap();
+        graph.insert_edge("hormona_del_estres", "reduce", "memoria", 0.8).unwrap();
+
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué hace el cortisol?", &["Cortisol"], "none"),
+            "Reduce la memoria.".to_string(),
+        ]);
+        let bridge = NeuralBridge::new(mock);
+        bridge.query_with_memory(&graph, "¿Qué hace el cortisol?", "").unwrap();
+
+        assert!(bridge.backend.user_prompts()[1].contains("Cortisol reduce Memoria"));
+    }
+
+    #[test]
+    fn test_successful_query_reinforces_only_context_edges() {
+        let graph = cortisol_graph();
+        let before_unused = edge_weight(&graph, "rust", "wasm");
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué hace el cortisol?", &["cortisol"], "none"),
+            "Reduce la memoria.".to_string(),
+        ]);
+        NeuralBridge::new(mock).query_with_memory(&graph, "¿Qué hace el cortisol?", "").unwrap();
+
+        let after = edge_weight(&graph, "cortisol", "memoria");
+        assert!((after - (0.85 + HEBBIAN_DELTA)).abs() < 1e-9, "peso tras Hebb: {after}");
+        assert_eq!(edge_weight(&graph, "rust", "wasm"), before_unused, "lo no usado no se refuerza");
+    }
+
+    #[test]
+    fn test_failed_answer_does_not_reinforce() {
+        let graph = cortisol_graph();
+        let bridge = NeuralBridge::new(PlanThenFail {
+            plan:  plan_json("query", "¿Qué hace el cortisol?", &["cortisol"], "none"),
+            calls: AtomicUsize::new(0),
+        });
+        assert!(bridge.query_with_memory(&graph, "¿Qué hace el cortisol?", "").is_err());
+        assert_eq!(edge_weight(&graph, "cortisol", "memoria"), 0.85);
+    }
+
+    #[test]
+    fn test_extraction_stores_embeddings_in_index() {
+        let graph = MemoryGraph::open(":memory:").unwrap()
+            .with_embedding(Arc::new(MockEmbeddingBackend::new(8)));
+        let mock = MockLlmBackend::new(vec![
+            r#"{"triples": [{"subject": "titanio", "relation": "se_usa_en", "object": "implantes_medicos", "weight": 0.9}]}"#,
+        ]);
+        NeuralBridge::new(mock).extract_and_memorize(&graph, "El titanio se usa en implantes.").unwrap();
+
+        assert_eq!(graph.vector_index_len(), 2);
+        assert!(graph.get_node("implantes_medicos").unwrap().unwrap().embedding.is_some());
     }
 }

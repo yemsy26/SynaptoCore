@@ -2,11 +2,14 @@
 // memory_graph.rs — Motor principal del Grafo de Memoria
 //
 // Paso 12: se añade soporte de embeddings semánticos (EmbeddingBackend).
+// Paso 22: índice vectorial en RAM, recuperación semántica de contexto,
+//          refuerzo hebbiano por lote y decaimiento sin doble conteo.
 // ============================================================
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -33,8 +36,13 @@ pub trait EmbeddingBackend: Send + Sync {
     /// El batch es más eficiente que llamadas individuales (amortiza overhead ONNX).
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, MemoryError>;
 
-    /// Dimensionalidad del espacio vectorial (e.g. 384 para BGE-Small).
+    /// Dimensionalidad del espacio vectorial (e.g. 384 para MiniLM).
     fn dimensions(&self) -> usize;
+
+    /// Identificador del modelo. Se persiste junto al grafo: si cambia, los
+    /// embeddings guardados pertenecen a otro espacio vectorial (aunque la
+    /// dimensión coincida) y se regeneran.
+    fn model_id(&self) -> String;
 }
 
 /// Backend mock para tests: produce vectores determinísticos via hashing
@@ -64,6 +72,8 @@ impl EmbeddingBackend for MockEmbeddingBackend {
     }
 
     fn dimensions(&self) -> usize { self.dims }
+
+    fn model_id(&self) -> String { format!("mock-{}", self.dims) }
 }
 
 /// Backend real usando fastembed (solo disponible con --features embeddings).
@@ -74,18 +84,55 @@ pub struct FastEmbedBackend {
     dims:  usize,
 }
 
+/// Modelo de producción (Paso 22): paraphrase-multilingual-MiniLM-L12-v2
+/// con cuantización dinámica int8 (export de Xenova). Multilingüe (el grafo
+/// está en español; BGE-Small-EN, el anterior, solo entiende inglés),
+/// 384 dimensiones, ~120 MB en disco frente a ~470 MB de la versión fp32.
+#[cfg(feature = "embeddings")]
+const FASTEMBED_REPO: &str = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
+
+#[cfg(feature = "embeddings")]
+const FASTEMBED_MODEL_ID: &str = "xenova/paraphrase-multilingual-MiniLM-L12-v2/q8";
+
 #[cfg(feature = "embeddings")]
 impl FastEmbedBackend {
-    /// Crea e inicializa el motor. Descarga el modelo de HuggingFace si
-    /// no está en caché (~/.cache/fastembed). Solo ocurre una vez.
+    /// Crea e inicializa el motor. Descarga el modelo de HuggingFace si no
+    /// está en caché (`.fastembed_cache` en el directorio de trabajo, o la
+    /// ruta de `FASTEMBED_CACHE_DIR`). Solo ocurre una vez; después funciona
+    /// sin red. Es bloqueante: llámalo desde `spawn_blocking`.
     pub fn new() -> Result<Self, MemoryError> {
-        use fastembed::{InitOptions, TextEmbedding, EmbeddingModel};
+        use fastembed::{
+            InitOptionsUserDefined, Pooling, QuantizationMode, TextEmbedding,
+            TokenizerFiles, UserDefinedEmbeddingModel,
+        };
+        let fail = |e: &dyn std::fmt::Display| MemoryError::Embedding(e.to_string());
 
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGESmallENV15)
-        ).map_err(|e| MemoryError::Embedding(e.to_string()))?;
+        let api = hf_hub::api::sync::ApiBuilder::new()
+            .with_cache_dir(fastembed::get_cache_dir().into())
+            .with_progress(true)
+            .build()
+            .map_err(|e| fail(&e))?;
+        let repo = api.model(FASTEMBED_REPO.to_string());
+        let read = |file: &str| -> Result<Vec<u8>, MemoryError> {
+            let path = repo.get(file).map_err(|e| fail(&e))?;
+            std::fs::read(path).map_err(|e| fail(&e))
+        };
 
-        // BGE-Small-EN-v1.5 produce embeddings de 384 dimensiones.
+        let tokenizer = TokenizerFiles {
+            tokenizer_file:          read("tokenizer.json")?,
+            config_file:             read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file:   read("tokenizer_config.json")?,
+        };
+        // Mean pooling: el que usa el modelo original (sentence-transformers).
+        // Dynamic: la cuantización de Xenova es dinámica; fastembed procesa
+        // entonces cada llamada en un único lote (vectores comparables).
+        let model = UserDefinedEmbeddingModel::new(read("onnx/model_quantized.onnx")?, tokenizer)
+            .with_pooling(Pooling::Mean)
+            .with_quantization(QuantizationMode::Dynamic);
+        let model = TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::default())
+            .map_err(|e| fail(&e))?;
+
         Ok(Self { model, dims: 384 })
     }
 }
@@ -99,6 +146,56 @@ impl EmbeddingBackend for FastEmbedBackend {
     }
 
     fn dimensions(&self) -> usize { self.dims }
+
+    fn model_id(&self) -> String { FASTEMBED_MODEL_ID.to_string() }
+}
+
+/// Calcula embeddings para varios textos FUERA del lock del grafo.
+///
+/// Devuelve un mapa texto → vector. Si no hay backend o el modelo falla,
+/// devuelve un mapa vacío (y lo registra): los nodos se insertarán sin
+/// vector y `backfill_embeddings` los completará más tarde. Aprender nunca
+/// debe fallar porque el modelo de embeddings no esté disponible.
+pub fn embed_texts(
+    backend: Option<&Arc<dyn EmbeddingBackend>>,
+    texts:   &[String],
+) -> HashMap<String, Vec<f32>> {
+    let Some(backend) = backend else { return HashMap::new() };
+    if texts.is_empty() {
+        return HashMap::new();
+    }
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    match backend.embed(&refs) {
+        Ok(vecs) => texts.iter().cloned().zip(vecs).collect(),
+        Err(e) => {
+            log::warn!("Embeddings no disponibles ({e}); los nodos se guardan sin vector");
+            HashMap::new()
+        }
+    }
+}
+
+/// Completa los embeddings que faltan (nodos anteriores al modelo o cuyo
+/// embedding falló), por lotes y sin retener el lock durante la inferencia.
+/// Devuelve cuántos nodos se vectorizaron.
+pub fn backfill_embeddings<G: GraphAccess>(graph: &G, batch: usize) -> Result<usize, MemoryError> {
+    let Some(backend) = graph.with_graph(|g| g.embedding_backend()) else { return Ok(0) };
+    let mut total = 0;
+    loop {
+        let pending = graph.with_graph(|g| g.nodes_missing_embedding(batch))?;
+        if pending.is_empty() {
+            break;
+        }
+        let names: Vec<&str> = pending.iter().map(|(_, name)| name.as_str()).collect();
+        let vecs = backend.embed(&names)?;                       // sin lock
+        let items: Vec<(String, Vec<f32>)> =
+            pending.into_iter().map(|(id, _)| id).zip(vecs).collect();
+        let stored = graph.with_graph(|g| g.store_embeddings(&items))?;
+        total += stored;
+        if stored == 0 {
+            break; // los nodos desaparecieron entre lectura y escritura
+        }
+    }
+    Ok(total)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -128,6 +225,168 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if mag_a == 0.0 || mag_b == 0.0 { 0.0 } else { dot / (mag_a * mag_b) }
 }
 
+/// Vector escalado a norma 1, o `None` si es nulo.
+fn normalized(v: &[f32]) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (norm > f32::EPSILON).then(|| v.iter().map(|x| x / norm).collect())
+}
+
+// ──────────────────────────────────────────────────────────────
+//  VectorIndex — índice semántico en RAM (Paso 22)
+// ──────────────────────────────────────────────────────────────
+
+/// Índice vectorial plano en RAM: búsqueda exacta por producto escalar.
+///
+/// ¿Por qué plano y no HNSW? Con 384 dimensiones, 10 000 nodos son 3,8 M
+/// multiplicaciones (~1-2 ms en una CPU actual) y la búsqueda es exacta. Un
+/// índice aproximado solo compensa a partir de ~10⁵ nodos y añade una
+/// dependencia, memoria extra y resultados no deterministas.
+///
+/// Los vectores se guardan normalizados, así que el coseno es un producto
+/// escalar. SQLite sigue siendo la fuente de verdad (BLOB): el índice se
+/// reconstruye al abrir y se mantiene en cada alta y baja de nodo.
+#[derive(Default)]
+struct VectorIndex {
+    dims: usize,
+    ids:  Vec<String>,
+    pos:  HashMap<String, usize>,
+    /// Matriz fila-mayor: la fila `i` es el vector normalizado de `ids[i]`.
+    data: Vec<f32>,
+}
+
+impl VectorIndex {
+    fn new(dims: usize) -> Self {
+        Self { dims, ..Default::default() }
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Inserta o sustituye el vector de un nodo. Ignora vectores nulos o de
+    /// otra dimensión (no pertenecen a este espacio).
+    fn upsert(&mut self, id: &str, v: &[f32]) -> bool {
+        if self.dims == 0 || v.len() != self.dims {
+            return false;
+        }
+        let Some(unit) = normalized(v) else { return false };
+        match self.pos.get(id) {
+            Some(&i) => self.data[i * self.dims..(i + 1) * self.dims].copy_from_slice(&unit),
+            None => {
+                self.pos.insert(id.to_string(), self.ids.len());
+                self.ids.push(id.to_string());
+                self.data.extend_from_slice(&unit);
+            }
+        }
+        true
+    }
+
+    /// Elimina un nodo moviendo la última fila a su hueco: O(dims).
+    fn remove(&mut self, id: &str) {
+        let Some(i) = self.pos.remove(id) else { return };
+        let last = self.ids.len() - 1;
+        if i != last {
+            let d = self.dims;
+            self.data.copy_within(last * d..(last + 1) * d, i * d);
+            self.pos.insert(self.ids[last].clone(), i);
+        }
+        self.ids.swap_remove(i);
+        self.data.truncate(last * self.dims);
+    }
+
+    /// Los `k` nodos más similares a `query`, por coseno descendente.
+    fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+        if k == 0 || self.ids.is_empty() || query.len() != self.dims {
+            return Vec::new();
+        }
+        let Some(q) = normalized(query) else { return Vec::new() };
+        let mut scored: Vec<(usize, f32)> = self.data
+            .chunks_exact(self.dims)
+            .map(|row| row.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>())
+            .enumerate()
+            .collect();
+        let by_score = |a: &(usize, f32), b: &(usize, f32)| b.1.total_cmp(&a.1);
+        if scored.len() > k {
+            // Selección parcial O(n): solo se ordenan los k ganadores.
+            scored.select_nth_unstable_by(k - 1, by_score);
+            scored.truncate(k);
+        }
+        scored.sort_unstable_by(by_score);
+        scored.into_iter().map(|(i, s)| (self.ids[i].clone(), s)).collect()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  Recuperación de contexto para el chat (Paso 22)
+// ──────────────────────────────────────────────────────────────
+
+/// Puntuación de una semilla encontrada solo por coincidencia léxica (LIKE),
+/// cuando no hay embeddings. Por debajo de una coincidencia exacta (1.0).
+const LEXICAL_SEED_SCORE: f32 = 0.6;
+
+/// Parámetros de la recuperación de contexto.
+#[derive(Debug, Clone)]
+pub struct RetrievalConfig {
+    /// Nodos semilla por sonda (cada entidad del plan, o la pregunta).
+    pub seeds_per_probe: usize,
+    /// Similitud coseno mínima para aceptar una semilla.
+    pub min_similarity:  f32,
+    /// Peso mínimo de una arista para entrar en el contexto.
+    pub min_edge_weight: f64,
+    /// Máximo de aristas en el contexto final (presupuesto de tokens).
+    pub max_edges:       usize,
+}
+
+impl Default for RetrievalConfig {
+    /// `min_similarity` calibrado con el modelo de producción
+    /// (`fastembed_calibration`): pares relacionados 0.49-0.67 ("inventario ↔
+    /// stock disponible" 0.49, "fénix flow ↔ Fénix Flow ERP" 0.67), no
+    /// relacionados 0.13-0.23. 0.40 prioriza precisión: a un modelo de 2B le
+    /// perjudica más el contexto irrelevante que el ausente.
+    fn default() -> Self {
+        Self { seeds_per_probe: 3, min_similarity: 0.40, min_edge_weight: 0.3, max_edges: 12 }
+    }
+}
+
+/// Una arista recuperada, lista para el prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextEdge {
+    pub edge_id:   String,
+    pub source:    String,
+    pub relation:  String,
+    pub target:    String,
+    pub weight:    f64,
+    /// Puntuación de la semilla × peso de la arista: orden del contexto.
+    pub relevance: f64,
+}
+
+/// Resultado de `retrieve_context`.
+#[derive(Debug, Clone, Default)]
+pub struct RetrievedContext {
+    /// Nodos de anclaje `(id, puntuación)`, de mayor a menor.
+    pub seeds: Vec<(String, f32)>,
+    /// Aristas para el prompt, de mayor a menor relevancia.
+    pub edges: Vec<ContextEdge>,
+}
+
+/// Forma canónica de un identificador de nodo, tal como lo escribe el
+/// extractor: minúsculas, snake_case y vocales sin tilde.
+pub(crate) fn canonical_id(text: &str) -> String {
+    text.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'ä' => 'a',
+            'é' | 'è' | 'ë' => 'e',
+            'í' | 'ì' | 'ï' => 'i',
+            'ó' | 'ò' | 'ö' => 'o',
+            'ú' | 'ù' | 'ü' => 'u',
+            c if c.is_whitespace() || c == '-' => '_',
+            c => c,
+        })
+        .collect()
+}
+
 // ──────────────────────────────────────────────────────────────
 //  MemoryGraph — Handle principal
 // ──────────────────────────────────────────────────────────────
@@ -136,9 +395,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 pub struct MemoryGraph {
     conn:     Connection,
     /// Motor de embeddings (Paso 12). `None` en tests y cuando la
-    /// feature "embeddings" no está activa. `semantic_search` hace
-    /// fallback a LIKE search cuando es `None`.
+    /// feature "embeddings" no está activa o el modelo no cargó: la
+    /// recuperación de contexto hace entonces fallback léxico (LIKE).
     emb_backend: Option<Arc<dyn EmbeddingBackend>>,
+    /// Índice vectorial en RAM (Paso 22). `RefCell` basta: `MemoryGraph` ya
+    /// es `!Sync` (rusqlite::Connection) y se comparte vía `Mutex`.
+    index: RefCell<VectorIndex>,
 }
 
 impl MemoryGraph {
@@ -150,7 +412,7 @@ impl MemoryGraph {
     /// Sin embedding backend — `semantic_search` usará LIKE fallback.
     pub fn open(path: &str) -> Result<Self, MemoryError> {
         let conn = Connection::open(path)?;
-        let mg = Self { conn, emb_backend: None };
+        let mg = Self { conn, emb_backend: None, index: RefCell::new(VectorIndex::new(0)) };
         mg.apply_pragmas()?;
         mg.create_schema()?;
         mg.run_migrations()?;
@@ -166,14 +428,70 @@ impl MemoryGraph {
     /// let mg = MemoryGraph::open(":memory:")?
     ///     .with_embedding(Arc::new(MockEmbeddingBackend::new(4)));
     /// ```
+    ///
+    /// Paso 22: además carga el índice vectorial en RAM desde los BLOBs. Si
+    /// los embeddings guardados proceden de otro modelo se invalidan (otro
+    /// espacio vectorial) para que `backfill_embeddings` los regenere.
     pub fn with_embedding(mut self, backend: Arc<dyn EmbeddingBackend>) -> Self {
+        if let Err(e) = self.sync_embedding_model(backend.as_ref()) {
+            log::warn!("No se pudo sincronizar el modelo de embeddings: {e}");
+        }
+        *self.index.get_mut() = VectorIndex::new(backend.dimensions());
         self.emb_backend = Some(backend);
+        if let Err(e) = self.reload_index() {
+            log::warn!("No se pudo cargar el índice vectorial: {e}");
+        }
         self
     }
 
     /// Devuelve `true` si el motor de embeddings está activo.
     pub fn has_embedding_backend(&self) -> bool {
         self.emb_backend.is_some()
+    }
+
+    /// Motor de embeddings compartido, para vectorizar FUERA del lock del grafo.
+    pub fn embedding_backend(&self) -> Option<Arc<dyn EmbeddingBackend>> {
+        self.emb_backend.clone()
+    }
+
+    /// Número de nodos presentes en el índice vectorial.
+    pub fn vector_index_len(&self) -> usize {
+        self.index.borrow().len()
+    }
+
+    /// Invalida los embeddings si el modelo guardado no es el actual.
+    fn sync_embedding_model(&self, backend: &dyn EmbeddingBackend) -> Result<(), MemoryError> {
+        let model = backend.model_id();
+        let stored: Option<String> = self.conn
+            .query_row("SELECT value FROM meta WHERE key = 'embedding_model'", [], |r| r.get(0))
+            .optional()?;
+        if stored.as_deref() != Some(model.as_str()) {
+            let cleared = self.conn.execute("UPDATE nodes SET embedding = NULL WHERE embedding IS NOT NULL", [])?;
+            if cleared > 0 {
+                log::info!("Modelo de embeddings cambiado a '{model}': {cleared} vectores se regenerarán");
+            }
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![model],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reconstruye el índice vectorial desde SQLite (fuente de verdad).
+    fn reload_index(&self) -> Result<usize, MemoryError> {
+        let mut index = self.index.borrow_mut();
+        *index = VectorIndex::new(index.dims);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, embedding FROM nodes WHERE embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        for row in rows {
+            let (id, blob) = row?;
+            index.upsert(&id, &blob_to_embedding(&blob));
+        }
+        Ok(index.len())
     }
 
     /// Configura los PRAGMAs de rendimiento y seguridad.
@@ -271,6 +589,13 @@ impl MemoryGraph {
             -- sin un full-scan de la tabla.
             CREATE INDEX IF NOT EXISTS idx_edges_last_accessed
                 ON edges (last_accessed ASC);
+
+            -- ────────── TABLA: meta (Paso 22) ──────────
+            -- Metadatos del grafo, p. ej. el modelo que generó los embeddings.
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) STRICT;
         ")?;
         Ok(())
     }
@@ -305,6 +630,14 @@ impl MemoryGraph {
             [],
         );
 
+        // v0.22: decayed_at = última pasada de la curva del olvido. Sin él,
+        // cada pasada aplicaba e^(-λ·(now - last_accessed)) sobre un peso ya
+        // decaído y el olvido se acumulaba (doble conteo). NULL = nunca decaída.
+        let _ = self.conn.execute(
+            "ALTER TABLE edges ADD COLUMN decayed_at INTEGER",
+            [],
+        );
+
         Ok(())
     }
 
@@ -314,9 +647,12 @@ impl MemoryGraph {
 
     /// Inserta un nodo en el grafo de memoria.
     ///
-    /// Si hay un `EmbeddingBackend` activo (Paso 12), genera el embedding
-    /// del campo `name` y lo persiste como BLOB en la columna `embedding`.
-    /// En caso contrario (tests, modo legacy), el BLOB queda como NULL.
+    /// Embedding (Paso 12 / Paso 22):
+    /// - Si `node.embedding` viene relleno, se usa tal cual. Es el camino
+    ///   normal: los llamadores vectorizan con `embed_texts` FUERA del lock.
+    /// - Si no, y hay backend activo, se calcula aquí (bajo el lock).
+    /// - Si el modelo falla, el nodo se guarda sin vector: aprender no debe
+    ///   depender del modelo de embeddings; `backfill_embeddings` lo completa.
     ///
     /// # Errores
     /// - [`MemoryError::DuplicateNode`] si `node.id` ya existe.
@@ -325,28 +661,22 @@ impl MemoryGraph {
         let props_json = serde_json::to_string(&node.properties)?;
 
         // Verificamos duplicado antes del INSERT para devolver un error semántico.
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM nodes WHERE id = ?1 LIMIT 1",
-                params![node.id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-
-        if exists {
+        if self.node_exists(&node.id)? {
             return Err(MemoryError::DuplicateNode(node.id.clone()));
         }
 
-        // Generar embedding si hay backend activo; None → NULL en SQLite.
-        let embedding_blob: Option<Vec<u8>> = if let Some(ref backend) = self.emb_backend {
-            // Embebemos el `name` del nodo (la descripción semántica principal).
-            let vecs = backend.embed(&[node.name.as_str()])?;
-            vecs.into_iter().next().map(|v| embedding_to_blob(&v))
-        } else {
-            None
+        let embedding: Option<Vec<f32>> = match (&node.embedding, &self.emb_backend) {
+            (Some(v), _) => Some(v.clone()),
+            (None, Some(backend)) => match backend.embed(&[node.name.as_str()]) {
+                Ok(mut vecs) => vecs.pop(),
+                Err(e) => {
+                    log::warn!("Embedding de '{}' falló ({e}); se guarda sin vector", node.id);
+                    None
+                }
+            },
+            (None, None) => None,
         };
+        let embedding_blob = embedding.as_deref().map(embedding_to_blob);
 
         self.conn.execute(
             "INSERT INTO nodes (id, label, name, properties, created_at, embedding)
@@ -361,7 +691,53 @@ impl MemoryGraph {
             ],
         )?;
 
+        if let Some(v) = &embedding {
+            self.index.borrow_mut().upsert(&node.id, v);
+        }
         Ok(())
+    }
+
+    /// `true` si existe un nodo con ese id.
+    fn node_exists(&self, id: &str) -> Result<bool, MemoryError> {
+        Ok(self.conn
+            .query_row("SELECT 1 FROM nodes WHERE id = ?1 LIMIT 1", params![id], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Nodos sin embedding `(id, name)`, para `backfill_embeddings`.
+    pub fn nodes_missing_embedding(&self, limit: usize) -> Result<Vec<(String, String)>, MemoryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name FROM nodes WHERE embedding IS NULL LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Persiste embeddings ya calculados y los añade al índice en RAM.
+    /// Una sola transacción. Devuelve cuántos nodos se actualizaron.
+    pub fn store_embeddings(&self, items: &[(String, Vec<f32>)]) -> Result<usize, MemoryError> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut stored = Vec::with_capacity(items.len());
+        {
+            let mut stmt = tx.prepare_cached("UPDATE nodes SET embedding = ?1 WHERE id = ?2")?;
+            for (id, v) in items {
+                if stmt.execute(params![embedding_to_blob(v), id])? > 0 {
+                    stored.push((id, v));
+                }
+            }
+        }
+        tx.commit()?;
+        let mut index = self.index.borrow_mut();
+        for (id, v) in &stored {
+            index.upsert(id, v);
+        }
+        Ok(stored.len())
     }
 
     /// Inserta una arista (relación semántica direccional) en el grafo.
@@ -487,6 +863,39 @@ impl MemoryGraph {
         Ok(rows > 0)
     }
 
+    /// **Refuerzo hebbiano por lote** (Paso 22): "neuronas que se disparan
+    /// juntas, se conectan más fuerte".
+    ///
+    /// Suma `delta` al peso de cada arista (con techo 1.0) y renueva su
+    /// `last_accessed`, reiniciando su curva del olvido. Se usa con las
+    /// aristas que el chat inyectó como contexto en una respuesta completada:
+    /// el conocimiento que se usa sobrevive; el que no, decae.
+    ///
+    /// Una sola transacción para todo el lote; los ids inexistentes (podados
+    /// entre la recuperación y el refuerzo) se ignoran. Devuelve cuántas
+    /// aristas se actualizaron.
+    pub fn reinforce_edges(&self, edge_ids: &[String], delta: f64) -> Result<usize, MemoryError> {
+        if edge_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = current_unix_ts();
+        let tx = self.conn.unchecked_transaction()?;
+        let mut updated = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE edges
+                 SET weight        = MIN(1.0, MAX(0.0, weight + ?1)),
+                     last_accessed = ?2
+                 WHERE id = ?3",
+            )?;
+            for id in edge_ids {
+                updated += stmt.execute(params![delta, now, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
     // ──────────────────────────────────────────────────────
     //  Operaciones de borrado
     // ──────────────────────────────────────────────────────
@@ -516,6 +925,9 @@ impl MemoryGraph {
             "DELETE FROM nodes WHERE id = ?1",
             params![node_id],
         )?;
+        if rows > 0 {
+            self.index.borrow_mut().remove(node_id);
+        }
         Ok(rows > 0)
     }
 
@@ -638,10 +1050,11 @@ impl MemoryGraph {
     /// Si no hay `EmbeddingBackend` activo (ej. tests, modo mock), delega a
     /// `search_nodes` (LIKE). Los nodos devueltos tienen score `1.0` de placeholder.
     ///
-    /// ## Rendimiento
-    /// Para <100 000 nodos el loop en RAM es <5 ms (medido en hardware de bajo nivel).
-    /// El cuello de botella real es el IO de leer los BLOBs, que SQLite optimiza
-    /// con su caché configurada en `apply_pragmas`.
+    /// ## Rendimiento (Paso 22)
+    /// La búsqueda va contra el índice en RAM (`VectorIndex`), no contra los
+    /// BLOBs de SQLite: ~1-2 ms para 10 000 nodos, sin E/S ni deserialización.
+    /// Ojo: vectoriza `query` bajo el lock del grafo; en caminos calientes usa
+    /// `embed_texts` fuera del lock y luego `nearest_nodes`/`retrieve_context`.
     pub fn semantic_search(
         &self,
         query: &str,
@@ -656,34 +1069,118 @@ impl MemoryGraph {
                 .collect());
         };
 
-        // 1. Embeber la query.
-        let query_vecs = backend.embed(&[query])?;
-        let query_emb = &query_vecs[0];
+        let query_emb = backend.embed(&[query])?.pop().unwrap_or_default();
+        let mut hits = Vec::new();
+        for (id, score) in self.nearest_nodes(&query_emb, top_k) {
+            if let Some(node) = self.get_node(&id)? {
+                hits.push((node, score));
+            }
+        }
+        Ok(hits)
+    }
 
-        // 2. Cargar todos los nodos con embedding de la DB.
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, name, properties, created_at, embedding
-             FROM nodes
-             WHERE embedding IS NOT NULL",
-        )?;
+    /// Los `k` nodos más cercanos a un vector ya calculado: `(id, coseno)`.
+    pub fn nearest_nodes(&self, query_vec: &[f32], k: usize) -> Vec<(String, f32)> {
+        self.index.borrow().search(query_vec, k)
+    }
 
-        let mut scored: Vec<(Node, f32)> = stmt
-            .query_map([], Self::row_to_node)?
-            .filter_map(|r| r.ok())
-            .filter_map(|node| {
-                node.embedding.clone().as_ref().map(|emb| {
-                    let score = cosine_similarity(query_emb, emb);
-                    (node, score)
-                })
-            })
-            .collect();
+    /// **Recuperación de contexto para el chat** (Paso 22).
+    ///
+    /// Sustituye el anclaje anterior (id exacto o `LIKE`) por anclaje
+    /// semántico, en tres pasos:
+    ///   1. Semillas por sonda (cada entidad del plan, o la pregunta):
+    ///      coincidencia exacta de id (puntuación 1.0) + los `seeds_per_probe`
+    ///      vecinos por coseno con similitud ≥ `min_similarity`. Sin
+    ///      embeddings, búsqueda léxica como último recurso.
+    ///   2. Expansión a 1 salto (entrantes y salientes) de cada semilla.
+    ///   3. Ranking por `puntuación de la semilla × peso de la arista`,
+    ///      filtrando aristas débiles y truncando a `max_edges`.
+    ///
+    /// `probe_vecs[i]` es el embedding de `probes[i]`, calculado por el
+    /// llamador FUERA del lock. Todo lo de aquí es lectura en RAM y SQLite.
+    pub fn retrieve_context(
+        &self,
+        probes:     &[String],
+        probe_vecs: Option<&[Vec<f32>]>,
+        cfg:        &RetrievalConfig,
+    ) -> Result<RetrievedContext, MemoryError> {
+        let mut seeds: HashMap<String, f32> = HashMap::new();
+        let mut add_seed = |id: String, score: f32| {
+            let best = seeds.entry(id).or_insert(score);
+            if score > *best {
+                *best = score;
+            }
+        };
+        let has_index = self.vector_index_len() > 0;
 
-        // 3. Ordenar por similitud descendente y truncar.
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(top_k);
-        Ok(scored)
+        for (i, probe) in probes.iter().enumerate() {
+            let probe = probe.trim();
+            if probe.is_empty() {
+                continue;
+            }
+            // 1a. Coincidencia exacta de identificador: la señal más precisa.
+            for candidate in [probe.to_string(), canonical_id(probe)] {
+                if self.node_exists(&candidate)? {
+                    add_seed(candidate, 1.0);
+                }
+            }
+            // 1b. Similitud coseno; sin vectores, búsqueda léxica.
+            match probe_vecs.and_then(|v| v.get(i)) {
+                Some(q) if has_index => {
+                    for (id, sim) in self.nearest_nodes(q, cfg.seeds_per_probe) {
+                        if sim >= cfg.min_similarity {
+                            add_seed(id, sim);
+                        }
+                    }
+                }
+                _ => {
+                    for node in self.search_nodes(probe, cfg.seeds_per_probe)? {
+                        add_seed(node.id, LEXICAL_SEED_SCORE);
+                    }
+                }
+            }
+        }
+
+        // 2. Expansión a 1 salto, quedándose con la mejor relevancia por arista.
+        let mut edges: HashMap<String, ContextEdge> = HashMap::new();
+        for (seed_id, score) in &seeds {
+            let hood = match self.get_neighbors(seed_id, TraversalDirection::Both) {
+                Ok(h) => h,
+                Err(MemoryError::NodeNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            for (edge, other) in hood.neighbors {
+                if edge.weight < cfg.min_edge_weight {
+                    continue;
+                }
+                let relevance = f64::from(*score) * edge.weight;
+                if edges.get(&edge.id).is_some_and(|e| e.relevance >= relevance) {
+                    continue;
+                }
+                let (source, target) = if edge.source_id == hood.root.id {
+                    (hood.root.name.clone(), other.name)
+                } else {
+                    (other.name, hood.root.name.clone())
+                };
+                edges.insert(edge.id.clone(), ContextEdge {
+                    edge_id: edge.id,
+                    source,
+                    relation: edge.relation,
+                    target,
+                    weight: edge.weight,
+                    relevance,
+                });
+            }
+        }
+
+        // 3. Ranking determinista y presupuesto de tokens.
+        let mut edges: Vec<ContextEdge> = edges.into_values().collect();
+        edges.sort_by(|a, b| b.relevance.total_cmp(&a.relevance).then_with(|| a.edge_id.cmp(&b.edge_id)));
+        edges.truncate(cfg.max_edges);
+
+        let mut seeds: Vec<(String, f32)> = seeds.into_iter().collect();
+        seeds.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(RetrievedContext { seeds, edges })
     }
 
     /// Devuelve una instantánea completa del grafo para renderizado visual.
@@ -967,8 +1464,10 @@ impl MemoryGraph {
         let mut to_prune: Vec<String>         = Vec::new();   // ids a borrar
 
         // ── 2. Calcular nuevo peso para cada arista ──────────────────────
-        for (edge_id, current_weight, last_accessed) in &edges_raw {
-            let delta_t  = (now - last_accessed).max(0) as f64;   // Δt en segundos
+        // `since` = el más reciente entre último acceso y última pasada
+        // (Paso 22): el peso guardado ya incluye el decaimiento anterior.
+        for (edge_id, current_weight, since) in &edges_raw {
+            let delta_t  = (now - since).max(0) as f64;           // Δt en segundos
             let new_weight = current_weight * (-decay_rate * delta_t).exp();
 
             if new_weight < prune_threshold {
@@ -982,7 +1481,7 @@ impl MemoryGraph {
         // Una transacción explícita es crítica: sin ella, SQLite abre una
         // transacción implícita por cada UPDATE, lo que multiplica los fsync
         // y convierte O(n) UPDATEs en O(n) transacciones — 100× más lento.
-        let updated_count  = self.batch_update_weights(&updates)?;
+        let updated_count  = self.batch_update_weights(&updates, now)?;
         let pruned_count   = self.batch_delete_edges(&to_prune)?;
 
         // ── 4. Limpiar nodos huérfanos ────────────────────────────────────
@@ -990,6 +1489,10 @@ impl MemoryGraph {
         // entrante). Los borramos para mantener el grafo limpio y evitar
         // que el subconsciente (Paso 4) investigue nodos sin contexto.
         let orphans_removed = self.prune_orphan_nodes()?;
+        if orphans_removed > 0 {
+            // Los nodos se borraron por SQL: resincronizar el índice en RAM.
+            self.reload_index()?;
+        }
 
         Ok(DecayReport {
             edges_decayed:  updated_count as u64,
@@ -1000,10 +1503,12 @@ impl MemoryGraph {
         })
     }
 
-    /// Lee `(id, weight, last_accessed)` de todas las aristas.
+    /// Lee `(id, weight, desde)` de todas las aristas, donde `desde` es el
+    /// instante más reciente entre el último acceso y la última pasada de
+    /// decaimiento: el intervalo que aún no se ha descontado del peso.
     fn fetch_edges_for_decay(&self) -> Result<Vec<(String, f64, i64)>, MemoryError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, weight, last_accessed FROM edges",
+            "SELECT id, weight, MAX(last_accessed, COALESCE(decayed_at, 0)) FROM edges",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1013,8 +1518,10 @@ impl MemoryGraph {
         Ok(rows)
     }
 
-    /// Aplica un batch de UPDATEs de peso dentro de una transacción.
-    fn batch_update_weights(&self, updates: &[(String, f64)]) -> Result<usize, MemoryError> {
+    /// Aplica un batch de UPDATEs de peso dentro de una transacción y marca
+    /// `decayed_at = now` para que la próxima pasada no vuelva a descontar
+    /// el mismo intervalo.
+    fn batch_update_weights(&self, updates: &[(String, f64)], now: i64) -> Result<usize, MemoryError> {
         if updates.is_empty() { return Ok(0); }
 
         // `savepoint` es equivalente a `BEGIN` pero anidable.
@@ -1023,8 +1530,8 @@ impl MemoryGraph {
         let mut count = 0usize;
         for (edge_id, new_weight) in updates {
             count += self.conn.execute(
-                "UPDATE edges SET weight = ?1 WHERE id = ?2",
-                params![new_weight, edge_id],
+                "UPDATE edges SET weight = ?1, decayed_at = ?3 WHERE id = ?2",
+                params![new_weight, edge_id, now],
             )?;
         }
 
@@ -1582,5 +2089,230 @@ mod tests {
 
         let results = mg.semantic_search("anything", 5).unwrap();
         assert!(results.is_empty(), "BD vacía → sin resultados semánticos");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Paso 22 — Índice vectorial, recuperación, Hebb y decaimiento
+    // ═══════════════════════════════════════════════════════════
+
+    /// Embedder que siempre falla (modelo no disponible).
+    struct FailingEmbedder;
+
+    impl EmbeddingBackend for FailingEmbedder {
+        fn embed(&self, _: &[&str]) -> Result<Vec<Vec<f32>>, MemoryError> {
+            Err(MemoryError::Embedding("modelo no disponible".into()))
+        }
+        fn dimensions(&self) -> usize { 4 }
+        fn model_id(&self) -> String { "failing".into() }
+    }
+
+    fn mock_graph(dims: usize) -> MemoryGraph {
+        MemoryGraph::open(":memory:").unwrap().with_embedding(Arc::new(MockEmbeddingBackend::new(dims)))
+    }
+
+    fn weight_of(g: &MemoryGraph, source: &str, target: &str) -> f64 {
+        g.get_neighbors(source, TraversalDirection::Outgoing).unwrap()
+            .neighbors.into_iter().find(|(_, n)| n.id == target).unwrap().0.weight
+    }
+
+    #[test]
+    fn test_vector_index_search_upsert_and_remove() {
+        let mut idx = VectorIndex::new(2);
+        assert!(idx.upsert("este", &[1.0, 0.0]));
+        assert!(idx.upsert("norte", &[0.0, 3.0]));       // se normaliza
+        assert!(idx.upsert("noreste", &[1.0, 1.0]));
+
+        let hits = idx.search(&[2.0, 0.1], 2);
+        assert_eq!(hits.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["este", "noreste"]);
+        assert!((hits[0].1 - 0.9988).abs() < 1e-3, "coseno: {}", hits[0].1);
+
+        // Borrar del medio mueve la última fila a su hueco sin corromper ids.
+        idx.remove("este");
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.search(&[0.0, 1.0], 1)[0].0, "norte");
+        assert_eq!(idx.search(&[1.0, 1.0], 1)[0].0, "noreste");
+
+        // Upsert de un id existente sustituye su vector.
+        idx.upsert("norte", &[1.0, 0.0]);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.search(&[1.0, 0.0], 1)[0].0, "norte");
+    }
+
+    #[test]
+    fn test_vector_index_rejects_foreign_vectors() {
+        let mut idx = VectorIndex::new(3);
+        assert!(!idx.upsert("dims", &[1.0, 0.0]));
+        assert!(!idx.upsert("nulo", &[0.0, 0.0, 0.0]));
+        assert_eq!(idx.len(), 0);
+        assert!(idx.search(&[1.0, 0.0], 5).is_empty(), "consulta de otra dimensión");
+        assert!(VectorIndex::new(0).search(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn test_insert_and_delete_keep_index_in_sync() {
+        let g = mock_graph(8);
+        g.insert_node(&Node::new("a", "concept", "Alfa")).unwrap();
+        g.insert_node(&Node::new("b", "concept", "Beta")).unwrap();
+        assert_eq!(g.vector_index_len(), 2);
+
+        let alfa = MockEmbeddingBackend::new(8).embed(&["Alfa"]).unwrap().pop().unwrap();
+        let hits = g.nearest_nodes(&alfa, 1);
+        assert_eq!(hits[0].0, "a");
+        assert!(hits[0].1 > 0.999);
+
+        g.delete_node("a").unwrap();
+        assert_eq!(g.vector_index_len(), 1);
+        assert_ne!(g.nearest_nodes(&alfa, 1)[0].0, "a");
+    }
+
+    #[test]
+    fn test_precomputed_embedding_is_used_as_is() {
+        let g = mock_graph(2);
+        let mut node = Node::new("x", "concept", "X");
+        node.embedding = Some(vec![0.0, 5.0]);
+        g.insert_node(&node).unwrap();
+        assert_eq!(g.get_node("x").unwrap().unwrap().embedding, Some(vec![0.0, 5.0]));
+        assert_eq!(g.nearest_nodes(&[0.0, 1.0], 1)[0].0, "x");
+    }
+
+    #[test]
+    fn test_embedding_failure_does_not_block_learning() {
+        let g = MemoryGraph::open(":memory:").unwrap().with_embedding(Arc::new(FailingEmbedder));
+        g.insert_node(&Node::new("a", "concept", "Alfa")).unwrap();
+        assert!(g.get_node("a").unwrap().unwrap().embedding.is_none());
+        assert_eq!(g.nodes_missing_embedding(10).unwrap().len(), 1, "queda pendiente para el backfill");
+        assert!(backfill_embeddings(&g, 10).is_err(), "el backfill informa del fallo del modelo");
+    }
+
+    #[test]
+    fn test_index_rebuilt_on_reopen_and_reset_on_model_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.db");
+        let path = path.to_str().unwrap();
+        {
+            let g = MemoryGraph::open(path).unwrap().with_embedding(Arc::new(MockEmbeddingBackend::new(4)));
+            g.insert_node(&Node::new("a", "concept", "Alfa")).unwrap();
+            g.insert_node(&Node::new("b", "concept", "Beta")).unwrap();
+        }
+        // Mismo modelo: el índice se reconstruye desde los BLOBs.
+        let same = MemoryGraph::open(path).unwrap().with_embedding(Arc::new(MockEmbeddingBackend::new(4)));
+        assert_eq!(same.vector_index_len(), 2);
+        drop(same);
+
+        // Otro modelo (otro espacio vectorial): vectores invalidados y regenerados.
+        let other = MemoryGraph::open(path).unwrap().with_embedding(Arc::new(MockEmbeddingBackend::new(6)));
+        assert_eq!(other.vector_index_len(), 0);
+        assert_eq!(other.nodes_missing_embedding(10).unwrap().len(), 2);
+        assert_eq!(backfill_embeddings(&other, 1).unwrap(), 2, "lotes de 1 → 2 iteraciones");
+        assert_eq!(other.vector_index_len(), 2);
+        assert!(other.nodes_missing_embedding(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_retrieve_context_anchors_and_ranks() {
+        let g = mock_graph(16);
+        for (id, name) in [("cortisol", "Cortisol"), ("memoria", "Memoria"), ("estres", "Estrés"),
+                           ("sueno", "Sueño"), ("rust", "Rust")] {
+            g.insert_node(&Node::new(id, "concept", name)).unwrap();
+        }
+        g.insert_edge("cortisol", "reduce", "memoria", 0.9).unwrap();
+        g.insert_edge("estres", "eleva", "cortisol", 0.6).unwrap();   // entrante a la semilla
+        g.insert_edge("cortisol", "altera", "sueno", 0.1).unwrap();   // débil: fuera
+        let cfg = RetrievalConfig::default();
+
+        // Sonda con tilde → id canónico exacto ("Cortisol" → "cortisol").
+        let ctx = g.retrieve_context(&["Cortisol".to_string()], None, &cfg).unwrap();
+        assert_eq!(ctx.seeds[0], ("cortisol".to_string(), 1.0));
+        let triples: Vec<_> = ctx.edges.iter()
+            .map(|e| (e.source.as_str(), e.relation.as_str(), e.target.as_str())).collect();
+        assert_eq!(triples, [("Cortisol", "reduce", "Memoria"), ("Estrés", "eleva", "Cortisol")],
+            "ordenadas por relevancia, orientación correcta en entrantes, sin aristas débiles");
+
+        // Sonda semántica: el vector del nombre "Sueño" ancla en "sueno".
+        let q = MockEmbeddingBackend::new(16).embed(&["Sueño"]).unwrap();
+        let ctx = g.retrieve_context(&["dormir bien".to_string()], Some(&q), &cfg).unwrap();
+        assert!(ctx.seeds.iter().any(|(id, s)| id == "sueno" && *s > 0.99));
+
+        // Presupuesto de aristas.
+        let tight = RetrievalConfig { max_edges: 1, ..cfg.clone() };
+        assert_eq!(g.retrieve_context(&["cortisol".to_string()], None, &tight).unwrap().edges.len(), 1);
+    }
+
+    #[test]
+    fn test_retrieve_context_lexical_fallback_without_vectors() {
+        let g = in_memory_graph();
+        g.insert_node(&Node::new("fenix_flow", "concept", "Fénix Flow ERP")).unwrap();
+        g.insert_node(&Node::new("postgres", "concept", "PostgreSQL")).unwrap();
+        g.insert_edge("fenix_flow", "usa", "postgres", 0.8).unwrap();
+
+        let ctx = g.retrieve_context(&["Fénix".to_string()], None, &RetrievalConfig::default()).unwrap();
+        assert_eq!(ctx.seeds, [("fenix_flow".to_string(), LEXICAL_SEED_SCORE)]);
+        assert_eq!(ctx.edges.len(), 1);
+    }
+
+    #[test]
+    fn test_reinforce_edges_batch() {
+        let g = in_memory_graph();
+        for id in ["a", "b", "c"] {
+            g.insert_node(&Node::new(id, "concept", id)).unwrap();
+        }
+        let ab = g.insert_edge("a", "r", "b", 0.5).unwrap();
+        let bc = g.insert_edge("b", "r", "c", 0.95).unwrap();
+        g.conn_execute_for_test("UPDATE edges SET last_accessed = 0", []).unwrap();
+
+        let n = g.reinforce_edges(&[ab.clone(), bc.clone(), "fantasma".into()], 0.1).unwrap();
+
+        assert_eq!(n, 2, "los ids inexistentes se ignoran");
+        assert!((weight_of(&g, "a", "b") - 0.6).abs() < 1e-9);
+        assert_eq!(weight_of(&g, "b", "c"), 1.0, "techo en 1.0");
+        assert_eq!(g.conn_query_row_for_test("SELECT COUNT(*) FROM edges WHERE last_accessed = 0").unwrap(), 0,
+            "el refuerzo reinicia el reloj del olvido");
+    }
+
+    /// Calibración de `RetrievalConfig::min_similarity` con el modelo real.
+    /// Descarga el modelo la primera vez (~120 MB). Ejecutar con:
+    ///   cargo test --release fastembed_calibration -- --ignored --nocapture
+    #[cfg(feature = "embeddings")]
+    #[test]
+    #[ignore]
+    fn fastembed_calibration() {
+        let model = FastEmbedBackend::new().expect("modelo de embeddings");
+        let pairs = [
+            ("implantes médicos", "prótesis dentales"),
+            ("titanio", "metal ligero"),
+            ("fénix flow", "Fénix Flow ERP"),
+            ("estrés", "Cortisol"),
+            ("cortisol", "hormona del estrés"),
+            ("lenguaje de programación", "Rust"),
+            ("inventario", "stock disponible"),
+            ("titanio", "receta de cocina"),
+            ("Rust", "Snapdragon 8 Gen 3"),
+            ("memoria", "tiempos de inicio"),
+        ];
+        for (a, b) in pairs {
+            let v = model.embed(&[a, b]).unwrap();
+            println!("{:>28} ↔ {:<28} {:.3}", a, b, cosine_similarity(&v[0], &v[1]));
+        }
+    }
+
+    #[test]
+    fn test_decay_does_not_double_count_elapsed_time() {
+        let g = in_memory_graph();
+        g.insert_node(&Node::new("a", "concept", "a")).unwrap();
+        g.insert_node(&Node::new("b", "concept", "b")).unwrap();
+        g.insert_edge("a", "r", "b", 1.0).unwrap();
+        // Último acceso hace 1000 s; λ = 0.001/s → e^-1 ≈ 0.368 tras la 1.ª pasada.
+        let past = current_unix_ts() - 1000;
+        g.conn_execute_for_test("UPDATE edges SET last_accessed = ?1", [past]).unwrap();
+
+        g.apply_decay_and_prune(0.001, 0.01).unwrap();
+        let first = weight_of(&g, "a", "b");
+        assert!((first - (-1.0f64).exp()).abs() < 0.01, "1.ª pasada: {first}");
+
+        // 2.ª pasada inmediata: no ha pasado tiempo desde la anterior. Antes
+        // del Paso 22 volvía a aplicar e^-1 (≈ 0.135).
+        g.apply_decay_and_prune(0.001, 0.01).unwrap();
+        let second = weight_of(&g, "a", "b");
+        assert!((second - first).abs() < 0.01, "2.ª pasada: {first} → {second}");
     }
 }

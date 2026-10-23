@@ -1823,6 +1823,14 @@ async function sendChat(text) {
           finished = true;
           const end = performance.now();
           const parts = [`TTFT ${tFirst ? secs(tFirst) : '—'}`, `total ${secs(end)}`, intent === 'learn' ? 'asimilación' : 'consulta'];
+          // Paso 22: desglose del servidor y refuerzo hebbiano.
+          if (p.timings) parts.push(`plan ${p.timings.plan_ms} ms`);
+          if (p.tool) parts.push(`herramienta ${p.tool}`);
+          if (p.reinforced_edges) {
+            parts.push(`+${p.reinforced_edges} conexiones reforzadas`);
+            logLocal('graph', `Refuerzo hebbiano: ${p.reinforced_edges} conexión(es) usada(s) en la respuesta`);
+            scheduleGraph();
+          }
           if (bubble) { bubble.update(raw, false); bubble.meta(parts); }
           if (card) card.meta(parts);
         }

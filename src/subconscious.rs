@@ -36,9 +36,10 @@
 // ============================================================
 
 use serde::Deserialize;
+use std::collections::HashMap;
 
-use crate::llm_bridge::{BridgeError, ExtractedTriple, LlmBackend};
-use crate::memory_graph::{GraphAccess, MemoryGraph, TraversalDirection};
+use crate::llm_bridge::{node_name, BridgeError, ExtractedTriple, LlmBackend};
+use crate::memory_graph::{embed_texts, GraphAccess, MemoryGraph, TraversalDirection};
 use crate::prompts;
 use crate::truth_filter::{EpistemicValidator, SearchBackend, ValidationStatus};
 use crate::types::Node;
@@ -225,11 +226,11 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         // ── FASE 1: Lectura ──────────────────────────────────────────────────
         // PASO A: Encontrar un par de nodos con vacío de conocimiento, y un
         // contexto breve de cada nodo para enriquecer el prompt.
-        let (node_a, node_b, ctx_a, ctx_b) = graph.with_graph(|g| {
+        let (node_a, node_b, ctx_a, ctx_b, embedder) = graph.with_graph(|g| {
             let (a, b) = self.find_knowledge_gap(g)?;
             let ctx_a = self.summarize_neighbors(g, &a);
             let ctx_b = self.summarize_neighbors(g, &b);
-            Ok::<_, CuriosityError>((a, b, ctx_a, ctx_b))
+            Ok::<_, CuriosityError>((a, b, ctx_a, ctx_b, g.embedding_backend()))
         })?;
         self.log(&format!("Vacío detectado: «{}» ↔ «{}»", node_a, node_b));
 
@@ -298,9 +299,18 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         // PASO E (cont.): Extraer tripletas de las fuentes.
         let raw_triples = self.synthesize_triples(&node_a, &node_b, &sources)?;
 
+        // Paso 22: embeddings de los conceptos nuevos, aún sin lock.
+        let mut names: Vec<String> = raw_triples
+            .iter()
+            .flat_map(|t| [node_name(&t.subject), node_name(&t.object)])
+            .collect();
+        names.sort();
+        names.dedup();
+        let vectors = embed_texts(embedder.as_ref(), &names);
+
         // ── FASE 3: Consolidación ────────────────────────────────────────────
         let consolidated = graph.with_graph(|g| {
-            self.consolidate(g, &raw_triples, validation.confidence)
+            self.consolidate(g, &raw_triples, validation.confidence, &vectors)
         });
 
         if consolidated.is_empty() {
@@ -472,7 +482,14 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
         graph:      &MemoryGraph,
         triples:    &[ExtractedTriple],
         confidence: f64,
+        vectors:    &HashMap<String, Vec<f32>>,
     ) -> Vec<String> {
+        let concept = |id: &str| {
+            let name = node_name(id);
+            let mut node = Node::new(id, "concept", &name);
+            node.embedding = vectors.get(&name).cloned();
+            node
+        };
         let mut consolidated = Vec::new();
 
         for triple in triples {
@@ -488,14 +505,8 @@ impl<L: LlmBackend + Clone, S: SearchBackend + Clone> CuriosityEngine<L, S> {
             }
 
             // Insertar nodos si no existen (idempotente: MemoryGraph ignora duplicados).
-            let _ = graph.insert_node(&Node::new(
-                &triple.subject, "concept",
-                &triple.subject.replace('_', " "),
-            ));
-            let _ = graph.insert_node(&Node::new(
-                &triple.object, "concept",
-                &triple.object.replace('_', " "),
-            ));
+            let _ = graph.insert_node(&concept(&triple.subject));
+            let _ = graph.insert_node(&concept(&triple.object));
 
             // Peso ajustado por la confianza del validador.
             let final_weight = triple.weight * confidence;

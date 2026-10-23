@@ -178,6 +178,18 @@ impl<L: LlmBackend> LlmBackend for BackgroundLlm<L> {
         self.inner.complete(system_prompt, user_prompt, max_tokens, temperature)
     }
 
+    fn complete_json(
+        &self,
+        system_prompt: &str,
+        user_prompt:   &str,
+        schema:        &serde_json::Value,
+        max_tokens:    i32,
+        temperature:   f32,
+    ) -> Result<String, BridgeError> {
+        self.yield_to_foreground();
+        self.inner.complete_json(system_prompt, user_prompt, schema, max_tokens, temperature)
+    }
+
     fn stream_synthesis(
         &self,
         system_prompt: &str,

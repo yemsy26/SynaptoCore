@@ -38,7 +38,9 @@ authors     = ["SynaptoCore Team"]
 # ══════════════════════════════════════════════════════════════════
 
 [features]
-default = []
+# Paso 22: la memoria semántica es parte del producto, no un extra opcional.
+# Para builds ligeros (CI sin red): cargo test --no-default-features
+default = ["embeddings"]
 # Habilita aceleración NVIDIA CUDA. Requiere CUDA Toolkit en PATH.
 cuda    = ["llama-backend", "llama-cpp-4/cuda"]
 # Habilita aceleración Vulkan (alternativa sin CUDA Toolkit).
@@ -47,10 +49,9 @@ vulkan  = ["llama-backend", "llama-cpp-4/vulkan"]
 # o manualmente para CPU: --features llama-backend
 llama-backend = ["dep:llama-cpp-4"]
 # Paso 12 — Búsqueda semántica vectorial (fastembed + ONNX Runtime).
-# Sin esta feature: semantic_search() hace fallback limpio a LIKE search.
-# Los 159 tests pasan SIN esta feature (cero descargas de red en CI).
-# Activar producción: cargo run --release --features embeddings
-embeddings = ["dep:fastembed"]
+# Sin esta feature: la recuperación de contexto hace fallback léxico (LIKE).
+# Los tests usan MockEmbeddingBackend: nunca descargan el modelo.
+embeddings = ["dep:fastembed", "dep:hf-hub"]
 
 [dependencies]
 # ── Paso 1: Memory Graph ──────────────────────────────────────────
@@ -105,7 +106,17 @@ urlencoding = "2.1"
 # `optional = true` → solo se compila con --features embeddings.
 # El modelo por defecto (BGE-Small-EN-v1.5, ~25MB) se descarga de HuggingFace
 # en el primer uso. Subsiguientes usos usan caché en disco (~/.cache/fastembed).
-fastembed = { version = "4", default-features = false, optional = true }
+# Paso 22: con `default-features = false` faltaban los binarios de ONNX Runtime
+# (fallo de enlazado) y la descarga del modelo (hf-hub), así que la feature
+# nunca llegó a funcionar. `ort-download-binaries` baja ONNX Runtime en build;
+# `hf-hub-rustls-tls` descarga el modelo con rustls (coherente con reqwest:
+# ninguna DLL de OpenSSL en Windows).
+fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"], optional = true }
+# hf-hub: misma versión que usa fastembed por dentro (sin compilación extra).
+# Lo usamos directamente para bajar la variante cuantizada de Xenova del modelo
+# multilingüe: la cuantizada que trae fastembed (Qdrant, "optimized") falla en
+# inferencia con este ONNX Runtime (SkipLayerNormalization: "Missing Input").
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
 
 # ── Paso 11: CLI Periférica (sc) ─────────────────────────────────────────────
 # clap: parser de argumentos estándar de facto en Rust.

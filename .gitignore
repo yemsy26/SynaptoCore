@@ -5,3 +5,6 @@
 
 # Memoria en uso: estado de ejecución, no código
 synaptocore_memory.db*
+
+# Modelo de embeddings descargado por fastembed (Paso 22)
+.fastembed_cache/

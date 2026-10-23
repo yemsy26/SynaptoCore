@@ -52,6 +52,7 @@ use axum::{
 };
 use axum::response::sse::{Event, KeepAlive, Sse};
 use std::convert::Infallible;
+use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -424,15 +425,19 @@ pub async fn handle_query(
 
 /// POST /api/v1/chat y POST /api/v1/query_stream — Endpoint Unificado con Enrutamiento de Intención y Streaming SSE (Paso 20).
 ///
-/// Flujo:
+/// Flujo (Paso 22 — dos llamadas al LLM por consulta, en vez de 3-6):
 /// 1. Validación temprana del prompt.
-/// 2. Clasificación semántica de intención en spawn_blocking: Intent::Learn vs Intent::Query.
+/// 2. Planificador (1 llamada): intención, reescritura con el historial,
+///    entidades y herramienta, todo en un JSON restringido por esquema.
 /// 3. Si Intent::Learn:
 ///    - Extrae tripletas y las asimila en el grafo de memoria (SQLite).
 ///    - Emite un mensaje estructurado de confirmación SSE y persiste el turno en SessionManager.
 /// 4. Si Intent::Query:
-///    - Prepara el contexto cognitivo (correferencia, ReAct, grafo) y emite tokens en tiempo real vía SSE.
-///    - Persiste el turno completo en SessionManager al finalizar el stream.
+///    - Herramienta (si el plan la pide) + contexto semántico del grafo, sin LLM.
+///    - Síntesis en streaming (2.ª llamada); tokens en tiempo real vía SSE.
+///    - Al completarse: refuerzo hebbiano de las aristas usadas como contexto
+///      y persistencia del turno en SessionManager.
+/// El evento final (`done`) incluye `timings`, `tool` y `reinforced_edges`.
 pub async fn handle_query_stream(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
@@ -454,34 +459,60 @@ pub async fn handle_query_stream(
     let history_text = format_history_as_text(&history);
 
     let graph_arc = Arc::clone(&state.graph);
+    let graph_for_hebb = Arc::clone(&state.graph);
     let llm_arc = Arc::clone(&state.llm);
     let registry_arc = Arc::clone(&state.tool_registry);
     let prompt_for_bridge = req.prompt.clone();
     let prompt_for_history = req.prompt.clone();
 
+    /// Tiempos del servidor antes del primer token (Paso 22, observabilidad).
+    struct Timings {
+        plan_ms:    u128,
+        prepare_ms: u128,
+    }
+
     enum RoutedStream {
-        Learn(ExtractionResult),
-        Query(crate::llm_bridge::BoxedTokenStream),
+        Learn(ExtractionResult, Timings),
+        Query {
+            tokens:           crate::llm_bridge::BoxedTokenStream,
+            context_edge_ids: Vec<String>,
+            tool:             Option<String>,
+            timings:          Timings,
+        },
     }
 
     let routed_result = tokio::task::spawn_blocking(move || -> Result<RoutedStream, ApiError> {
-        // Paso 21: sin lock aquí. Clasificación, extracción y bucle ReAct son
-        // inferencia pura; el bridge bloquea el grafo solo para leer o escribir.
+        // Paso 21: sin lock aquí. Planificador, herramienta y extracción son
+        // inferencia o red; el bridge bloquea el grafo solo para leer o escribir.
         let graph = &*graph_arc;
         let bridge = NeuralBridge::new(Arc::clone(&llm_arc))
             .with_tools(registry_arc);
 
-        let intent = bridge.route_intent(&prompt_for_bridge);
-        match intent {
+        // Paso 22: UNA llamada decide intención, reescritura, entidades y herramienta.
+        let t_plan = Instant::now();
+        let plan = bridge.plan(&prompt_for_bridge, &history_text);
+        let plan_ms = t_plan.elapsed().as_millis();
+
+        let t_prepare = Instant::now();
+        match plan.intent {
             Intent::Learn => {
-                let extract_res = bridge.extract_and_memorize(graph, &prompt_for_bridge)
+                // La reescritura del plan resuelve referencias ("su capital es
+                // París" → "la capital de Francia es París") antes de extraer.
+                let extract_res = bridge.extract_and_memorize(graph, &plan.rewritten_query)
                     .map_err(ApiError::from)?;
-                Ok(RoutedStream::Learn(extract_res))
+                let timings = Timings { plan_ms, prepare_ms: t_prepare.elapsed().as_millis() };
+                Ok(RoutedStream::Learn(extract_res, timings))
             }
             Intent::Query => {
-                let token_stream = bridge.query_with_memory_stream(graph, &prompt_for_bridge, &history_text)
-                    .map_err(ApiError::from)?;
-                Ok(RoutedStream::Query(token_stream))
+                let prepared = bridge.prepare_answer(graph, &plan).map_err(ApiError::from)?;
+                let timings = Timings { plan_ms, prepare_ms: t_prepare.elapsed().as_millis() };
+                let tokens = bridge.answer_stream(&prepared).map_err(ApiError::from)?;
+                Ok(RoutedStream::Query {
+                    tokens,
+                    context_edge_ids: prepared.context_edge_ids,
+                    tool: plan.tool.map(|t| t.name),
+                    timings,
+                })
             }
         }
     }).await.map_err(|e| ApiError::internal(format!("Join error: {e}")))?;
@@ -493,7 +524,7 @@ pub async fn handle_query_stream(
     let sse_stream = async_stream::stream! {
         let _fg = fg;
         match routed {
-            RoutedStream::Learn(res) => {
+            RoutedStream::Learn(res, timings) => {
                 let summary_triples = res.triples
                     .iter()
                     .take(5)
@@ -531,11 +562,12 @@ pub async fn handle_query_stream(
                     "token": "",
                     "session_id": sid,
                     "done": true,
-                    "intent": "learn"
+                    "intent": "learn",
+                    "timings": { "plan_ms": timings.plan_ms, "extract_ms": timings.prepare_ms }
                 }).to_string();
                 yield Ok(Event::default().data(done_payload));
             }
-            RoutedStream::Query(mut token_stream) => {
+            RoutedStream::Query { tokens: mut token_stream, context_edge_ids, tool, timings } => {
                 use futures_util::StreamExt;
                 let mut full_response = String::new();
 
@@ -564,6 +596,12 @@ pub async fn handle_query_stream(
                     }
                 }
 
+                // Paso 22: refuerzo hebbiano. Solo aquí, con la respuesta
+                // completada: un stream con error o cortado no refuerza nada.
+                let reinforced = tokio::task::spawn_blocking(move || {
+                    crate::llm_bridge::reinforce_context(&*graph_for_hebb, &context_edge_ids)
+                }).await.unwrap_or(0);
+
                 // Persistir en memoria de trabajo (Paso 13)
                 sessions.push(&sid, ChatMessage::user(&prompt_for_history));
                 sessions.push(&sid, ChatMessage::assistant(&full_response));
@@ -572,7 +610,10 @@ pub async fn handle_query_stream(
                     "token": "",
                     "session_id": sid,
                     "done": true,
-                    "intent": "query"
+                    "intent": "query",
+                    "tool": tool,
+                    "reinforced_edges": reinforced,
+                    "timings": { "plan_ms": timings.plan_ms, "context_ms": timings.prepare_ms }
                 }).to_string();
                 yield Ok(Event::default().data(done_payload));
             }
@@ -884,6 +925,12 @@ mod tests {
     use crate::memory_graph::MemoryGraph;
     use crate::types::Node;
 
+    /// Respuestas del planificador (Paso 22) para los mocks.
+    const PLAN_QUERY_RUST: &str =
+        r#"{"i":"query","q":"¿Qué es Rust?","e":["rust"],"t":"none","p":{}}"#;
+    const PLAN_LEARN_TITANIO: &str =
+        r#"{"i":"learn","q":"El titanio es un metal ultrarresistente.","e":["titanio"],"t":"none","p":{}}"#;
+
     // ── Helpers ─────────────────────────────────────────────
 
     /// Crea un backend LLM mock type-erased para AppState.
@@ -1011,12 +1058,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_returns_response_field() {
-        // query_with_memory hace 2 llamadas LLM:
-        //   [0] identificación de entidad → JSON {"entity": "rust"}
+        // query_with_memory hace 2 llamadas LLM (Paso 22):
+        //   [0] planificador → JSON del plan
         //   [1] respuesta final → texto libre
         let app = test_router_with_nodes(
             vec![
-                r#"{"entity": "rust"}"#,
+                PLAN_QUERY_RUST,
                 "Rust es un lenguaje de programación de sistemas.",
             ],
             &[("rust", "concept", "Rust")],
@@ -1062,12 +1109,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_unified_chat_routes_to_learn_and_updates_graph() {
-        // Respuesta 1: clasificador de intención -> LEARN
+        // Respuesta 1: planificador -> intent "learn"
         // Respuesta 2: extracción de tripletas -> JSON con triples
         let triples_json = r#"{"triples": [
             {"subject": "titanio", "relation": "es", "object": "metal", "weight": 0.95}
         ]}"#;
-        let app = test_router(vec!["LEARN", triples_json]);
+        let app = test_router(vec![PLAN_LEARN_TITANIO, triples_json]);
 
         let (status, body) = send(
             app,
@@ -1088,12 +1135,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_unified_chat_routes_to_query_stream() {
-        // Prompt con signo de interrogación -> heurística rápida lo clasifica como QUERY directamente.
-        // Respuesta 1: entidad ("rust")
+        // Respuesta 1: planificador -> intent "query", entidad "rust"
         // Respuesta 2: síntesis de respuesta
         let app = test_router_with_nodes(
             vec![
-                r#"{"entity": "rust"}"#,
+                PLAN_QUERY_RUST,
                 "Rust es un lenguaje compilado veloz y seguro.",
             ],
             &[("rust", "concept", "Rust")],
@@ -1130,10 +1176,10 @@ mod tests {
     #[tokio::test]
     async fn test_query_session_id_preserved_across_turns() {
         // Paso 13: el session_id enviado en el request debe devolverse igual.
-        // Primer turno: sin historial → 2 llamadas LLM (entity + synthesis).
+        // 2 llamadas LLM: planificador + síntesis.
         let app = test_router_with_nodes(
             vec![
-                "rust",                                      // entity extraction
+                PLAN_QUERY_RUST,                             // planificador
                 "Rust es un lenguaje de sistemas.",          // synthesis
             ],
             &[("rust", "concept", "Rust")],
@@ -1156,7 +1202,7 @@ mod tests {
     async fn test_query_generates_session_id_when_absent() {
         // Sin session_id en el request → el servidor genera uno nuevo.
         let app = test_router_with_nodes(
-            vec!["rust", "Rust es un lenguaje de sistemas."],
+            vec![PLAN_QUERY_RUST, "Rust es un lenguaje de sistemas."],
             &[("rust", "concept", "Rust")],
         );
         let (status, body) = send(
@@ -1176,7 +1222,7 @@ mod tests {
     async fn test_query_stream_returns_sse_and_persists_session() {
         let app = test_router_with_nodes(
             vec![
-                r#"{"entity": "rust"}"#,
+                PLAN_QUERY_RUST,
                 "Rust es un lenguaje compilado rÃ¡pido.",
             ],
             &[("rust", "concept", "Rust")],
@@ -1328,6 +1374,42 @@ mod tests {
         assert_eq!(neighbors[0]["target_id"],   "b");
         assert_eq!(neighbors[0]["target_name"], "Nodo B");
         assert!((neighbors[0]["weight"].as_f64().unwrap() - 0.75).abs() < 1e-9);
+    }
+
+    // ── Paso 22: refuerzo hebbiano extremo a extremo ─────────
+
+    #[tokio::test]
+    async fn test_chat_stream_reinforces_context_edges_on_completion() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        {
+            let g = graph.lock().unwrap();
+            g.insert_node(&Node::new("rust", "concept", "Rust")).unwrap();
+            g.insert_node(&Node::new("wasm", "concept", "WebAssembly")).unwrap();
+            g.insert_edge("rust", "compila_a", "wasm", 0.5).unwrap();
+        }
+        let state = AppState {
+            graph:         Arc::clone(&graph),
+            llm:           mock_llm(vec![PLAN_QUERY_RUST, "Rust compila a WebAssembly."]),
+            agent_id:      "test".to_string(),
+            events_tx:     dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+        };
+
+        let (status, body) = send(
+            build_router(state),
+            post_json("/api/v1/chat", r#"{"prompt": "¿Qué es Rust?"}"#),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(r#""reinforced_edges":1"#), "evento final: {text}");
+        assert!(text.contains(r#""plan_ms""#));
+
+        let g = graph.lock().unwrap();
+        let weight = g.get_neighbors("rust", TraversalDirection::Outgoing).unwrap().neighbors[0].0.weight;
+        assert!((weight - 0.6).abs() < 1e-9, "0.5 + HEBBIAN_DELTA, obtuvo {weight}");
     }
 
     // ── Tests: POST /api/v1/federation/export ───────────────
