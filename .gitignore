@@ -8,3 +8,6 @@ synaptocore_memory.db*
 
 # Modelo de embeddings descargado por fastembed (Paso 22)
 .fastembed_cache/
+
+# Conectores de esta instalación (la plantilla versionada es conectores.example.json)
+conectores.json

@@ -15,16 +15,17 @@
 //   Paso 13: Lóbulo Frontal (SessionManager + Correferencia)
 //   Paso 14: Córtex Motor (Tool Use — ReAct pattern)
 //   Paso 15: Orquestador Multi-Paso (ReAct Loop + Scratchpad)
-//   Paso 16: Integración Empresarial (Fénix Flow Tools)
+//   Paso 16: Integración Empresarial (desde el Paso 25: conectores.json)
 //   Paso 17: El Despertar (Optimización Release + Entorno)
 //   Paso 21: Concurrencia Cognitiva (locks breves + prioridad del usuario)
+//   Paso 25: Conectores externos por configuración (cualquier sistema HTTP)
 // ============================================================
 #![allow(dead_code)]
 
 mod api_server;
+mod connectors;
 mod error;
 mod federated_memory;
-mod fenix_tools;
 mod forgetting_curve;
 mod llm_bridge;
 mod memory_graph;
@@ -49,7 +50,6 @@ use truth_filter::{BoxedSearch, MockSearchBackend, SearxngBackend};
 use forgetting_curve::{ForgettingConfig, ForgettingCurve};
 use subconscious::{CuriosityEngine, CuriosityError, CycleBackoff};
 use api_server::{build_router, AppState, SubconsciousEvent};
-use fenix_tools::{ClientTool, InventoryTool};
 use tools::{TimeTool, ToolRegistry, WebhookTool};
 use types::Node;
 use working_memory::SessionManager;
@@ -262,16 +262,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (events_tx, _events_rx_dummy) = tokio::sync::broadcast::channel::<String>(128);
 
     // Paso 14: registro de herramientas para el ciclo ReAct.
-    // Paso 16: herramientas empresariales Fénix Flow (InventoryTool, ClientTool).
-    // TimeTool:      fecha/hora del sistema (sin deps externos).
-    // WebhookTool:   GET HTTP a sistemas externos (Fénix Flow, ERPs, APIs).
-    // InventoryTool: consulta de stock y precios en el ERP Fénix Flow.
-    // ClientTool:    historial y datos de clientes en el ERP Fénix Flow.
+    // TimeTool:    fecha/hora del sistema (sin deps externos).
+    // WebhookTool: GET HTTP a una URL.
+    // Paso 25: los sistemas externos (ERP, CRM, motores de cálculo…) se
+    // declaran en conectores.json; el núcleo no depende de ninguno.
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(TimeTool);
     tool_registry.register(WebhookTool);
-    tool_registry.register(InventoryTool);
-    tool_registry.register(ClientTool);
+    for connector in tokio::task::spawn_blocking(load_declared_connectors).await? {
+        tool_registry.register(connector);
+    }
     let tool_registry = Arc::new(tool_registry);
 
     // Paso 21: árbitro entre el usuario (primer plano) y el subconsciente (fondo).
@@ -547,6 +547,33 @@ async fn attach_embeddings(graph: MemoryGraph) -> MemoryGraph {
 async fn attach_embeddings(graph: MemoryGraph) -> MemoryGraph {
     println!("ℹ Compilado sin la feature 'embeddings': recuperación léxica (LIKE)\n");
     graph
+}
+
+/// Conectores declarados en `SYNAPTOCORE_CONNECTORS` (por defecto
+/// `./conectores.json`) (Paso 25). Sin archivo, ninguno. Bloqueante: cada
+/// conector construye un cliente `reqwest::blocking`.
+fn load_declared_connectors() -> Vec<connectors::HttpConnector> {
+    let explicit = std::env::var(connectors::CONNECTORS_ENV).ok();
+    let path = std::path::PathBuf::from(explicit.as_deref().unwrap_or(connectors::DEFAULT_CONNECTORS_PATH));
+    if explicit.is_none() && !path.exists() {
+        println!("ℹ Sin conectores externos (crea {} a partir de conectores.example.json)\n", path.display());
+        return Vec::new();
+    }
+    match connectors::load_connectors(&path) {
+        Ok((loaded, skipped)) => {
+            let names: Vec<&str> = loaded.iter().map(|c| tools::Tool::name(c)).collect();
+            println!("✓ Conectores externos: {} [{}]", loaded.len(), names.join(", "));
+            for reason in skipped {
+                println!("  ⚠ Conector omitido: {reason}");
+            }
+            println!();
+            loaded
+        }
+        Err(e) => {
+            println!("⚠ Conectores no cargados: {e}\n");
+            Vec::new()
+        }
+    }
 }
 
 /// Huella barata del grafo (nodos, aristas) para que el bucle subconsciente

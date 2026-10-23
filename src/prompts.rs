@@ -66,8 +66,17 @@ Salida: {"triples": [{"subject": "estres_cronico", "relation": "eleva", "object"
 /// El formato del contexto es texto plano (no JSON) porque los modelos
 /// pequeños razonan mejor sobre prosa que sobre estructuras de datos
 /// en el prompt de síntesis.
-pub fn synthesis_system_prompt() -> &'static str {
-    r#"Eres un asistente cognitivo. Tienes acceso a una base de conocimiento verificada que se te proporciona como contexto. Responde la pregunta del usuario ÚNICAMENTE basándote en la información del contexto. Si el contexto no contiene información suficiente, dilo explícitamente. No inventes hechos."#
+///
+/// Paso 25: los conectores devuelven el JSON tal cual del sistema externo.
+/// Con el prompt genérico de "base verificada" el 2B desconfiaba de esos
+/// datos («no se puede determinar» con `"stock": 7` delante), así que se
+/// dice explícitamente que son actuales y que se responda con sus valores.
+pub fn tool_answer_system_prompt() -> &'static str {
+    "Eres SynaptoCore, un asistente con memoria a largo plazo. En «Datos del sistema conectado» está la \
+respuesta actual del sistema que se consultó para esta pregunta: son datos reales y vigentes. Responde \
+la pregunta directamente con esos valores (cifras, nombres, estados), en el idioma de la pregunta, de \
+forma clara y breve. Usa la memoria solo si añade algo. Si los datos son un error o no contienen lo que \
+se pregunta, dilo claramente. No inventes datos."
 }
 
 /// Formatea el contexto de vecinos del grafo para inyección en el prompt.
@@ -313,10 +322,10 @@ r#"Eres el planificador de SynaptoCore. Analiza el último mensaje del usuario y
 {{"i":"query" | "learn","q":"...","e":["..."],"t":"none" | "NombreHerramienta","p":{{...}}}}
 
 CAMPOS:
-1. "i" (intención): por defecto "query". Usa "learn" SOLO si el mensaje afirma un hecho nuevo ("Rust es un lenguaje compilado", "Fénix Flow usa PostgreSQL") o pide memorizar algo ("Memoriza que la sucursal abre a las 9"). Preguntas (aunque no lleven signos), peticiones ("Explícame…", "Háblame de…", "Dime…", "Cuéntame…"), saludos y conversación son SIEMPRE "query". Si dudas, "query".
+1. "i" (intención): por defecto "query". Usa "learn" SOLO si el mensaje afirma un hecho nuevo ("Rust es un lenguaje compilado", "PostgreSQL usa MVCC") o pide memorizar algo ("Memoriza que la sucursal abre a las 9"). Preguntas (aunque no lleven signos), peticiones ("Explícame…", "Háblame de…", "Dime…", "Cuéntame…"), saludos y conversación son SIEMPRE "query". Si dudas, "query".
 2. "q" (consulta reescrita): el mensaje reescrito de forma autocontenida, sustituyendo pronombres, referencias ("eso", "ese producto") o el sujeto omitido ("Y cómo afecta al sueño") por lo que indique el historial. Si ya es autocontenido, cópialo igual. Mismo idioma.
-3. "e" (entidades): de 1 a 4 conceptos clave del mensaje, en minúsculas y sin artículos ("fénix flow", "cortisol", "inteligencia artificial"). Lista vacía si no hay ninguno (por ejemplo, un saludo).
-4. "t" (herramienta): usa una herramienta SOLO si piden datos en tiempo real: precios, stock de inventario, facturación, datos de clientes o fecha/hora actual. Para conocimiento general responde "none".
+3. "e" (entidades): de 1 a 4 conceptos clave del mensaje, en minúsculas y sin artículos ("postgresql", "cortisol", "inteligencia artificial"). Lista vacía si no hay ninguno (por ejemplo, un saludo).
+4. "t" (herramienta): usa una herramienta SOLO si la pregunta pide datos que esa herramienta proporciona según su descripción (datos en tiempo real, de un sistema conectado, fecha/hora actual). Para conocimiento general responde "none".
 5. "p" (parámetros): parámetros de la herramienta según su esquema, o {{}} si "t" es "none".
 
 HERRAMIENTAS DISPONIBLES:
@@ -332,12 +341,12 @@ Mensaje: "El titanio es un metal ligero usado en implantes."
 {{"i":"learn","q":"El titanio es un metal ligero usado en implantes.","e":["titanio","implantes"],"t":"none","p":{{}}}}
 
 Historial: (vacío)
-Mensaje: "Explícame qué hace Fénix Flow"
-{{"i":"query","q":"Explícame qué hace Fénix Flow","e":["fénix flow"],"t":"none","p":{{}}}}
+Mensaje: "Explícame qué hace Kubernetes"
+{{"i":"query","q":"Explícame qué hace Kubernetes","e":["kubernetes"],"t":"none","p":{{}}}}
 
-Historial: User: ¿Qué es Fénix Flow? / Assistant: Un ERP de facturación.
+Historial: User: ¿Qué es PostgreSQL? / Assistant: Una base de datos relacional.
 Mensaje: "¿En qué lenguaje está hecho?"
-{{"i":"query","q":"¿En qué lenguaje está hecho Fénix Flow?","e":["fénix flow","lenguaje de programación"],"t":"none","p":{{}}}}
+{{"i":"query","q":"¿En qué lenguaje está hecho PostgreSQL?","e":["postgresql","lenguaje de programación"],"t":"none","p":{{}}}}
 
 Historial: (vacío)
 Mensaje: "Hola, buenos días"
@@ -615,17 +624,17 @@ mod tests {
         assert!(empty.contains("(vacío)"));
         assert!(empty.contains("Mensaje: \"¿Qué es Rust?\""));
 
-        let with = format_planner_user_prompt("User: ¿Qué es Fénix Flow?", "¿Y su precio?");
-        assert!(with.contains("Fénix Flow"));
+        let with = format_planner_user_prompt("User: ¿Qué es PostgreSQL?", "¿Y su licencia?");
+        assert!(with.contains("PostgreSQL"));
         assert!(!with.contains("(vacío)"));
     }
 
     #[test]
     fn test_planner_schema_restricts_tools_and_requires_fields() {
-        let s = planner_json_schema(&["InventoryTool", "TimeTool"]);
+        let s = planner_json_schema(&["Inventario", "TimeTool"]);
         let tools: Vec<&str> = s["properties"]["t"]["enum"]
             .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(tools, ["none", "InventoryTool", "TimeTool"]);
+        assert_eq!(tools, ["none", "Inventario", "TimeTool"]);
         assert_eq!(s["required"], serde_json::json!(["i", "q", "e", "t", "p"]));
         assert_eq!(s["properties"]["i"]["enum"], serde_json::json!(["query", "learn"]));
     }

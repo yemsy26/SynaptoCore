@@ -346,7 +346,7 @@ pub struct RetrievalConfig {
 impl Default for RetrievalConfig {
     /// `min_similarity` calibrado con el modelo de producción
     /// (`fastembed_calibration`): pares relacionados 0.49-0.67 ("inventario ↔
-    /// stock disponible" 0.49, "fénix flow ↔ Fénix Flow ERP" 0.67), no
+    /// stock disponible" 0.49, "implantes médicos ↔ prótesis dentales" 0.54), no
     /// relacionados 0.13-0.23. 0.40 prioriza precisión: a un modelo de 2B le
     /// perjudica más el contexto irrelevante que el ausente.
     fn default() -> Self {
@@ -2461,12 +2461,12 @@ mod tests {
     #[test]
     fn test_retrieve_context_lexical_fallback_without_vectors() {
         let g = in_memory_graph();
-        g.insert_node(&Node::new("fenix_flow", "concept", "Fénix Flow ERP")).unwrap();
+        g.insert_node(&Node::new("odoo_erp", "concept", "Odoo ERP")).unwrap();
         g.insert_node(&Node::new("postgres", "concept", "PostgreSQL")).unwrap();
-        g.insert_edge("fenix_flow", "usa", "postgres", 0.8).unwrap();
+        g.insert_edge("odoo_erp", "usa", "postgres", 0.8).unwrap();
 
-        let ctx = g.retrieve_context(&["Fénix".to_string()], None, &RetrievalConfig::default()).unwrap();
-        assert_eq!(ctx.seeds, [("fenix_flow".to_string(), LEXICAL_SEED_SCORE)]);
+        let ctx = g.retrieve_context(&["Odoo".to_string()], None, &RetrievalConfig::default()).unwrap();
+        assert_eq!(ctx.seeds, [("odoo_erp".to_string(), LEXICAL_SEED_SCORE)]);
         assert_eq!(ctx.edges.len(), 1);
     }
 
@@ -2500,7 +2500,6 @@ mod tests {
         let pairs = [
             ("implantes médicos", "prótesis dentales"),
             ("titanio", "metal ligero"),
-            ("fénix flow", "Fénix Flow ERP"),
             ("estrés", "Cortisol"),
             ("cortisol", "hormona del estrés"),
             ("lenguaje de programación", "Rust"),
@@ -2573,11 +2572,11 @@ mod tests {
     fn test_resolve_node_id_by_canonical_form() {
         let g = in_memory_graph();
         g.insert_node(&Node::new("diagramas de clases", "concept", "diagramas de clases")).unwrap();
-        g.insert_node(&Node::new("fenix_flow", "concept", "Fénix Flow")).unwrap();
+        g.insert_node(&Node::new("cafe_de_olla", "concept", "Café de olla")).unwrap();
 
         assert_eq!(g.resolve_node_id("diagramas de clases").unwrap().as_deref(), Some("diagramas de clases"));
         assert_eq!(g.resolve_node_id("Diagramas_de_Clases").unwrap().as_deref(), Some("diagramas de clases"));
-        assert_eq!(g.resolve_node_id("Fénix Flow").unwrap().as_deref(), Some("fenix_flow"));
+        assert_eq!(g.resolve_node_id("Café de Olla").unwrap().as_deref(), Some("cafe_de_olla"));
         assert_eq!(g.resolve_node_id("herramientas_case").unwrap(), None);
     }
 

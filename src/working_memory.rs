@@ -137,7 +137,7 @@ impl Default for SessionManager {
 ///
 /// Formato:
 /// ```text
-/// User: ¿Qué es Fénix Flow?
+/// User: ¿Qué es PostgreSQL?
 /// Assistant: Es un software de facturación.
 /// ```
 ///
@@ -240,11 +240,11 @@ mod tests {
     #[test]
     fn test_format_history_renders_correctly() {
         let history = vec![
-            Message::user("¿Qué es Fénix Flow?"),
+            Message::user("¿Qué es PostgreSQL?"),
             Message::assistant("Es un software de facturación."),
         ];
         let text = format_history_as_text(&history);
-        assert!(text.contains("User: ¿Qué es Fénix Flow?"));
+        assert!(text.contains("User: ¿Qué es PostgreSQL?"));
         assert!(text.contains("Assistant: Es un software de facturación."));
     }
 

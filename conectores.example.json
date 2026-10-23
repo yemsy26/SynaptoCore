@@ -1,0 +1,19 @@
+[
+  {
+    "name": "Inventario",
+    "description": "Consulta el stock disponible y el precio de un producto en el sistema de inventario.",
+    "method": "GET",
+    "url": "http://localhost:9000/api/v1/inventory?producto={producto}",
+    "headers": { "Authorization": "Bearer ${ERP_API_TOKEN}" },
+    "params": { "producto": "Nombre o SKU del producto" },
+    "timeout_secs": 10
+  },
+  {
+    "name": "Clientes",
+    "description": "Busca un cliente por nombre o documento y devuelve sus datos e historial de compras.",
+    "method": "GET",
+    "url": "http://localhost:9000/api/v1/clients?query={cliente}",
+    "headers": { "Authorization": "Bearer ${ERP_API_TOKEN}" },
+    "params": { "cliente": "Nombre, documento o correo del cliente" }
+  }
+]

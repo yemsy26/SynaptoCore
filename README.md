@@ -44,8 +44,8 @@ SynaptoCore es un sistema de memoria semántica persistente con razonamiento aut
 │  │  ToolRegistry│          │    CuriosityEngine      │            │
 │  │  TimeTool    │          │  (bucle subconsciente)  │            │
 │  │  WebhookTool │          │  nodos → hipótesis →    │            │
-│  │  InventoryT  │          │  SearXNG → validación → │            │
-│  │  ClientTool  │          │  consolidación en grafo  │            │
+│  │  Conectores  │          │  SearXNG → validación → │            │
+│  │  (JSON)      │          │  consolidación en grafo  │            │
 │  └──────────────┘          └─────────────────────────┘            │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -67,16 +67,17 @@ SynaptoCore es un sistema de memoria semántica persistente con razonamiento aut
 ### Flujo de una consulta
 
 ```
-Usuario: "¿En qué lenguaje está hecho Fénix Flow?"
-(sesión activa: ya sabe que Fénix Flow es software de facturación)
+Usuario: "¿En qué lenguaje está hecho?"
+(sesión activa: antes preguntó qué es PostgreSQL)
 
-1. SessionManager.get_history()  → recupera los últimos 6 mensajes
-2. LlmBridge.rewrite_context()   → "¿En qué lenguaje está hecho el software de facturación Fénix Flow?"
-3. MemoryGraph.semantic_search() → top-3 nodos por similitud coseno
-4. LlmBridge.tool_decision()     → ¿necesita herramienta? → "none"
-5. LlmBridge.synthesize()        → genera respuesta con contexto del grafo
-6. SessionManager.push()         → guarda turno en ventana deslizante
-7. API → JSON { response, session_id }
+1. SessionManager.get_history()  → recupera los últimos mensajes
+2. Planificador (1 llamada)      → intención, reescritura con el historial,
+                                   entidades y herramienta: "¿En qué lenguaje está hecho PostgreSQL?"
+3. Memoria                       → contexto semántico del grafo para cada entidad
+4. Si la memoria no lo sabe      → busca en la web (SearXNG) y responde citando [n]
+5. Respuesta en streaming        → y, si investigó, aprende lo verificado en segundo plano
+6. SessionManager.push()         → guarda el turno
+7. API → { response, session_id, answered_from, sources }
 ```
 
 ### Bucle Subconsciente (ReAct autónomo)
@@ -85,11 +86,11 @@ El `CuriosityEngine` corre en un hilo Tokio separado mientras el servidor está 
 
 ```
 cada N minutos:
-  1. Muestrea 2 nodos aleatorios del grafo (ej. "Fénix Flow", "Python")
-  2. LLM formula una pregunta: "¿Está Fénix Flow implementado en Python?"
+  1. Elige un par de conceptos relacionados y sin conectar (ej. "PostgreSQL", "MVCC")
+  2. LLM formula una pregunta: "¿Cómo usa PostgreSQL el MVCC?"
   3. SearXNG busca evidencia en la web (si SEARXNG_URL está definida)
   4. EpistemicValidator: Verificado / Contradictorio / Inconcluso
-  5. Si Verificado → insert_edge("fénix_flow", "implementado_en", "python", 0.8)
+  5. Si Verificado → insert_edge("postgresql", "usa", "mvcc", 0.8)
   6. ForgettingCurve.run_nightly_cleanup() → decae aristas sin refuerzo
 ```
 
@@ -183,8 +184,9 @@ SC_PORT=8080
 # ── Motor Epistémico (opcional) ─────────────────────────────────────────────
 SEARXNG_URL=http://localhost:8888   # sin esta var → subconsciente desconectado
 
-# ── Integración Fénix Flow ERP (opcional) ───────────────────────────────────
-FENIX_FLOW_API_URL=http://localhost:9000/api/v1   # sin esta var → modo DEMO
+# ── Conectores externos (opcional) ──────────────────────────────────────────
+SYNAPTOCORE_CONNECTORS=conectores.json   # sin archivo → sin conectores
+ERP_API_TOKEN=...                        # secretos citados en el JSON como ${ERP_API_TOKEN}
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 RUST_LOG=synaptocore=info,tower_http=warn
@@ -193,6 +195,30 @@ RUST_LOG=synaptocore=info,tower_http=warn
 Copia completa documentada en `.env.example`.
 
 ---
+
+## Conectores externos
+
+Cualquier sistema con API HTTP (ERP, CRM, inventario, una API propia, un motor de cálculo) se conecta
+declarándolo en `conectores.json` (ruta configurable con `SYNAPTOCORE_CONNECTORS`), sin tocar el código.
+El planificador ve el nombre y la descripción de cada conector y solo rellena sus parámetros: nunca
+elige URLs. Los secretos van en variables de entorno y se citan como `${NOMBRE}`.
+
+```json
+[
+  {
+    "name": "Inventario",
+    "description": "Consulta el stock disponible y el precio de un producto.",
+    "method": "GET",
+    "url": "http://localhost:9000/api/v1/inventory?producto={producto}",
+    "headers": { "Authorization": "Bearer ${ERP_API_TOKEN}" },
+    "params": { "producto": "Nombre o SKU del producto" }
+  }
+]
+```
+
+Plantilla completa en `conectores.example.json`. Con `POST`, los parámetros se envían como JSON. Un
+conector mal declarado (URL con un `{parámetro}` sin describir, variable de entorno ausente) se omite al
+arrancar con su motivo; los demás siguen funcionando.
 
 ## API REST
 
@@ -222,7 +248,7 @@ Enseña texto libre al cerebro. El LLM extrae tripletas semánticas, las valida 
 ```bash
 curl -X POST http://localhost:8080/api/v1/learn \
   -H "Content-Type: application/json" \
-  -d '{"text": "Fénix Flow es un sistema de facturación implementado en Python para tiendas de teléfonos móviles."}'
+  -d '{"text": "PostgreSQL es una base de datos relacional escrita en C que usa MVCC."}'
 ```
 ```json
 {
@@ -240,19 +266,21 @@ Consulta con memoria de sesión. Si omites `session_id` se genera uno nuevo y se
 ```bash
 curl -X POST http://localhost:8080/api/v1/query \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "¿En qué lenguaje está hecho Fénix Flow?", "session_id": "mi-sesion-1"}'
+  -d '{"prompt": "¿En qué lenguaje está hecho PostgreSQL?", "session_id": "mi-sesion-1"}'
 ```
 ```json
 {
-  "response": "Fénix Flow está implementado en Python. Es un sistema de facturación orientado a tiendas de teléfonos móviles.",
-  "session_id": "mi-sesion-1"
+  "response": "PostgreSQL está escrito en C.",
+  "session_id": "mi-sesion-1",
+  "answered_from": "memory",
+  "sources": []
 }
 ```
 
 Multi-turno: el sistema reescribe automáticamente las referencias ambiguas usando el historial de la sesión:
 
 ```bash
-# Turno 2 — "está" se resuelve a "Fénix Flow" por correferencia
+# Turno 2 — "tiene" se resuelve a "PostgreSQL" por correferencia
 curl -X POST http://localhost:8080/api/v1/query \
   -d '{"prompt": "¿Tiene versión móvil?", "session_id": "mi-sesion-1"}'
 ```
@@ -267,11 +295,11 @@ curl http://localhost:8080/api/v1/graph/all
 ```json
 {
   "nodes": [
-    {"id": "fénix_flow", "name": "Fénix Flow", "weight": 0.95, ...},
+    {"id": "postgresql", "name": "PostgreSQL", "weight": 0.95, ...},
     ...
   ],
   "edges": [
-    {"source": "fénix_flow", "relation": "implementado_en", "target": "python", "weight": 0.87},
+    {"source": "postgresql", "relation": "escrito_en", "target": "c", "weight": 0.87},
     ...
   ]
 }
@@ -389,8 +417,8 @@ Un `.synapse` es JSON con la siguiente estructura:
     {
       "type": "UpsertNode",
       "node": {
-        "id": "fénix_flow",
-        "name": "Fénix Flow",
+        "id": "postgresql",
+        "name": "PostgreSQL",
         "weight": 0.95,
         "decay_rate": 0.01,
         "embedding": null
@@ -472,7 +500,7 @@ cargo build --profile release-gpu --features cuda
 cargo test
 
 # Un módulo específico:
-cargo test --test-threads=1 fenix_tools
+cargo test connectors
 
 # Con logs visibles:
 cargo test -- --nocapture

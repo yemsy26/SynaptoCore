@@ -273,7 +273,7 @@ impl AnswerMode {
     fn system_prompt(&self) -> &'static str {
         match self {
             Self::Memory       => prompts::memory_answer_system_prompt(),
-            Self::Tool         => prompts::synthesis_system_prompt(),
+            Self::Tool         => prompts::tool_answer_system_prompt(),
             Self::Research     => prompts::research_answer_system_prompt(),
             Self::General      => prompts::general_answer_system_prompt(),
             Self::Conversation => prompts::conversation_system_prompt(),
@@ -821,7 +821,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
         let mode = if tool_output.is_some() { AnswerMode::Tool } else { AnswerMode::Memory };
         let user_prompt = match tool_output {
             Some(tool_result) => format!(
-                "Información en tiempo real:\n{tool_result}\n\nContexto del grafo:\n{graph_context}\n\nPregunta: {question}"
+                "Datos del sistema conectado:\n{tool_result}\n\nMemoria:\n{graph_context}\n\nPregunta: {question}"
             ),
             None => format!("Contexto:\n{graph_context}\n\nPregunta: {question}"),
         };
@@ -1857,12 +1857,12 @@ Espero que sea útil."#;
     #[test]
     fn test_planner_sees_history_for_coreference() {
         let mock = MockLlmBackend::new(vec![
-            plan_json("query", "¿En qué lenguaje está hecho Fénix Flow?", &["fénix flow"], "none"),
+            plan_json("query", "¿En qué lenguaje está hecho PostgreSQL?", &["postgresql"], "none"),
         ]);
         let bridge = NeuralBridge::new(mock);
-        let plan = bridge.plan("¿En qué lenguaje está hecho?", "User: ¿Qué es Fénix Flow?\nAssistant: Un ERP.");
-        assert_eq!(plan.rewritten_query, "¿En qué lenguaje está hecho Fénix Flow?");
-        assert!(bridge.backend.user_prompts()[0].contains("Fénix Flow"));
+        let plan = bridge.plan("¿En qué lenguaje está hecho?", "User: ¿Qué es PostgreSQL?\nAssistant: Una base de datos.");
+        assert_eq!(plan.rewritten_query, "¿En qué lenguaje está hecho PostgreSQL?");
+        assert!(bridge.backend.user_prompts()[0].contains("PostgreSQL"));
         assert_eq!(bridge.backend.call_count(), 1);
     }
 
@@ -1889,22 +1889,22 @@ Espero que sea útil."#;
     #[test]
     fn test_query_with_history_is_still_two_calls() {
         let graph = MemoryGraph::open(":memory:").unwrap();
-        graph.insert_node(&Node::new("fenix_flow", "concept", "Fénix Flow")).unwrap();
-        graph.insert_node(&Node::new("rust", "concept", "Rust")).unwrap();
-        graph.insert_edge("fenix_flow", "escrito_en", "rust", 0.9).unwrap();
+        graph.insert_node(&Node::new("postgresql", "concept", "PostgreSQL")).unwrap();
+        graph.insert_node(&Node::new("c", "concept", "C")).unwrap();
+        graph.insert_edge("postgresql", "escrito_en", "c", 0.9).unwrap();
 
         let mock = MockLlmBackend::new(vec![
-            plan_json("query", "¿En qué lenguaje está hecho Fénix Flow?", &["fénix flow"], "none"),
-            "Fénix Flow está escrito en Rust.".to_string(),
+            plan_json("query", "¿En qué lenguaje está hecho PostgreSQL?", &["postgresql"], "none"),
+            "PostgreSQL está escrito en C.".to_string(),
         ]);
         let bridge = NeuralBridge::new(mock);
-        let history = "User: ¿Qué es Fénix Flow?\nAssistant: Un ERP.";
+        let history = "User: ¿Qué es PostgreSQL?\nAssistant: Una base de datos.";
         bridge.query_with_memory(&graph, "¿En qué lenguaje está hecho?", history).unwrap();
 
         assert_eq!(bridge.backend.call_count(), 2, "la correferencia ya no cuesta una llamada");
         let synthesis = &bridge.backend.user_prompts()[1];
-        assert!(synthesis.contains("Pregunta: ¿En qué lenguaje está hecho Fénix Flow?"));
-        assert!(synthesis.contains("escrito_en"), "'fénix flow' ancla en fenix_flow: {synthesis}");
+        assert!(synthesis.contains("Pregunta: ¿En qué lenguaje está hecho PostgreSQL?"));
+        assert!(synthesis.contains("escrito_en"), "'postgresql' ancla en el nodo postgresql: {synthesis}");
     }
 
     #[test]

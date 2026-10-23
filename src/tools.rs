@@ -210,7 +210,8 @@ impl Tool for TimeTool {
 /// Realiza un GET HTTP a una URL y retorna los primeros 500 caracteres
 /// de la respuesta.
 ///
-/// Sirve como puente hacia sistemas externos (ej. Fénix Flow ERP).
+/// Para conectar sistemas de forma estable es mejor un conector declarado
+/// en conectores.json (Paso 25): el modelo no elige URLs.
 /// Timeout estricto de 5 segundos para no bloquear el ciclo cognitivo.
 pub struct WebhookTool;
 
