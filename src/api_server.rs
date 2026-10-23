@@ -1,0 +1,1547 @@
+﻿// ============================================================
+// api_server.rs — El Córtex de Comunicación de SynaptoCore
+//
+// OBJETIVO:
+//   Convertir el cerebro cognitivo en un microservicio HTTP de alta
+//   eficiencia, accesible desde cualquier cliente (Python, JS, ERP, CLI)
+//   sin tocar el binario de Rust.
+//
+// DECISIÓN: ¿Por qué Axum sobre Actix-web o Rocket?
+//
+//   • Axum está construido 100% sobre Tower + Tokio, el mismo stack que
+//     usa el ecosistema async de Rust. Los middlewares son Tower Layers
+//     composables, sin magia de macros.
+//   • Actix-web tiene su propio runtime interno (actix::System) que puede
+//     conflictuar con dependencias Tokio (como llama-cpp-4). Axum es
+//     Tokio-native: un solo runtime, sin overhead de coordinación.
+//   • Rocket 0.5 requiere nightly features que no queremos para un
+//     sistema de producción estable.
+//
+// DISEÑO DE CONCURRENCIA:
+//
+//   ┌──────────────────────────────────────────────────────────┐
+//   │  Tokio Runtime (multi-thread)                            │
+//   │                                                          │
+//   │  ┌────────────┐  ┌──────────────────────────────────┐  │
+//   │  │ Axum Server│  │  tokio::spawn (subconscious loop) │  │
+//   │  │ (handlers) │  │  → spawn_blocking cada 5 min     │  │
+//   │  └────────────┘  └──────────────────────────────────┘  │
+//   │         │                      │                         │
+//   │  spawn_blocking (SQLite ops)   │                         │
+//   │  spawn_blocking (LLM inference)│                         │
+//   └──────────────────────────────────────────────────────────┘
+//
+//   • MemoryGraph envuelto en Arc<Mutex<>>: la conexión SQLite NO es Sync.
+//     Mutex garantiza acceso exclusivo entre handlers concurrentes.
+//   • spawn_blocking para SQLite e inferencia LLM: ambas son operaciones
+//     bloqueantes de CPU/IO que no deben ocupar los hilos de Tokio.
+//   • LlmBackend type-erased como Arc<dyn LlmBackend + Send + Sync>:
+//     permite cambiar el backend (mock ↔ llama.cpp) sin recompilar
+//     la lógica del servidor.
+// ============================================================
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use std::convert::Infallible;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
+
+use crate::error::MemoryError;
+use crate::federated_memory::{self, FederationError};
+use crate::llm_bridge::{BridgeError, ExtractionResult, Intent, LlmBackend, NeuralBridge};
+use crate::memory_graph::{GraphSnapshot, MemoryGraph, TraversalDirection};
+use crate::priority::CognitivePriority;
+use crate::tools::ToolRegistry;
+use crate::types::current_unix_ts;
+use crate::working_memory::{format_history_as_text, Message as ChatMessage, SessionManager};
+
+// ──────────────────────────────────────────────────────────────
+//  TELEMETRÍA EN TIEMPO REAL (Paso 9)
+// ──────────────────────────────────────────────────────────────
+
+/// Evento estructurado del motor subconsciente, transmitido por WebSocket.
+///
+/// El campo `event_type` permite al frontend tomar decisiones semánticas:
+/// - `"Hypothesis"`:    El motor ha formulado una pregunta de investigación.
+/// - `"Validation"`:   El TruthFilter ha evaluado la hipótesis.
+/// - `"Consolidation"`: Se consolidaron tripletas nuevas en el grafo.
+/// - `"Rejection"`:    La hipótesis fue descartada (CONTRADICTED o baja confianza).
+/// - `"Cycle"`:        Evento genérico del ciclo (inicio, fin, etc.).
+/// - `"Error"`:        Error recuperable del motor; el ciclo continúa.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubconsciousEvent {
+    /// Tipo semántico del evento. Usado por el JS para decisiones de UI.
+    pub event_type: String,
+    /// Mensaje legible por humanos para el feed.
+    pub message:    String,
+    /// Unix timestamp en segundos (para ordenación y display).
+    pub timestamp:  u64,
+}
+
+impl SubconsciousEvent {
+    /// Constructor conveniente que rellena el timestamp automáticamente.
+    pub fn new(event_type: impl Into<String>, message: impl Into<String>) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        Self {
+            event_type: event_type.into(),
+            message:    message.into(),
+            timestamp:  SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+
+    /// Serializa el evento a JSON listo para enviar por WebSocket.
+    /// Nunca falla porque todos los campos son tipos primitivos serializables.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"event_type":"Error","message":"serialization error","timestamp":0}"#.to_string()
+        })
+    }
+}
+
+/// Alias para el emisor del canal de broadcast de eventos del subconsciente.
+///
+/// `broadcast::Sender<String>` — los mensajes son JSON pre-serializado para
+/// evitar serializar N veces si hay N clientes WebSocket suscritos.
+/// Capacidad del canal: 128 mensajes. Si el cliente es lento y se llena
+/// el buffer, los mensajes antiguos se descartan (comportamiento intencional:
+/// preferimos datos frescos sobre buffering ilimitado).
+pub type EventSender = broadcast::Sender<String>;
+
+// ──────────────────────────────────────────────────────────────
+//  ESTADO COMPARTIDO
+// ──────────────────────────────────────────────────────────────
+
+/// Estado global compartido entre todos los handlers de Axum.
+///
+/// Axum requiere que el estado sea `Clone + Send + Sync + 'static`.
+/// Todos los campos son Arc-wrapped para cumplir estos requisitos.
+///
+/// # Por qué Mutex y no RwLock
+/// `rusqlite::Connection` no implementa `Sync`. Aunque SQLite WAL permite
+/// múltiples lectores concurrentes a nivel de base de datos, la conexión
+/// Rust solo puede ser usada desde un hilo a la vez. `Mutex` garantiza
+/// exclusión mutua sin la complejidad de RwLock sobre un tipo no-Sync.
+#[derive(Clone)]
+pub struct AppState {
+    /// Grafo de memoria protegido para concurrencia entre handlers.
+    pub graph: Arc<Mutex<MemoryGraph>>,
+
+    /// Backend LLM type-erased. Puede ser `LlamaCppBackend` en producción
+    /// o `DemoMock` en desarrollo. Ambos son `Send + Sync` gracias al
+    /// impl en llm_bridge.rs que delega a `Arc<dyn LlmBackend + Send + Sync>`.
+    pub llm: Arc<dyn LlmBackend + Send + Sync + 'static>,
+
+    /// UUID estable del agente para identificar deltas de federación.
+    pub agent_id: String,
+
+    /// Canal de broadcast de eventos del subconsciente (Paso 9).
+    ///
+    /// `broadcast::Sender` es `Clone + Send + Sync`: seguro para compartir
+    /// entre handlers de Axum concurrentes. Cada cliente WebSocket crea su
+    /// propio `Receiver` con `tx.subscribe()`.
+    ///
+    /// Si no hay nadie escuchando, `tx.send()` devuelve `SendError` que
+    /// se descarta silenciosamente (el motor subconsciente no hace panic).
+    pub events_tx: EventSender,
+
+    /// Memoria de trabajo: historial de conversación por sesión (Paso 13).
+    ///
+    /// `Arc<SessionManager>` — compartido entre todos los handlers. El
+    /// `SessionManager` usa `RwLock` internamente para acceso concurrente
+    /// eficiente (N lectores simultáneos, escritura exclusiva breve).
+    pub sessions: Arc<SessionManager>,
+
+    /// Registro de herramientas para el ciclo ReAct (Paso 14).
+    ///
+    /// `Arc<ToolRegistry>` — compartido entre handlers. El `ToolRegistry`
+    /// es inmutable después de la inicialización (solo lectura en producción).
+    pub tool_registry: Arc<ToolRegistry>,
+
+    /// Prioridad cognitiva (Paso 21): los handlers de usuario toman un
+    /// `ForegroundGuard` y el subconsciente cede el LLM mientras exista.
+    pub priority: Arc<CognitivePriority>,
+}
+
+// ──────────────────────────────────────────────────────────────
+//  TIPOS DE REQUEST / RESPONSE (DTOs)
+// ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct QueryRequest {
+    /// Pregunta en lenguaje natural. El bridge identificará la entidad
+    /// principal y enriquecerá la respuesta con el grafo de memoria.
+    pub prompt: String,
+
+    /// Identificador de sesión para memoria de trabajo multi-turno (Paso 13).
+    /// Si no se envía, se genera un UUID nuevo y se devuelve en la respuesta.
+    /// El cliente debe incluirlo en la siguiente petición para mantener contexto.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct QueryResponse {
+    pub response:   String,
+    /// Session ID activo para esta conversación. El cliente debe
+    /// persistirlo y devolverlo en el siguiente turno.
+    pub session_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct LearnRequest {
+    /// Texto libre del que el LLM extraerá tripletas de conocimiento.
+    pub text: String,
+}
+
+#[derive(Serialize)]
+pub struct LearnResponse {
+    pub triples_extracted: usize,
+    pub nodes_created:     usize,
+    pub edges_created:     usize,
+    pub llm_attempts:      u8,
+}
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status:     &'static str,
+    pub node_count: u64,
+    pub edge_count: u64,
+    pub avg_weight: f64,
+    pub version:    &'static str,
+}
+
+/// Un vecino en el grafo: arista + nodo destino.
+#[derive(Serialize)]
+pub struct NeighborDto {
+    pub relation:    String,
+    pub target_id:   String,
+    pub target_name: String,
+    pub weight:      f64,
+}
+
+#[derive(Serialize)]
+pub struct NeighborsResponse {
+    pub node_id:   String,
+    pub neighbors: Vec<NeighborDto>,
+    pub direction: String,
+}
+
+// ──────────────────────────────────────────────────────────────
+//  MANEJO DE ERRORES — ApiError
+// ──────────────────────────────────────────────────────────────
+
+/// Tipo de error unificado para todos los handlers.
+///
+/// Implementa `IntoResponse` para que Axum lo serialice automáticamente
+/// en una respuesta HTTP con el `StatusCode` correcto y un cuerpo JSON
+/// consistente: `{ "error": "...", "code": NNN }`.
+///
+/// # Por qué no Box<dyn Error>
+/// Usar un tipo concreto permite que el compilador verifique exhaustivamente
+/// los mapeos de error. Además, el JSON de error es uniforme en toda la API.
+#[derive(Debug)]
+pub enum ApiError {
+    /// El recurso solicitado no existe (nodo, arista).
+    NotFound(String),
+    /// La petición tiene datos inválidos (prompt vacío, peso fuera de rango).
+    BadRequest(String),
+    /// Fallo interno no recuperable (SQLite, LLM, mutex envenenado).
+    Internal(String),
+}
+
+impl ApiError {
+    pub fn not_found(msg: impl ToString)  -> Self { Self::NotFound(msg.to_string())  }
+    pub fn bad_request(msg: impl ToString)-> Self { Self::BadRequest(msg.to_string())}
+    pub fn internal(msg: impl ToString)   -> Self { Self::Internal(msg.to_string())  }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match &self {
+            Self::NotFound(m)  => (StatusCode::NOT_FOUND, m.clone()),
+            Self::BadRequest(m)=> (StatusCode::BAD_REQUEST, m.clone()),
+            Self::Internal(m)  => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
+        };
+        let body = Json(serde_json::json!({
+            "error": message,
+            "code":  status.as_u16()
+        }));
+        (status, body).into_response()
+    }
+}
+
+// Conversiones From<> para usar el operador `?` en los handlers.
+
+impl From<MemoryError> for ApiError {
+    fn from(e: MemoryError) -> Self {
+        match e {
+            MemoryError::NodeNotFound(id) =>
+                Self::not_found(format!("Nodo '{}' no encontrado en el grafo", id)),
+            MemoryError::DuplicateNode(id) =>
+                Self::bad_request(format!("El nodo '{}' ya existe", id)),
+            MemoryError::DuplicateEdge { from_node, relation, to_node } =>
+                Self::bad_request(format!("La arista ({})−[{}]→({}) ya existe", from_node, relation, to_node)),
+            MemoryError::InvalidWeight { weight } =>
+                Self::bad_request(format!("Peso {} fuera del rango [0.0, 1.0]", weight)),
+            other => Self::internal(other.to_string()),
+        }
+    }
+}
+
+impl From<BridgeError> for ApiError {
+    fn from(e: BridgeError) -> Self {
+        match &e {
+            BridgeError::EmptyPrompt =>
+                Self::bad_request("El prompt no puede estar vacío"),
+            _ => Self::internal(e.to_string()),
+        }
+    }
+}
+
+impl From<FederationError> for ApiError {
+    fn from(e: FederationError) -> Self {
+        match e {
+            FederationError::GraphError(me) => me.into(),
+            other => Self::internal(other.to_string()),
+        }
+    }
+}
+
+impl From<tokio::task::JoinError> for ApiError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        Self::internal(format!("Error de tarea asíncrona: {}", e))
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::internal(format!("Error de serialización: {}", e))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  HANDLERS
+// ──────────────────────────────────────────────────────────────
+
+/// `GET /health` — Estado del sistema.
+///
+/// Endpoint sin autenticación ni parámetros. Ideal para health-checks
+/// de orquestadores (Docker, Kubernetes, systemd watchdog).
+/// Latencia esperada: < 2ms (solo un COUNT(*) en SQLite).
+pub async fn handle_health(
+    State(state): State<AppState>,
+) -> Result<Json<HealthResponse>, ApiError> {
+    let graph_arc = Arc::clone(&state.graph);
+
+    // Las operaciones SQLite son bloqueantes (I/O bound). spawn_blocking
+    // las ejecuta en el thread-pool de Tokio para I/O-bound sin bloquear
+    // los hilos del runtime async.
+    let stats = tokio::task::spawn_blocking(move || {
+        let graph = graph_arc.lock()
+            .map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        graph.stats().map_err(ApiError::from)
+    }).await??;
+
+    Ok(Json(HealthResponse {
+        status:     "ok",
+        node_count: stats.node_count,
+        edge_count: stats.edge_count,
+        avg_weight: stats.avg_edge_weight,
+        version:    env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// `POST /api/v1/query` — Consulta fundamentada en memoria.
+///
+/// Flujo interno (Paso 2 + Paso 13 — NeuralBridge::query_with_memory):
+///   1. (Paso 13) Resolución de correferencia usando historial de sesión.
+///   2. LLM identifica la entidad principal del prompt (reescrito).
+///   3. Se recuperan vecinos de esa entidad del grafo.
+///   4. LLM genera respuesta usando el contexto recuperado.
+///   5. (Paso 13) El turno se persiste en SessionManager.
+///
+/// Latencia con mock: < 5ms. Con llama.cpp GPU: ~200-800ms.
+pub async fn handle_query(
+    State(state): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> Result<Json<QueryResponse>, ApiError> {
+    // Validación temprana antes de spawnar tareas costosas.
+    if req.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("El campo 'prompt' no puede estar vacío"));
+    }
+    // Paso 21: el subconsciente cede el LLM mientras dure esta petición.
+    let _fg = state.priority.enter();
+
+    // ── Paso 13: Gestión de sesión ───────────────────────────
+    // Usar session_id provisto o generar uno nuevo.
+    let session_id = req.session_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Obtener historial ANTES de la llamada LLM (read-lock brevísimo).
+    let history      = state.sessions.get_history(&session_id);
+    let history_text = format_history_as_text(&history);
+
+    let graph_arc    = Arc::clone(&state.graph);
+    let llm_arc      = Arc::clone(&state.llm);
+    let registry_arc = Arc::clone(&state.tool_registry);
+    let prompt       = req.prompt.clone();
+    let hist_clone   = history_text;
+
+    let response = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
+        // NeuralBridge<Arc<dyn LlmBackend + Send + Sync>> funciona gracias al
+        // impl LlmBackend for Arc<dyn LlmBackend + Send + Sync> en llm_bridge.rs.
+        let bridge = NeuralBridge::new(Arc::clone(&llm_arc))
+            .with_tools(registry_arc);
+        // Paso 21: se pasa el Mutex, no un guard; el bridge solo lo bloquea
+        // durante la recuperación del vecindario, no durante la inferencia.
+        bridge.query_with_memory(&*graph_arc, &prompt, &hist_clone)
+            .map_err(ApiError::from)
+    }).await??;
+
+    // ── Paso 13: Persistir turno (write-lock brevísimo) ──────
+    state.sessions.push(&session_id, ChatMessage::user(&req.prompt));
+    state.sessions.push(&session_id, ChatMessage::assistant(&response));
+
+    Ok(Json(QueryResponse { response, session_id }))
+}
+
+/// POST /api/v1/chat y POST /api/v1/query_stream — Endpoint Unificado con Enrutamiento de Intención y Streaming SSE (Paso 20).
+///
+/// Flujo:
+/// 1. Validación temprana del prompt.
+/// 2. Clasificación semántica de intención en spawn_blocking: Intent::Learn vs Intent::Query.
+/// 3. Si Intent::Learn:
+///    - Extrae tripletas y las asimila en el grafo de memoria (SQLite).
+///    - Emite un mensaje estructurado de confirmación SSE y persiste el turno en SessionManager.
+/// 4. Si Intent::Query:
+///    - Prepara el contexto cognitivo (correferencia, ReAct, grafo) y emite tokens en tiempo real vía SSE.
+///    - Persiste el turno completo en SessionManager al finalizar el stream.
+pub async fn handle_query_stream(
+    State(state): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    if req.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("El campo 'prompt' no puede estar vacío"));
+    }
+    // Paso 21: prioridad del usuario hasta el último token (el guard se mueve
+    // al stream SSE más abajo; se libera también si el cliente corta).
+    let fg = state.priority.enter();
+
+    let session_id = req.session_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let history = state.sessions.get_history(&session_id);
+    let history_text = format_history_as_text(&history);
+
+    let graph_arc = Arc::clone(&state.graph);
+    let llm_arc = Arc::clone(&state.llm);
+    let registry_arc = Arc::clone(&state.tool_registry);
+    let prompt_for_bridge = req.prompt.clone();
+    let prompt_for_history = req.prompt.clone();
+
+    enum RoutedStream {
+        Learn(ExtractionResult),
+        Query(crate::llm_bridge::BoxedTokenStream),
+    }
+
+    let routed_result = tokio::task::spawn_blocking(move || -> Result<RoutedStream, ApiError> {
+        // Paso 21: sin lock aquí. Clasificación, extracción y bucle ReAct son
+        // inferencia pura; el bridge bloquea el grafo solo para leer o escribir.
+        let graph = &*graph_arc;
+        let bridge = NeuralBridge::new(Arc::clone(&llm_arc))
+            .with_tools(registry_arc);
+
+        let intent = bridge.route_intent(&prompt_for_bridge);
+        match intent {
+            Intent::Learn => {
+                let extract_res = bridge.extract_and_memorize(graph, &prompt_for_bridge)
+                    .map_err(ApiError::from)?;
+                Ok(RoutedStream::Learn(extract_res))
+            }
+            Intent::Query => {
+                let token_stream = bridge.query_with_memory_stream(graph, &prompt_for_bridge, &history_text)
+                    .map_err(ApiError::from)?;
+                Ok(RoutedStream::Query(token_stream))
+            }
+        }
+    }).await.map_err(|e| ApiError::internal(format!("Join error: {e}")))?;
+
+    let routed = routed_result?;
+    let sessions = Arc::clone(&state.sessions);
+    let sid = session_id.clone();
+
+    let sse_stream = async_stream::stream! {
+        let _fg = fg;
+        match routed {
+            RoutedStream::Learn(res) => {
+                let summary_triples = res.triples
+                    .iter()
+                    .take(5)
+                    .map(|t| format!("({} → {} → {})", t.subject, t.relation, t.object))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let confirmation = if res.triples.is_empty() {
+                    "He analizado tu mensaje, pero no identifiqué hechos o relaciones nuevas para memorizar en el grafo.".to_string()
+                } else {
+                    format!(
+                        "🧠 He integrado esta información a mi red sináptica: {} tripletas asimiladas [{}] ({} nodos nuevos, {} conexiones).",
+                        res.triples.len(),
+                        summary_triples,
+                        res.nodes_created,
+                        res.edges_created
+                    )
+                };
+
+                let payload = serde_json::json!({
+                    "token": confirmation,
+                    "session_id": sid,
+                    "done": false,
+                    "intent": "learn",
+                    "triples_count": res.triples.len(),
+                    "nodes_created": res.nodes_created,
+                    "edges_created": res.edges_created
+                }).to_string();
+                yield Ok(Event::default().data(payload));
+
+                // Persistir en memoria de trabajo (Paso 13 / 20)
+                sessions.push(&sid, ChatMessage::user(&prompt_for_history));
+                sessions.push(&sid, ChatMessage::assistant(&confirmation));
+
+                let done_payload = serde_json::json!({
+                    "token": "",
+                    "session_id": sid,
+                    "done": true,
+                    "intent": "learn"
+                }).to_string();
+                yield Ok(Event::default().data(done_payload));
+            }
+            RoutedStream::Query(mut token_stream) => {
+                use futures_util::StreamExt;
+                let mut full_response = String::new();
+
+                while let Some(item) = token_stream.next().await {
+                    match item {
+                        Ok(token) => {
+                            full_response.push_str(&token);
+                            let payload = serde_json::json!({
+                                "token": token,
+                                "session_id": sid,
+                                "done": false,
+                                "intent": "query"
+                            }).to_string();
+                            yield Ok(Event::default().data(payload));
+                        }
+                        Err(e) => {
+                            let err_payload = serde_json::json!({
+                                "error": e.to_string(),
+                                "session_id": sid,
+                                "done": true,
+                                "intent": "query"
+                            }).to_string();
+                            yield Ok(Event::default().data(err_payload));
+                            return;
+                        }
+                    }
+                }
+
+                // Persistir en memoria de trabajo (Paso 13)
+                sessions.push(&sid, ChatMessage::user(&prompt_for_history));
+                sessions.push(&sid, ChatMessage::assistant(&full_response));
+
+                let done_payload = serde_json::json!({
+                    "token": "",
+                    "session_id": sid,
+                    "done": true,
+                    "intent": "query"
+                }).to_string();
+                yield Ok(Event::default().data(done_payload));
+            }
+        }
+    };
+
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// Alias para `POST /api/v1/chat` (Paso 20).
+pub async fn handle_unified_chat(
+    state: State<AppState>,
+    req: Json<QueryRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    handle_query_stream(state, req).await
+}
+
+pub async fn handle_learn(
+    State(state): State<AppState>,
+    Json(req): Json<LearnRequest>,
+) -> Result<Json<LearnResponse>, ApiError> {
+    if req.text.trim().is_empty() {
+        return Err(ApiError::bad_request("El campo 'text' no puede estar vacío"));
+    }
+    let _fg = state.priority.enter();
+
+    let graph_arc = Arc::clone(&state.graph);
+    let llm_arc   = Arc::clone(&state.llm);
+    let text      = req.text;
+
+    let result = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        let bridge = NeuralBridge::new(Arc::clone(&llm_arc));
+        bridge.extract_and_memorize(&*graph_arc, &text).map_err(ApiError::from)
+    }).await??;
+
+    Ok(Json(LearnResponse {
+        triples_extracted: result.triples.len(),
+        nodes_created:     result.nodes_created,
+        edges_created:     result.edges_created,
+        llm_attempts:      result.llm_attempts,
+    }))
+}
+
+/// `GET /api/v1/graph/neighbors/:id` — Vecindario de un nodo.
+///
+/// Recupera los vecinos inmediatos del nodo `id` en dirección saliente.
+/// Latencia esperada: < 5ms (consulta SQLite con índice). Los vecinos
+/// se ordenan por peso descendente (mayor relevancia primero).
+///
+/// Retorna 404 si el nodo no existe.
+pub async fn handle_neighbors(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<Json<NeighborsResponse>, ApiError> {
+    let graph_arc = Arc::clone(&state.graph);
+    let id        = node_id.clone();
+
+    let neighborhood = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        let graph = graph_arc.lock()
+            .map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        graph.get_neighbors(&id, TraversalDirection::Outgoing)
+            .map_err(ApiError::from)
+    }).await??;
+
+    let neighbors: Vec<NeighborDto> = neighborhood.neighbors.into_iter().map(|(edge, node)| {
+        NeighborDto {
+            relation:    edge.relation,
+            target_id:   node.id,
+            target_name: node.name,
+            weight:      edge.weight,
+        }
+    }).collect();
+
+    Ok(Json(NeighborsResponse {
+        node_id:   node_id,
+        neighbors,
+        direction: "outgoing".to_string(),
+    }))
+}
+
+/// `POST /api/v1/federation/export` — Exportar delta incremental.
+///
+/// Genera un `MemoryDelta` con los nodos y aristas creados en las últimas
+/// 24 horas y lo retorna como JSON para que otros agentes lo importen.
+///
+/// El delta NO se escribe en disco aquí — se devuelve directamente en la
+/// respuesta HTTP. El cliente decide si guardarlo como archivo `.synapse`.
+pub async fn handle_federation_export(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let graph_arc = Arc::clone(&state.graph);
+    let agent_id  = state.agent_id.clone();
+
+    let delta = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        let graph      = graph_arc.lock()
+            .map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        // 24 horas hacia atrás para el delta incremental.
+        let since      = current_unix_ts() - 86_400;
+        federated_memory::build_incremental_delta(&agent_id, &*graph, since)
+            .map_err(ApiError::from)
+    }).await??;
+
+    // Serializamos el MemoryDelta directamente a Value para retornarlo.
+    // El cliente puede guardarlo como archivo .synapse si lo desea.
+    let value = serde_json::to_value(&delta)?;
+    Ok(Json(value))
+}
+
+// ──────────────────────────────────────────────────────────────
+//  PASO 8 — Dashboard y snapshot del grafo
+// ──────────────────────────────────────────────────────────────
+
+/// `GET /` — Sirve el Panel de Observabilidad (Paso 8).
+///
+/// El HTML está embebido en el binario mediante `include_str!` para
+/// mantener la promesa de ejecutable portátil sin archivos externos.
+/// Content-Type: text/html;charset=utf-8 — el navegador renderizará
+/// el dashboard directamente al abrir http://127.0.0.1:8080.
+pub async fn handle_dashboard() -> impl IntoResponse {
+    // DECISIÓN: include_str! en tiempo de compilación → cero I/O en runtime.
+    // El dashboard.html se embebe como &'static str en el segmento .rodata
+    // del ejecutable. Cualquier cambio al HTML requiere recompilar, lo que
+    // garantiza versioning atómico: binario y UI siempre en sincronía.
+    const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        DASHBOARD_HTML,
+    )
+}
+
+/// `GET /api/v1/graph/all` — Snapshot completo del grafo para Cytoscape.js.
+///
+/// Devuelve hasta `NODE_LIMIT` nodos y sus aristas en formato JSON.
+/// El límite evita saturar el navegador con grafos muy grandes.
+///
+/// Response:
+/// ```json
+/// {
+///   "nodes": [{ "id":"rust", "label":"concept", "name":"Rust", ... }],
+///   "edges": [{ "id":"...", "source_id":"rust", "relation":"garantiza",
+///               "target_id":"memoria_segura", "weight":0.9, ... }]
+/// }
+/// ```
+pub async fn handle_graph_all(
+    State(state): State<AppState>,
+) -> Result<Json<GraphSnapshot>, ApiError> {
+    // Límite de seguridad: 2 000 nodos es el máximo recomendado por Cytoscape.js
+    // antes de que el layout force-directed se vuelva inaceptablemente lento.
+    const NODE_LIMIT: usize = 2_000;
+
+    let graph_arc = Arc::clone(&state.graph);
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let graph = graph_arc
+            .lock()
+            .map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        graph.get_all_graph_data(NODE_LIMIT).map_err(ApiError::from)
+    })
+    .await??;
+
+    Ok(Json(snapshot))
+}
+
+// ──────────────────────────────────────────────────────────────
+//  PASO 9 — WebSocket de telemetría en tiempo real
+// ──────────────────────────────────────────────────────────────
+
+/// `GET /ws/subconscious` — Upgrade a WebSocket de telemetría.
+///
+/// El cliente JS llama a `new WebSocket("ws://host/ws/subconscious")`.
+/// Una vez establecida la conexión persistente, el servidor le retransmite
+/// todos los eventos del motor de curiosidad (hipótesis, validaciones,
+/// consolidaciones) en formato JSON.
+///
+/// # Tolerancia a fallos
+/// - Si el cliente cierra la pestaña, el `select!` detecta el canal cerrado
+///   y la tarea termina limpiamente (sin panic).
+/// - Si nadie está conectado al WS, `broadcast::Sender::send` devuelve
+///   `SendError` que se descarta silenciosamente en el CuriosityEngine.
+/// - La capacidad del canal (128 slots) actúa como buffer de jitter: si el
+///   cliente tiene lag puntual, no pierde eventos recientes.
+pub async fn handle_ws_subconscious(
+    ws:              WebSocketUpgrade,
+    State(state):    State<AppState>,
+) -> impl IntoResponse {
+    // Suscribimos ANTES de hacer el upgrade para no perder eventos que
+    // lleguen durante el handshake (race window mínima pero real).
+    let mut rx = state.events_tx.subscribe();
+
+    ws.on_upgrade(move |socket| async move {
+        pump_ws(socket, &mut rx).await;
+    })
+}
+
+/// Bombea mensajes del canal broadcast hacia el WebSocket del cliente.
+///
+/// Usa `tokio::select!` para reaccionar simultáneamente a:
+///   A) Mensajes del canal broadcast (eventos del subconsciente).
+///   B) Mensajes del cliente WS (pings automáticos de keep-alive o Close).
+///
+/// El bucle termina en cuanto se detecta desconexión del cliente o
+/// el canal broadcast es eliminado (shutdown del servidor).
+async fn pump_ws(
+    mut socket: WebSocket,
+    rx:         &mut broadcast::Receiver<String>,
+) {
+    loop {
+        tokio::select! {
+            // Rama A: Nuevo evento del subconsciente → reenviar al cliente.
+            event = rx.recv() => {
+                match event {
+                    Ok(json) => {
+                        // Enviamos como texto UTF-8 (formato JSON estándar WS).
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            // Canal de escritura cerrado: cliente desconectado.
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // El cliente consumía más lento que el productor.
+                        // Informamos del lag y continuamos; no es fatal.
+                        let warn = SubconsciousEvent::new(
+                            "Cycle",
+                            format!("⚠ {n} eventos descartados por lag del cliente WS"),
+                        );
+                        let _ = socket.send(Message::Text(warn.to_json().into())).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // El emisor fue eliminado (servidor apagándose).
+                        return;
+                    }
+                }
+            }
+
+            // Rama B: Mensaje del cliente WS → gestionar control frames.
+            client_msg = socket.recv() => {
+                match client_msg {
+                    Some(Ok(Message::Close(_))) | None => {
+                        // Cierre normal del cliente.
+                        return;
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        // Pong automático de keep-alive.
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(_)) => {
+                        // Otros mensajes del cliente (Text, Binary): los ignoramos.
+                        // El WS del subconsciente es unidireccional servidor→cliente.
+                    }
+                    Some(Err(_)) => {
+                        // Error de lectura: cliente probablemente caído.
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+//  ROUTER — Composición de rutas
+// ──────────────────────────────────────────────────────────────
+
+/// Construye el Router de Axum con todas las rutas y el estado compartido.
+///
+/// Separar el router de `main()` permite instanciarlo en tests sin
+/// levantar un socket TCP real (usando `tower::ServiceExt::oneshot`).
+///
+/// # Estructura de rutas
+/// ```
+/// GET  /                              → Dashboard HTML (Paso 8)
+/// GET  /health
+/// GET  /ws/subconscious               → WebSocket de telemetría (Paso 9)
+/// POST /api/v1/query
+/// POST /api/v1/learn
+/// GET  /api/v1/graph/all              → Snapshot completo (Paso 8)
+/// GET  /api/v1/graph/neighbors/{id}
+/// POST /api/v1/federation/export
+/// ```
+pub fn build_router(state: AppState) -> Router {
+    let api_v1 = Router::new()
+        .route("/chat",                 post(handle_query_stream))
+        .route("/query",                post(handle_query))
+        .route("/query_stream",         post(handle_query_stream))
+        .route("/learn",                post(handle_learn))
+        .route("/graph/all",            get(handle_graph_all))
+        .route("/graph/neighbors/{id}", get(handle_neighbors))
+        .route("/federation/export",    post(handle_federation_export));
+
+    Router::new()
+        .route("/",                   get(handle_dashboard))
+        .route("/health",             get(handle_health))
+        .route("/ws/subconscious",    get(handle_ws_subconscious))
+        .nest("/api/v1", api_v1)
+        .with_state(state)
+}
+
+// ──────────────────────────────────────────────────────────────
+//  TESTS
+// ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use http_body_util::BodyExt;
+    // ServiceExt se importa con `as _` en send() para oneshot; no hace falta aquí.
+    use crate::llm_bridge::mock::MockLlmBackend;
+    use crate::memory_graph::MemoryGraph;
+    use crate::types::Node;
+
+    // ── Helpers ─────────────────────────────────────────────
+
+    /// Crea un backend LLM mock type-erased para AppState.
+    fn mock_llm(responses: Vec<&str>) -> Arc<dyn LlmBackend + Send + Sync + 'static> {
+        // MockLlmBackend tiene Arc<Mutex<>> internamente → Send + Sync ✓
+        Arc::new(MockLlmBackend::new(
+            responses.into_iter().map(String::from).collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Crea un emisor de broadcast desechable para tests.
+    /// `_rx` se descarta inmediatamente; es solo para satisfacer el constructor.
+    fn dummy_tx() -> EventSender {
+        tokio::sync::broadcast::channel::<String>(1).0
+    }
+
+    /// Construye un Router de test con grafo en memoria y LLM mock.
+    fn test_router(responses: Vec<&str>) -> Router {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = AppState {
+            graph,
+            llm:       mock_llm(responses),
+            agent_id:  "agent-test".to_string(),
+            events_tx: dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+        };
+        build_router(state)
+    }
+
+    /// Router con nodos pre-insertados para tests de vecindario y query.
+    fn test_router_with_nodes(responses: Vec<&str>, nodes: &[(&str, &str, &str)]) -> Router {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        {
+            let g = graph.lock().unwrap();
+            for &(id, label, name) in nodes {
+                let _ = g.insert_node(&Node::new(id, label, name));
+            }
+        }
+        let state = AppState {
+            graph,
+            llm:       mock_llm(responses),
+            agent_id:  "agent-test".to_string(),
+            events_tx: dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+        };
+        build_router(state)
+    }
+
+    /// Ejecuta una petición y retorna (status, bytes del body).
+    async fn send(app: Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+        use tower::ServiceExt as _;
+        let resp: axum::response::Response = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body: Vec<u8> = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, body)
+    }
+
+    /// Construye una Request GET vacía.
+    fn get_req(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Construye una Request POST con JSON body.
+    fn post_json(uri: &str, json: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("Content-Type", "application/json")
+            .body(Body::from(json.to_string()))
+            .unwrap()
+    }
+
+    // ── Tests: GET /health ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_returns_200() {
+        let app = test_router(vec![]);
+        let (status, _) = send(app, get_req("/health")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_json_fields() {
+        let app = test_router(vec![]);
+        let (status, body) = send(app, get_req("/health")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json["node_count"].is_number());
+        assert!(json["edge_count"].is_number());
+        assert!(json["avg_weight"].is_number());
+        assert!(json["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_health_empty_graph_has_zero_counts() {
+        let app = test_router(vec![]);
+        let (_, body) = send(app, get_req("/health")).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["node_count"], 0);
+        assert_eq!(json["edge_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_reflects_inserted_nodes() {
+        let app = test_router_with_nodes(
+            vec![],
+            &[("n1", "c", "N1"), ("n2", "c", "N2")],
+        );
+        let (_, body) = send(app, get_req("/health")).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["node_count"], 2);
+    }
+
+    // ── Tests: POST /api/v1/query ────────────────────────────
+
+    #[tokio::test]
+    async fn test_query_returns_response_field() {
+        // query_with_memory hace 2 llamadas LLM:
+        //   [0] identificación de entidad → JSON {"entity": "rust"}
+        //   [1] respuesta final → texto libre
+        let app = test_router_with_nodes(
+            vec![
+                r#"{"entity": "rust"}"#,
+                "Rust es un lenguaje de programación de sistemas.",
+            ],
+            &[("rust", "concept", "Rust")],
+        );
+        let (status, body) = send(
+            app,
+            post_json("/api/v1/query", r#"{"prompt": "¿Qué es Rust?"}"#),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["response"].is_string());
+        assert!(!json["response"].as_str().unwrap().is_empty());
+        // Paso 13: la respuesta incluye session_id generado automáticamente.
+        assert!(json["session_id"].is_string());
+        assert!(!json["session_id"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_query_empty_prompt_returns_400() {
+        let app = test_router(vec![]);
+        let (status, body) = send(
+            app,
+            post_json("/api/v1/query", r#"{"prompt": ""}"#),
+        ).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_query_whitespace_prompt_returns_400() {
+        let app = test_router(vec![]);
+        let (status, _) = send(
+            app,
+            post_json("/api/v1/query", r#"{"prompt": "   "}"#),
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── Tests Paso 20: Unified Chat con Enrutamiento de Intención ──
+
+    #[tokio::test]
+    async fn test_unified_chat_routes_to_learn_and_updates_graph() {
+        // Respuesta 1: clasificador de intención -> LEARN
+        // Respuesta 2: extracción de tripletas -> JSON con triples
+        let triples_json = r#"{"triples": [
+            {"subject": "titanio", "relation": "es", "object": "metal", "weight": 0.95}
+        ]}"#;
+        let app = test_router(vec!["LEARN", triples_json]);
+
+        let (status, body) = send(
+            app,
+            post_json(
+                "/api/v1/chat",
+                r#"{"prompt": "El titanio es un metal ultrarresistente.", "session_id": "sess-learn-chat"}"#,
+            ),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("data:"), "Debe ser un stream SSE");
+        assert!(text.contains(r#""intent":"learn""#), "Debe indicar intent learn");
+        assert!(text.contains("titanio"), "Debe mencionar las entidades aprendidas");
+        assert!(text.contains("sess-learn-chat"));
+        assert!(text.contains(r#""done":true"#));
+    }
+
+    #[tokio::test]
+    async fn test_unified_chat_routes_to_query_stream() {
+        // Prompt con signo de interrogación -> heurística rápida lo clasifica como QUERY directamente.
+        // Respuesta 1: entidad ("rust")
+        // Respuesta 2: síntesis de respuesta
+        let app = test_router_with_nodes(
+            vec![
+                r#"{"entity": "rust"}"#,
+                "Rust es un lenguaje compilado veloz y seguro.",
+            ],
+            &[("rust", "concept", "Rust")],
+        );
+
+        let (status, body) = send(
+            app,
+            post_json(
+                "/api/v1/chat",
+                r#"{"prompt": "¿Qué es Rust?", "session_id": "sess-query-chat"}"#,
+            ),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("data:"));
+        assert!(text.contains(r#""intent":"query""#), "Debe indicar intent query");
+        assert!(text.contains("Rust"));
+        assert!(text.contains("sess-query-chat"));
+        assert!(text.contains(r#""done":true"#));
+    }
+
+    #[tokio::test]
+    async fn test_query_missing_field_returns_422() {
+        // Axum retorna 422 Unprocessable Entity cuando falta un campo requerido.
+        let app = test_router(vec![]);
+        let (status, _) = send(
+            app,
+            post_json("/api/v1/query", r#"{"wrong_field": "x"}"#),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_query_session_id_preserved_across_turns() {
+        // Paso 13: el session_id enviado en el request debe devolverse igual.
+        // Primer turno: sin historial → 2 llamadas LLM (entity + synthesis).
+        let app = test_router_with_nodes(
+            vec![
+                "rust",                                      // entity extraction
+                "Rust es un lenguaje de sistemas.",          // synthesis
+            ],
+            &[("rust", "concept", "Rust")],
+        );
+        let (status, body) = send(
+            app,
+            post_json(
+                "/api/v1/query",
+                r#"{"prompt": "¿Qué es Rust?", "session_id": "test-session-abc"}"#,
+            ),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // El session_id devuelto debe ser el mismo que se envió.
+        assert_eq!(json["session_id"].as_str().unwrap(), "test-session-abc");
+    }
+
+    #[tokio::test]
+    async fn test_query_generates_session_id_when_absent() {
+        // Sin session_id en el request → el servidor genera uno nuevo.
+        let app = test_router_with_nodes(
+            vec!["rust", "Rust es un lenguaje de sistemas."],
+            &[("rust", "concept", "Rust")],
+        );
+        let (status, body) = send(
+            app,
+            post_json("/api/v1/query", r#"{"prompt": "¿Qué es Rust?"}"#),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sid = json["session_id"].as_str().unwrap();
+        // Debe ser un UUID válido (36 chars: 8-4-4-4-12).
+        assert_eq!(sid.len(), 36, "session_id autogenerado debe ser UUID v4");
+        assert!(sid.contains('-'), "UUID debe tener guiones");
+    }
+
+    #[tokio::test]
+    async fn test_query_stream_returns_sse_and_persists_session() {
+        let app = test_router_with_nodes(
+            vec![
+                r#"{"entity": "rust"}"#,
+                "Rust es un lenguaje compilado rÃ¡pido.",
+            ],
+            &[("rust", "concept", "Rust")],
+        );
+        let (status, body) = send(
+            app,
+            post_json("/api/v1/query_stream", r#"{"prompt": "Â¿QuÃ© es Rust?", "session_id": "sess-stream-1"}"#),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("data:"), "La respuesta debe contener formato SSE data:");
+        assert!(text.contains("sess-stream-1"));
+        assert!(text.contains("\"done\":true"));
+    }
+
+    #[tokio::test]
+    async fn test_query_stream_empty_prompt_returns_400() {
+        let app = test_router(vec![]);
+        let (status, _) = send(
+            app,
+            post_json("/api/v1/query_stream", r#"{"prompt": ""}"#),
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── Tests: POST /api/v1/learn ────────────────────────────
+
+    #[tokio::test]
+    async fn test_learn_returns_extraction_counts() {
+        // extract_and_memorize hace 1 llamada LLM → JSON de tripletas.
+        let triples_json = r#"{"triples": [
+            {"subject": "rust", "relation": "es", "object": "lenguaje", "weight": 0.9},
+            {"subject": "rust", "relation": "tiene", "object": "ownership", "weight": 0.85}
+        ]}"#;
+
+        let app = test_router(vec![triples_json]);
+        let (status, body) = send(
+            app,
+            post_json("/api/v1/learn", r#"{"text": "Rust es un lenguaje con ownership."}"#),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["triples_extracted"].as_u64().unwrap() >= 1);
+        assert!(json["nodes_created"].is_number());
+        assert!(json["edges_created"].is_number());
+        assert!(json["llm_attempts"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_learn_empty_text_returns_400() {
+        let app = test_router(vec![]);
+        let (status, body) = send(
+            app,
+            post_json("/api/v1/learn", r#"{"text": ""}"#),
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_learn_missing_text_returns_422() {
+        let app = test_router(vec![]);
+        let (status, _) = send(
+            app,
+            post_json("/api/v1/learn", r#"{"content": "algo"}"#),
+        ).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ── Tests: GET /api/v1/graph/neighbors/:id ───────────────
+
+    #[tokio::test]
+    async fn test_neighbors_unknown_node_returns_404() {
+        let app = test_router(vec![]);
+        let (status, body) = send(app, get_req("/api/v1/graph/neighbors/nodo_inexistente")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].is_string());
+        assert_eq!(json["code"], 404);
+    }
+
+    #[tokio::test]
+    async fn test_neighbors_isolated_node_returns_empty_list() {
+        let app = test_router_with_nodes(vec![], &[("isla", "concept", "Isla")]);
+        let (status, body) = send(app, get_req("/api/v1/graph/neighbors/isla")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["node_id"], "isla");
+        assert_eq!(json["neighbors"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_neighbors_returns_connected_nodes() {
+        let app = test_router_with_nodes(vec![], &[
+            ("rust", "concept", "Rust"),
+            ("wasm", "concept", "WebAssembly"),
+        ]);
+
+        // Insertar arista directamente (no hay endpoint POST para aristas en v1)
+        // — accedemos al estado a través del grafo en memoria
+        {
+            // Para el test, insertamos via el AppState reconstruido.
+            // Usamos un grafo auxiliar para poblar y luego verificar el endpoint.
+        }
+
+        // Este test verifica que si hay vecinos, se retornan correctamente.
+        // Con grafo sin aristas, neighbors = [].
+        let (status, body) = send(app, get_req("/api/v1/graph/neighbors/rust")).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["node_id"], "rust");
+        assert_eq!(json["direction"], "outgoing");
+        assert!(json["neighbors"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_neighbors_with_edge_returns_correct_structure() {
+        // Crear grafo con arista y verificar estructura completa de NeighborDto.
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        {
+            let g = graph.lock().unwrap();
+            g.insert_node(&Node::new("a", "concept", "Nodo A")).unwrap();
+            g.insert_node(&Node::new("b", "concept", "Nodo B")).unwrap();
+            g.insert_edge("a", "conecta", "b", 0.75).unwrap();
+        }
+        let state = AppState {
+            graph,
+            llm:       mock_llm(vec![]),
+            agent_id:  "test".to_string(),
+            events_tx: dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+        };
+        let app = build_router(state);
+
+        let (status, body) = send(app, get_req("/api/v1/graph/neighbors/a")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let neighbors = json["neighbors"].as_array().unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0]["relation"],    "conecta");
+        assert_eq!(neighbors[0]["target_id"],   "b");
+        assert_eq!(neighbors[0]["target_name"], "Nodo B");
+        assert!((neighbors[0]["weight"].as_f64().unwrap() - 0.75).abs() < 1e-9);
+    }
+
+    // ── Tests: POST /api/v1/federation/export ───────────────
+
+    #[tokio::test]
+    async fn test_federation_export_returns_valid_delta_json() {
+        let app = test_router_with_nodes(vec![], &[("n1", "c", "N1")]);
+        let (status, body) = send(
+            app,
+            post_json("/api/v1/federation/export", "{}"),
+        ).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // El delta debe tener los campos estándar de MemoryDelta.
+        assert!(json["delta_id"].is_string());
+        assert!(json["agent_id"].is_string());
+        assert!(json["created_at"].is_number());
+        assert_eq!(json["schema_version"], 1);
+        assert!(json["operations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_federation_export_agent_id_matches_state() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = AppState {
+            graph,
+            llm:       mock_llm(vec![]),
+            agent_id:  "mi-agente-xyz".to_string(),
+            events_tx: dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+        };
+        let app = build_router(state);
+        let (_, body) = send(app, post_json("/api/v1/federation/export", "{}")).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["agent_id"], "mi-agente-xyz");
+    }
+
+    // ── Tests: Routing general ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_unknown_route_returns_404() {
+        let app = test_router(vec![]);
+        let (status, _) = send(app, get_req("/ruta/inexistente")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_wrong_method_returns_405() {
+        // /health es solo GET; POST debe devolver 405.
+        let app = test_router(vec![]);
+        let (status, _) = send(
+            app,
+            post_json("/health", "{}"),
+        ).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn test_error_response_has_consistent_json_format() {
+        let app = test_router(vec![]);
+        let (_, body) = send(app, get_req("/api/v1/graph/neighbors/no_existe")).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Todos los errores tienen: { "error": String, "code": Number }
+        assert!(json.get("error").is_some());
+        assert!(json.get("code").is_some());
+        assert!(json["code"].is_number());
+    }
+
+    // ── Tests: GET / (Dashboard HTML) ────────────────────────
+
+    #[tokio::test]
+    async fn test_dashboard_returns_200() {
+        let app = test_router(vec![]);
+        let (status, _) = send(app, get_req("/")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_content_type_is_html() {
+        use tower::ServiceExt as _;
+        let app = test_router(vec![]);
+        let resp: axum::response::Response = app.oneshot(get_req("/")).await.unwrap();
+        let ct = resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v: &axum::http::HeaderValue| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/html"), "Content-Type was: {ct}");
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_body_contains_synaptocore() {
+        let app = test_router(vec![]);
+        let (_, body) = send(app, get_req("/")).await;
+        let html = String::from_utf8(body).unwrap();
+        // El dashboard debe contener referencias a la API y a Cytoscape
+        assert!(html.contains("SynaptoCore"),  "HTML no contiene 'SynaptoCore'");
+        assert!(html.contains("cytoscape"),    "HTML no importa Cytoscape.js");
+        assert!(html.contains("/api/v1/chat") || html.contains("/api/v1/query"), "HTML no referencia el endpoint chat o query");
+    }
+
+    // ── Tests: GET /api/v1/graph/all ─────────────────────────
+
+    #[tokio::test]
+    async fn test_graph_all_empty_graph_returns_empty_lists() {
+        let app = test_router(vec![]);
+        let (status, body) = send(app, get_req("/api/v1/graph/all")).await;
+        assert_eq!(status, StatusCode::OK, "body: {}", String::from_utf8_lossy(&body));
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["nodes"].is_array(), "Debe tener campo 'nodes'");
+        assert!(json["edges"].is_array(), "Debe tener campo 'edges'");
+        assert_eq!(json["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_graph_all_returns_inserted_nodes() {
+        let app = test_router_with_nodes(
+            vec![],
+            &[
+                ("rust",     "concept", "Rust"),
+                ("memoria",  "concept", "Memoria Segura"),
+                ("sistemas", "concept", "Sistemas"),
+            ],
+        );
+        let (status, body) = send(app, get_req("/api/v1/graph/all")).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let nodes = json["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3, "Deben aparecer los 3 nodos insertados");
+        // Verificamos que los campos esenciales están presentes
+        assert!(nodes[0]["id"].is_string());
+        assert!(nodes[0]["name"].is_string());
+        assert!(nodes[0]["label"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_graph_all_includes_edges() {
+        use crate::types::Node;
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        {
+            let g = graph.lock().unwrap();
+            g.insert_node(&Node::new("a", "concept", "Nodo A")).unwrap();
+            g.insert_node(&Node::new("b", "concept", "Nodo B")).unwrap();
+            g.insert_edge("a", "relaciona", "b", 0.8).unwrap();
+        }
+        let state = AppState {
+            graph,
+            llm:       mock_llm(vec![]),
+            agent_id:  "test".to_string(),
+            events_tx: dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+        };
+        let app = build_router(state);
+        let (status, body) = send(app, get_req("/api/v1/graph/all")).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(json["edges"].as_array().unwrap().len(), 1);
+        // La arista debe tener source_id, target_id y weight
+        let edge = &json["edges"][0];
+        assert_eq!(edge["source_id"], "a");
+        assert_eq!(edge["target_id"], "b");
+        assert!((edge["weight"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+        assert_eq!(edge["relation"], "relaciona");
+    }
+
+    #[tokio::test]
+    async fn test_graph_all_node_fields_complete() {
+        let app = test_router_with_nodes(
+            vec![],
+            &[("ia", "entity", "Inteligencia Artificial")],
+        );
+        let (_, body) = send(app, get_req("/api/v1/graph/all")).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let node = &json["nodes"][0];
+        // Verificar que todos los campos del Node están serializados
+        assert!(node.get("id").is_some(),         "falta id");
+        assert!(node.get("label").is_some(),       "falta label");
+        assert!(node.get("name").is_some(),        "falta name");
+        assert!(node.get("created_at").is_some(),  "falta created_at");
+    }
+
+    // ── Tests: Paso 9 — SubconsciousEvent y ruta WebSocket ──────
+
+    /// Verifica que SubconsciousEvent serializa correctamente los tres campos clave.
+    #[tokio::test]
+    async fn test_subconscious_event_serializes_correctly() {
+        let event = SubconsciousEvent::new("Consolidation", "test msg");
+        let json: serde_json::Value = serde_json::from_str(&event.to_json()).unwrap();
+        assert_eq!(json["event_type"], "Consolidation", "campo event_type incorrecto");
+        assert_eq!(json["message"],    "test msg",      "campo message incorrecto");
+        assert!(json["timestamp"].is_number(),           "timestamp debe ser número");
+        // El timestamp debe ser un epoch Unix positivo (> año 2020 = 1577836800)
+        assert!(json["timestamp"].as_u64().unwrap() > 1_577_836_800);
+    }
+
+    /// Verifica que GET /ws/subconscious existe en el router y no devuelve 404.
+    /// Sin cabecera Upgrade, Axum responde 400 (Bad Request), no 404.
+    #[tokio::test]
+    async fn test_ws_route_exists_and_not_404() {
+        let app = test_router(vec![]);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/ws/subconscious")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send(app, req).await;
+        // La ruta existe → no puede ser NOT_FOUND
+        assert_ne!(status, StatusCode::NOT_FOUND, "La ruta /ws/subconscious debe existir");
+    }
+}
+

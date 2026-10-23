@@ -1,0 +1,7 @@
+/target
+
+# Configuración local (la plantilla versionada es .env.example)
+.env
+
+# Memoria en uso: estado de ejecución, no código
+synaptocore_memory.db*

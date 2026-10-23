@@ -1,0 +1,27 @@
+[botdetection]
+ipv4_prefix = 32
+ipv6_prefix = 48
+# Confiar en peticiones desde la red local y Docker
+trusted_proxies = [
+  '127.0.0.0/8',
+  '::1',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '10.0.0.0/8',
+]
+
+[botdetection.ip_limit]
+filter_link_local = false
+link_token = false
+
+[botdetection.ip_lists]
+block_ip = []
+# Pass-list: localhost + redes privadas = acceso sin restricción
+pass_ip = [
+  '127.0.0.0/8',
+  '::1/128',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '10.0.0.0/8',
+]
+pass_searxng_org = false

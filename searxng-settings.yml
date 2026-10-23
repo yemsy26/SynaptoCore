@@ -1,0 +1,19 @@
+# SearXNG settings for SynaptoCore integration
+# Habilita el formato JSON y desactiva bot-detection para uso local.
+
+use_default_settings: true
+
+server:
+  secret_key: "synaptocore-searxng-secret-local-dev"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "es-ES"
+  # CRITICO: habilitar formato JSON para la API del subconsciente.
+  # Por defecto SearXNG solo permite "html". Sin "json" aqui, responde 403.
+  formats:
+    - html
+    - json

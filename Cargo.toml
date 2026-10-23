@@ -1,0 +1,164 @@
+[package]
+name        = "synaptocore"
+version     = "0.17.0"
+edition     = "2021"
+description = "SynaptoCore — Autonomous Cognitive Architecture: Memory · Bridge · TruthFilter · Subconscious · CLI"
+authors     = ["SynaptoCore Team"]
+
+# ══════════════════════════════════════════════════════════════════
+# DECISIÓN ARQUITECTÓNICA — Paso 2: LLM Bridge
+#
+# CANDIDATOS EVALUADOS para inferencia GGUF local con GPU NVIDIA:
+#
+# ① llama-cpp-4 v0.8 (ELEGIDO)
+#    - Bindings seguros sobre llama.cpp C++, la referencia del ecosistema.
+#    - Feature `cuda` delega la compilación CUDA a la build.rs del crate
+#      → cero código unsafe extra en nuestro código.
+#    - API de alto nivel: LlamaBackend → LlamaModel → LlamaContext → Sampler.
+#    - Soporta Qwen2.5, Llama3.2, Mistral, Phi3 out-of-the-box (GGUF).
+#    - rust-version: 1.88, activamente mantenido.
+#
+# ② llama-rs v0.23 — DESCARTADO
+#    - Usa `cudarc` para CUDA, que requiere matchear versión exacta de
+#      CUDA Toolkit del sistema. En Windows con RTX esto es frágil.
+#    - Su API de generación es async-first (tokio), lo que añade overhead
+#      de runtime para inferencia que es inherentemente single-threaded.
+#
+# ③ llama-cpp-2 v0.1 — DESCARTADO
+#    - Predecesor de llama-cpp-4. Misma genealogía pero con API más
+#      verbosa y menos ergonómica para samplers encadenados.
+#
+# FEATURE FLAG DE GPU:
+#   Por defecto compilamos sin cuda para que `cargo test` funcione
+#   en CI sin CUDA Toolkit. El usuario activa GPU con:
+#     cargo run --release --features cuda
+#   Documentado en README y en la función init_brain().
+#
+# DECISIÓN: rusqlite (ver Paso 1) sin cambios.
+# ══════════════════════════════════════════════════════════════════
+
+[features]
+default = []
+# Habilita aceleración NVIDIA CUDA. Requiere CUDA Toolkit en PATH.
+cuda    = ["llama-backend", "llama-cpp-4/cuda"]
+# Habilita aceleración Vulkan (alternativa sin CUDA Toolkit).
+vulkan  = ["llama-backend", "llama-cpp-4/vulkan"]
+# Backend LLM real (llama-cpp-4). Se activa al elegir cuda o vulkan,
+# o manualmente para CPU: --features llama-backend
+llama-backend = ["dep:llama-cpp-4"]
+# Paso 12 — Búsqueda semántica vectorial (fastembed + ONNX Runtime).
+# Sin esta feature: semantic_search() hace fallback limpio a LIKE search.
+# Los 159 tests pasan SIN esta feature (cero descargas de red en CI).
+# Activar producción: cargo run --release --features embeddings
+embeddings = ["dep:fastembed"]
+
+[dependencies]
+# ── Paso 1: Memory Graph ──────────────────────────────────────────
+rusqlite   = { version = "0.32", features = ["bundled"] }
+thiserror  = "1.0"
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid       = { version = "1.11", features = ["v4"] }
+# rayon eliminado en Paso 17: auditoría confirmó 0 usos reales en el código.
+
+# ── Paso 2: LLM Bridge ───────────────────────────────────────────
+# llama-cpp-4: bindings Rust sobre llama.cpp. Compila llama.cpp C++
+# como staticlib en build.rs. No requiere instalar llama.cpp por separado.
+# Sin features extra → CPU con SIMD. Feature `cuda` → NVIDIA RTX.
+# `optional = true`: solo se compila cuando se activa `llama-backend`.
+llama-cpp-4 = { version = "0.8", default-features = false, optional = true }
+
+# log: facade de logging estándar de Rust. Bajo costo (macro que
+# desaparece si no hay subscriber). Usamos tracing-compatible.
+log = "0.4"
+
+# ─── Paso 7: API Server ──────────────────────────────────────────────────────
+# axum: framework HTTP async construido sobre Tower + Tokio.
+# Elegido sobre Actix-web (runtime propio incompatible) y Rocket (nightly).
+axum = { version = "0.8", features = ["ws"] }
+# tokio: runtime async con thread-pool para I/O y CPU-bound.
+# `full` habilita time, fs, net, signal, etc.
+tokio = { version = "1", features = ["full"] }
+# tower-http eliminado en Paso 17: CORS y logging se gestionan directamente en
+# build_router() sin necesidad del middleware tower-http (0 usos confirmados).
+# tower: utilidades para ServiceExt (oneshot en tests).
+tower = { version = "0.5", features = ["util"] }
+
+# ── Paso 10: Cliente HTTP para SearXNG ───────────────────────────────────────
+# reqwest: cliente HTTP async maduro. Feature `json` habilita des/serialización
+# automática con serde. `rustls-tls` usa rustls en lugar de OpenSSL → binario
+# 100% portable sin dependencias de sistema (ninguna DLL de OpenSSL en Windows).
+# `blocking` habilita la API síncrona que usamos dentro de spawn_blocking.
+# `default-features = false` elimina el TLS de sistema (OpenSSL) y el cliente
+# async innecesario para este path.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking", "stream"], default-features = false }
+# chrono: fecha y hora con timezone-awareness. Feature `clock` habilita
+# SystemTime → DateTime (sin depender de libc completo).
+# `default-features = false` evita arrastrar serde de chrono y otros.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# urlencoding: encoda la query de búsqueda como URL-safe string.
+# Crate minimal (una sola función pura, cero transitive deps).
+urlencoding = "2.1"
+
+# ── Paso 12: Motor de Embeddings Semánticos ──────────────────────────────────
+# fastembed: embeddings densos locales vía ONNX Runtime (CPU-only por defecto).
+# `optional = true` → solo se compila con --features embeddings.
+# El modelo por defecto (BGE-Small-EN-v1.5, ~25MB) se descarga de HuggingFace
+# en el primer uso. Subsiguientes usos usan caché en disco (~/.cache/fastembed).
+fastembed = { version = "4", default-features = false, optional = true }
+
+# ── Paso 11: CLI Periférica (sc) ─────────────────────────────────────────────
+# clap: parser de argumentos estándar de facto en Rust.
+# Feature `derive` habilita los macros #[derive(Parser, Subcommand)].
+clap = { version = "4", features = ["derive"] }
+# colored: colores ANSI cross-platform en la terminal (funciona en Windows 10+).
+colored = "2"
+# tokio-tungstenite: cliente WebSocket async sobre Tokio.
+# Feature `rustls-tls-webpki-roots` usa rustls (mismo TLS que reqwest → cero DLLs extra).
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# futures-util: StreamExt + SinkExt para el cliente WebSocket.
+# Es una dep transitiva de tokio-tungstenite; la declaramos explícita
+# para poder usarla directamente en sc.rs sin depender del grafo implícito.
+async-stream = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std", "async-await"] }
+
+# ── Binarios adicionales ──────────────────────────────────────────────────────
+[[bin]]
+name = "sc"
+path = "src/bin/sc.rs"
+
+[dev-dependencies]
+tempfile       = "3.14"
+# http-body-util: extrae bytes del body en tests de Axum con BodyExt.
+http-body-util = "0.1"
+
+# ── Perfil Release (CPU / CI / distribución genérica) ──────────────────────────
+# opt-level = 3   : optimización máxima de velocidad (vectorización SIMD automática).
+# lto = "fat"     : Link-Time Optimization completo entre todos los crates del binario.
+#                   Permite que LLVM optimice cruzando fronteras de crates.
+#                   Coste: compilación más lenta (solo en release, irrelevante en dev).
+# codegen-units=1 : un solo módulo de codegen → LLVM ve todo el crate a la vez.
+#                   Aumenta tiempo de compilación pero maximiza inline y eliminación
+#                   de código muerto. Imprescindible junto con fat LTO.
+# strip="debuginfo": elimina símbolos de debug del binario final (reduce ~60-70% tamaño).
+#                    Los símbolos de panic y backtrace se conservan con "debuginfo"
+#                    (vs "symbols" que elimina absolutamente todo).
+# panic="abort"   : en un panic, el proceso aborta directamente en lugar de
+#                   desenrollar el stack. Elimina el código de unwinding del binario
+#                   (~100-300 KB menos) y es más rápido. Apropiado para un servidor
+#                   donde un panic es un bug y debe reiniciarse externamente.
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = "debuginfo"
+panic         = "abort"
+
+# ── Perfil Release-GPU (RTX/Vulkan — máximo rendimiento con llama.cpp) ─────────
+# Idéntico a release pero con símbolos de línea para profiling con NVIDIA Nsight.
+# Uso: cargo build --profile release-gpu --features cuda
+# El ejecutable se genera en: target/release-gpu/synaptocore
+[profile.release-gpu]
+inherits      = "release"
+strip         = false
+debug         = 1        # líneas de debug para profiler de GPU (sin overhead en producción)
