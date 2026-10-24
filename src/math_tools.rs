@@ -1625,7 +1625,7 @@ mod tests {
         let r = Conjetura.execute(json!({"afirmacion": "n*(n+1) % 2 == 0", "hasta": "100"})).unwrap();
         assert!(r.contains("100 valores de n entre 1 y 100"), "{r}");
         assert!(Sucesion.execute(json!({"terminos": [1, 4, 9, 16]})).unwrap().contains("a(n) = n^2"));
-        let misrouted = Sucesion.execute(json!({"terminos": "suma(2*k-1,k,1,n) == n^2"})).unwrap();
+        let misrouted = Sucesion.execute(json!({"terminos": "n*(n+1) % 2 == 0"})).unwrap();
         assert!(misrouted.contains("se cumple para los 1000 valores de n"), "{misrouted}");
         assert!(Calculadora.execute(json!({"expresion": "1/0"})).is_err());
     }

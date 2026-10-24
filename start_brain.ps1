@@ -1,19 +1,23 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # =============================================================================
 # start_brain.ps1 — Script de Arranque Rápido de SynaptoCore
 # =============================================================================
 # Uso:
-#   .\start_brain.ps1                      # CPU (ServerMock/LLM desactivado)
-#   .\start_brain.ps1 -Gpu                 # GPU NVIDIA RTX (llama.cpp + CUDA)
-#   .\start_brain.ps1 -Gpu -Vulkan         # GPU AMD/Intel (llama.cpp + Vulkan)
-#   .\start_brain.ps1 -Embeddings          # Activa búsqueda semántica vectorial
-#   .\start_brain.ps1 -Gpu -Embeddings     # Producción completa (RTX + Embeddings)
+#   .\start_brain.ps1                      # uso normal: Ollama + búsqueda semántica
+#
+# Opciones experimentales (compilan los enlaces con llama.cpp; el servidor
+# sigue usando Ollama como motor):
+#   .\start_brain.ps1 -Gpu                 # llama.cpp + CUDA (NVIDIA)
+#   .\start_brain.ps1 -Vulkan              # llama.cpp + Vulkan (AMD / Intel)
+#
+# -Embeddings se mantiene por compatibilidad: la búsqueda semántica ya viene
+# activada por defecto.
 # =============================================================================
 
 param(
-    [switch]$Gpu,       # Activa el backend LLM real con CUDA (NVIDIA RTX)
-    [switch]$Vulkan,    # Activa el backend LLM real con Vulkan (AMD / Intel Arc)
-    [switch]$Embeddings # Activa fastembed para búsqueda semántica vectorial
+    [switch]$Gpu,       # Experimental: compila llama.cpp con CUDA (NVIDIA)
+    [switch]$Vulkan,    # Experimental: compila llama.cpp con Vulkan (AMD / Intel Arc)
+    [switch]$Embeddings # Compatibilidad: la búsqueda semántica ya es la opción por defecto
 )
 
 Set-StrictMode -Version Latest
@@ -66,7 +70,7 @@ if ($Gpu -and $Vulkan) {
     $features += "vulkan"
     $features += "llama-backend"
 } else {
-    Write-Host "💡 Modo CPU (sin LLM real). Para activar GPU: .\start_brain.ps1 -Gpu" -ForegroundColor Yellow
+    Write-Host "💡 Motor LLM: Ollama (usa la GPU automáticamente si está disponible)." -ForegroundColor Yellow
 }
 
 if ($Embeddings) {
@@ -86,8 +90,9 @@ if ($features.Count -gt 0) {
 # ── 4. Mostrar configuración final ────────────────────────────────────────────
 Write-Host ""
 Write-Host "Configuración:" -ForegroundColor White
-Write-Host "  Host API  : $($env:SC_HOST):$($env:SC_PORT)" -ForegroundColor DarkGray
-Write-Host "  Memoria DB: $($env:SC_DB_PATH)" -ForegroundColor DarkGray
+$port = if ($env:SYNAPTOCORE_PORT) { $env:SYNAPTOCORE_PORT } else { "8080" }
+Write-Host "  Panel/API : http://127.0.0.1:$port/" -ForegroundColor DarkGray
+Write-Host "  Modelo    : $(if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { 'qwen3.5:2b-q4_K_M' }) (Ollama)" -ForegroundColor DarkGray
 if ($env:SYNAPTOCORE_MODEL_PATH) {
     Write-Host "  Modelo LLM: $($env:SYNAPTOCORE_MODEL_PATH)" -ForegroundColor DarkGray
 }

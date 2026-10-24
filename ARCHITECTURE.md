@@ -47,45 +47,30 @@ SynaptoCore usa un único proceso con tres capas de concurrencia:
 
 ## 2. Esquema SQLite
 
+El esquema se crea en `MemoryGraph::create_schema` y se actualiza en `run_migrations` (migraciones idempotentes: una base antigua se abre sin perder datos). Resumen de las tablas:
+
+| Tabla | Contenido |
+|-------|-----------|
+| `nodes` | Conceptos: `id` canónico, `label`, `name`, `properties` (JSON), `created_at`, `embedding` (BLOB `f32` little-endian) y `canon` (nombre normalizado e indexado). |
+| `edges` | Relaciones `source_id → relation → target_id` con `weight`, `created_at`, `last_accessed`, `decayed_at`, `origin` (procedencia) y `source` (URLs, lote de importación…). Única por tripleta. |
+| `passages` | Pasajes de texto con `title`, `url`, `origin`, `question`, `last_used`, `uses` y `embedding`. Texto único. |
+| `passages_fts` | Índice FTS5 de los pasajes (`unicode61 remove_diacritics 2`). |
+| `meta` | Metadatos, como el modelo que generó los embeddings (si cambia, se regeneran). |
+| `gap_attempts` | Pares de conceptos que exploró el aprendizaje autónomo y su enfriamiento. |
+| `imports` | Lotes importados, con su progreso para reanudar o deshacer. |
+| `investigations` | Investigaciones profundas: estado completo en JSON. |
+
+**Pragmas** aplicados en cada conexión:
+
 ```sql
--- Nodos del grafo de conocimiento
-CREATE TABLE IF NOT EXISTS nodes (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    weight     REAL NOT NULL DEFAULT 1.0,
-    decay_rate REAL NOT NULL DEFAULT 0.01,
-    last_accessed INTEGER NOT NULL DEFAULT 0,
-    embedding  BLOB,    -- Vec<f32> serializado como bytes little-endian (Paso 12)
-    created_at INTEGER NOT NULL DEFAULT 0
-);
-
--- Aristas semánticas (tripleta: source →[relation]→ target)
-CREATE TABLE IF NOT EXISTS edges (
-    id        TEXT PRIMARY KEY,
-    source_id TEXT NOT NULL REFERENCES nodes(id),
-    relation  TEXT NOT NULL,
-    target_id TEXT NOT NULL REFERENCES nodes(id),
-    weight    REAL NOT NULL DEFAULT 1.0,
-    created_at INTEGER NOT NULL DEFAULT 0
-);
-
--- Schema migrations
-CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-
--- Índices para traversal y búsqueda
-CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
-CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
-```
-
-**Pragmas de rendimiento** aplicados en cada conexión:
-```sql
-PRAGMA journal_mode = WAL;     -- lecturas concurrentes con escrituras
-PRAGMA synchronous  = NORMAL;  -- balance durabilidad/velocidad
-PRAGMA cache_size   = -65536;  -- 64 MB de caché en página
+PRAGMA journal_mode = WAL;     -- los lectores no bloquean al escritor
+PRAGMA synchronous  = NORMAL;  -- fsync solo en checkpoints
+PRAGMA cache_size   = -16384;  -- 64 MB de caché de páginas
 PRAGMA foreign_keys = ON;
+PRAGMA temp_store   = MEMORY;
 ```
 
-**Embedding blob**: los vectores `Vec<f32>` se serializan como `bytemuck::cast_slice::<f32, u8>`. La deserialización reconstruye `Vec<f32>` alineando bytes. Cero overhead de serialización JSON.
+**Índices vectoriales.** Los embeddings de los nodos y de los pasajes se cargan al arrancar en dos índices planos en RAM (`VectorIndex`): búsqueda exacta por producto escalar sobre vectores normalizados. SQLite sigue siendo la fuente de verdad.
 
 ---
 

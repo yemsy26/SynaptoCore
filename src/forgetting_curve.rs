@@ -264,8 +264,10 @@ mod tests {
             ("a", "rel", "b", 0.9, past),
         ]);
 
-        // λ = 0.001: W_t = 0.9 × e^(-0.001 × 1000) = 0.9 × e^(-1) ≈ 0.331
+        // λ = 0.001: W_t = 0.9 × e^(-0.001 × 1000) = 0.9 × e^(-1) ≈ 0.331.
+        // La pasada lee el reloj después: admite hasta 2 s de diferencia.
         let expected = 0.9 * (-0.001 * 1000.0_f64).exp();
+        let slowest  = 0.9 * (-0.001 * 1002.0_f64).exp();
 
         let report = g.apply_decay_and_prune(&|_| Some(0.001), 0.05).unwrap();
 
@@ -276,8 +278,8 @@ mod tests {
         let hood = g.get_neighbors("a", crate::memory_graph::TraversalDirection::Outgoing).unwrap();
         let actual_weight = hood.neighbors[0].0.weight;
         assert!(
-            (actual_weight - expected).abs() < 1e-6,
-            "expected {expected:.6}, got {actual_weight:.6}"
+            actual_weight <= expected + 1e-9 && actual_weight >= slowest - 1e-9,
+            "expected {expected:.6} (≥ {slowest:.6}), got {actual_weight:.6}"
         );
     }
 
@@ -328,14 +330,15 @@ mod tests {
 
     #[test]
     fn test_recent_edge_survives_decay() {
-        // Arista recién creada (Δt ≈ 0) debe sobrevivir con cualquier λ.
+        // Arista recién creada (Δt de 0 a unos segundos) debe sobrevivir. Con
+        // λ = 1/s bastaba cruzar un cambio de segundo para podarla.
         let now = crate::types::current_unix_ts();
 
         let g = setup_graph_with_timestamps(&[
             ("nuevo_a", "rel", "nuevo_b", 0.8, now),
         ]);
 
-        let report = g.apply_decay_and_prune(&|_| Some(1.0), 0.10).unwrap();
+        let report = g.apply_decay_and_prune(&|_| Some(0.001), 0.10).unwrap();
 
         assert_eq!(report.edges_pruned, 0, "Arista reciente no debe podarse");
 
@@ -420,11 +423,12 @@ mod tests {
 
         let g = setup_graph_with_timestamps(&[
             ("fuerte", "rel", "b", 0.9, now),   // reciente → sobrevive
-            ("debil",  "rel", "b", 0.5, past),   // antigua  → decae a ~0 con λ=1.0
+            ("debil",  "rel", "b", 0.5, past),   // antigua  → decae a ~0
         ]);
 
-        // Insertar nodo "b" explícitamente (ya lo hace setup_graph).
-        let report = g.apply_decay_and_prune(&|_| Some(1.0), 0.10).unwrap();
+        // λ = 0,001/s: la antigua (50 000 s) cae a ~0 y la reciente aguanta
+        // aunque la pasada llegue unos segundos después.
+        let report = g.apply_decay_and_prune(&|_| Some(0.001), 0.10).unwrap();
 
         assert!(report.edges_pruned >= 1, "La arista débil debe podarse");
 

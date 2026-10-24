@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 :: ============================================================================
-:: start_brain.bat — SynaptoCore v0.17 Quick-Start (Windows)
+:: start_brain.bat — SynaptoCore Quick-Start (Windows)
 :: ============================================================================
 :: Flujo:
 ::   [1] Validar dependencias (Rust, Ollama)
@@ -16,11 +16,11 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 set "SCRIPT_DIR=%~dp0"
 
-title SynaptoCore v0.17 - Iniciador
+title SynaptoCore - Iniciador
 
 echo.
 echo  +=================================================================+
-echo  ^|        SynaptoCore v0.17 - Autonomous Cognitive Brain           ^|
+echo  ^|        SynaptoCore                                              ^|
 echo  +=================================================================+
 echo.
 
@@ -60,9 +60,7 @@ if exist "%SCRIPT_DIR%.env" (
 :: Valores por defecto
 if not defined OLLAMA_HOST  set "OLLAMA_HOST=http://localhost:11434"
 if not defined OLLAMA_MODEL set "OLLAMA_MODEL=qwen3.5:2b-q4_K_M"
-if not defined SC_HOST      set "SC_HOST=127.0.0.1"
-if not defined SC_PORT      set "SC_PORT=8080"
-if not defined SC_DB_PATH   set "SC_DB_PATH=synaptocore_memory.db"
+if not defined SYNAPTOCORE_PORT set "SYNAPTOCORE_PORT=8080"
 echo.
 
 :: ══════════════════════════════════════════════════════════════════════════
@@ -197,9 +195,7 @@ echo.
 set "OLLAMA_HOST=%OLLAMA_HOST%"
 set "OLLAMA_MODEL=%OLLAMA_MODEL%"
 set "SEARXNG_URL=%SEARXNG_URL%"
-set "SC_HOST=%SC_HOST%"
-set "SC_PORT=%SC_PORT%"
-set "SC_DB_PATH=%SC_DB_PATH%"
+set "SYNAPTOCORE_PORT=%SYNAPTOCORE_PORT%"
 
 :: Lanzar el servidor en una nueva ventana que se cierra sola con /c.
 :: /c ejecuta el comando y cierra al terminar (o al Ctrl+C).
@@ -209,11 +205,11 @@ start "SynaptoCore - Servidor" cmd /k "cd /d %SCRIPT_DIR% && echo Iniciando Syna
 :: ══════════════════════════════════════════════════════════════════════════
 :: [5/5] POLLING HTTP + ABRIR NAVEGADOR
 :: ══════════════════════════════════════════════════════════════════════════
-echo  [5/5] Esperando que el servidor responda en http://%SC_HOST%:%SC_PORT%/health
+echo  [5/5] Esperando que el servidor responda en http://127.0.0.1:%SYNAPTOCORE_PORT%/health
 echo        ^(Si es el primer build, espera 2-5 minutos^)
 echo.
 
-set "HEALTH_URL=http://%SC_HOST%:%SC_PORT%/health"
+set "HEALTH_URL=http://127.0.0.1:%SYNAPTOCORE_PORT%/health"
 set "MAX_INTENTOS=90"
 set "INTENTO=0"
 set "SERVIDOR_LISTO=0"
@@ -247,7 +243,7 @@ echo  El servidor no respondio en !MAX_INTENTOS! intentos ^(~3 min^).
 echo  El servidor sigue compilando en la otra ventana.
 echo.
 echo  Cuando veas el banner de SynaptoCore alli, abre manualmente:
-echo    http://%SC_HOST%:%SC_PORT%/
+echo    http://127.0.0.1:%SYNAPTOCORE_PORT%/
 echo.
 goto DONE
 
@@ -256,9 +252,9 @@ echo.
 echo  +================================================================+
 echo  ^|  SynaptoCore listo!                                            ^|
 echo  ^|                                                                ^|
-echo  ^|  API    : http://%SC_HOST%:%SC_PORT%/health                   ^|
-echo  ^|  Query  : POST http://%SC_HOST%:%SC_PORT%/api/v1/query        ^|
-echo  ^|  Learn  : POST http://%SC_HOST%:%SC_PORT%/api/v1/learn        ^|
+echo  ^|  API    : http://127.0.0.1:%SYNAPTOCORE_PORT%/health                   ^|
+echo  ^|  Query  : POST http://127.0.0.1:%SYNAPTOCORE_PORT%/api/v1/query        ^|
+echo  ^|  Learn  : POST http://127.0.0.1:%SYNAPTOCORE_PORT%/api/v1/learn        ^|
 if defined SEARXNG_URL (
     echo  ^|  SearXNG: %SEARXNG_URL%                                ^|
 )
@@ -266,7 +262,7 @@ echo  +================================================================+
 echo.
 
 :: Abrir el navegador predeterminado.
-start "" "http://%SC_HOST%:%SC_PORT%/"
+start "" "http://127.0.0.1:%SYNAPTOCORE_PORT%/"
 
 echo  Navegador abierto. Esta ventana se cerrara en 5 segundos...
 powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 5" >nul 2>&1

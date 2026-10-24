@@ -2,8 +2,13 @@
 name        = "synaptocore"
 version     = "0.17.0"
 edition     = "2021"
-description = "SynaptoCore — Autonomous Cognitive Architecture: Memory · Bridge · TruthFilter · Subconscious · CLI"
-authors     = ["SynaptoCore Team"]
+description = "Memoria cognitiva local: grafo de conocimiento que aprende, verifica, olvida y responde citando sus fuentes"
+authors     = ["Ramón Burgos"]
+license     = "MIT"
+repository  = "https://github.com/yemsy26/SynaptoCore"
+readme      = "README.md"
+keywords    = ["knowledge-graph", "memory", "llm", "ollama", "sqlite"]
+categories  = ["command-line-utilities", "web-programming::http-server"]
 
 # ══════════════════════════════════════════════════════════════════
 # DECISIÓN ARQUITECTÓNICA — Paso 2: LLM Bridge

@@ -885,7 +885,9 @@ mod integration_tests {
 
         graph.reinforce_edge("a", "rel2", "c_node").unwrap();
 
-        let report = graph.apply_decay_and_prune(&|_| Some(1.0), 0.10).unwrap();
+        // λ = 0,001/s: la antigua (100 000 s) cae a ~0 y la reforzada aguanta
+        // aunque la pasada llegue unos segundos después.
+        let report = graph.apply_decay_and_prune(&|_| Some(0.001), 0.10).unwrap();
         assert!(report.edges_pruned >= 1, "La arista antigua debe podarse");
 
         let hood = graph.get_neighbors("a", TraversalDirection::Outgoing).unwrap();

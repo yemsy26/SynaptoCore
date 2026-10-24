@@ -1,213 +1,289 @@
 # SynaptoCore
 
-**Motor Neurosimbólico de Conocimiento — 100% local, 0 dependencias de nube.**
+**Memoria cognitiva local: un grafo de conocimiento que aprende, verifica lo que aprende, olvida lo que no usa y responde citando de dónde lo sabe.**
 
-SynaptoCore es un sistema de memoria semántica persistente con razonamiento autónomo. Almacena conocimiento en un grafo de tripletas (sujeto → relación → objeto), lo consolida en reposo mediante un bucle subconsciente, y lo expone a través de una API REST, una CLI y un dashboard en tiempo real. La inferencia LLM corre localmente via `llama.cpp` con aceleración NVIDIA RTX o CPU SIMD; sin llamadas a OpenAI, Anthropic ni ningún proveedor externo.
+[![CI](https://github.com/yemsy26/SynaptoCore/actions/workflows/ci.yml/badge.svg)](https://github.com/yemsy26/SynaptoCore/actions/workflows/ci.yml)
+[![Licencia: MIT](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/Rust-estable-orange.svg)
+![Plataformas](https://img.shields.io/badge/plataformas-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
 
----
-
-## Índice
-
-1. [Arquitectura](#arquitectura)
-2. [Requisitos](#requisitos)
-3. [Instalación y primer arranque](#instalación-y-primer-arranque)
-4. [Configuración (.env)](#configuración-env)
-5. [Herramientas matemáticas](#herramientas-matemáticas)
-6. [Importar conocimiento por lotes](#importar-conocimiento-por-lotes)
-7. [Investigación profunda](#investigación-profunda)
-8. [Memoria de pasajes](#memoria-de-pasajes)
-9. [API REST](#api-rest)
-10. [CLI — sc](#cli--sc)
-11. [Memoria Federada (.synapse)](#memoria-federada-synapse)
-12. [Features opcionales](#features-opcionales)
-13. [Compilación de producción](#compilación-de-producción)
+SynaptoCore es un servidor escrito en Rust que da a un modelo de lenguaje local una memoria a largo plazo. Guarda el conocimiento como relaciones (`sujeto → relación → objeto`) en SQLite, junto con el texto de donde salió. Cuando no sabe algo, lo investiga en la web, responde citando las fuentes y aprende en segundo plano solo lo que puede verificar. Todo corre en tu máquina: el modelo (vía [Ollama](https://ollama.com)), el buscador ([SearXNG](https://docs.searxng.org)) y la base de datos.
 
 ---
 
-## Arquitectura
+## Contenido
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        SynaptoCore v0.17                         │
-│                                                                   │
-│  ┌──────────────┐   query   ┌──────────────────────────────────┐ │
-│  │   API REST   │ ────────► │         LlmBridge / ReAct        │ │
-│  │  (Axum 0.8)  │          │  correferencia → búsqueda →       │ │
-│  │  port 8080   │ ◄──────── │  tool loop → síntesis            │ │
-│  └──────┬───────┘  respuesta└────────────┬─────────────────────┘ │
-│         │                               │                         │
-│         │ learn                   read/write                      │
-│         ▼                               ▼                         │
-│  ┌──────────────┐          ┌────────────────────────┐            │
-│  │  SessionMgr  │          │     MemoryGraph         │            │
-│  │  (RAM/RwLock)│          │  SQLite WAL + embeddings│            │
-│  │  ventana 6   │          │  tripletas + decay rate │            │
-│  └──────────────┘          └────────────┬───────────┘            │
-│                                          │                         │
-│  ┌──────────────┐          ┌────────────▼───────────┐            │
-│  │  ToolRegistry│          │    CuriosityEngine      │            │
-│  │  TimeTool    │          │  (bucle subconsciente)  │            │
-│  │  WebhookTool │          │  nodos → hipótesis →    │            │
-│  │  Conectores  │          │  SearXNG → validación → │            │
-│  │  (JSON)      │          │  consolidación en grafo  │            │
-│  └──────────────┘          └─────────────────────────┘            │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Módulos y su analogía neurológica
-
-| Módulo | Archivo | Analogía | Función |
-|--------|---------|----------|---------|
-| **Memory Graph** | `memory_graph.rs` | Hipocampo | Grafo de tripletas semánticas en SQLite WAL. Embeddings f32 (BGE-Small). Similitud coseno. |
-| **LLM Bridge** | `llm_bridge.rs` | Córtex Prefrontal | Extracción de entidades, síntesis de respuesta, bucle ReAct multi-paso. |
-| **Session Manager** | `working_memory.rs` | Lóbulo Frontal | Memoria de trabajo en RAM. Ventana deslizante de 6 mensajes por sesión. Resolución de correferencia. |
-| **Curiosity Engine** | `subconscious.rs` | Subconsciente / sueño REM | Bucle autónomo: muestrea pares de nodos, formula hipótesis, valida via SearXNG, consolida tripletas. |
-| **Forgetting Curve** | `forgetting_curve.rs` | Olvido de Ebbinghaus | Decaimiento exponencial según la procedencia de cada arista (lo enseñado no se olvida). Poda de conexiones débiles. Refuerzo Hebbiano en consulta. |
-| **Truth Filter** | `truth_filter.rs` | Corteza Frontal (inhibición) | Validación epistémica 3-way (Verificado / Contradictorio / Inconcluso) antes de consolidar. |
-| **Tool Registry** | `tools.rs` | Córtex Motor | Trait `Tool`. ReAct loop: decide herramienta → ejecuta → acumula en scratchpad → sintetiza. |
-| **Federated Memory** | `federated_memory.rs` | Red Neuronal Distribuida | Intercambio de deltas entre agentes via archivos `.synapse`. |
-| **API Server** | `api_server.rs` | Interfaz Sensoriomotora | Axum 0.8. REST + WebSocket de telemetría. |
-
-### Flujo de una consulta
-
-```
-Usuario: "¿En qué lenguaje está hecho?"
-(sesión activa: antes preguntó qué es PostgreSQL)
-
-1. SessionManager.get_history()  → recupera los últimos mensajes
-2. Planificador (1 llamada)      → intención, reescritura con el historial,
-                                   entidades y herramienta: "¿En qué lenguaje está hecho PostgreSQL?"
-3. Memoria                       → contexto semántico del grafo para cada entidad
-                                   y pasajes guardados relevantes, citables como [n]
-4. Si la memoria no lo sabe      → busca en la web (SearXNG) y responde citando [n]
-5. Respuesta en streaming        → y, si investigó, guarda los pasajes de las fuentes
-                                   y aprende lo verificado en segundo plano
-6. SessionManager.push()         → guarda el turno
-7. API → { response, session_id, answered_from, sources }
-```
-
-### Bucle Subconsciente (ReAct autónomo)
-
-El `CuriosityEngine` corre en un hilo Tokio separado mientras el servidor está activo:
-
-```
-cada N minutos:
-  1. Elige un par de conceptos relacionados y sin conectar (ej. "PostgreSQL", "MVCC")
-  2. LLM formula una pregunta: "¿Cómo usa PostgreSQL el MVCC?"
-  3. SearXNG busca evidencia en la web (si SEARXNG_URL está definida)
-  4. EpistemicValidator: Verificado / Contradictorio / Inconcluso
-  5. Si Verificado → insert_edge("postgresql", "usa", "mvcc", 0.8)
-  6. ForgettingCurve.run_nightly_cleanup() → decae aristas sin refuerzo
-```
+- [Características](#características)
+- [Cómo funciona](#cómo-funciona)
+- [Requisitos](#requisitos)
+- [Instalación](#instalación)
+- [Primeros pasos](#primeros-pasos)
+- [Guía de uso](#guía-de-uso)
+- [Configuración](#configuración)
+- [Desarrollo](#desarrollo)
+- [Solución de problemas](#solución-de-problemas)
+- [Contribuir](#contribuir)
+- [Licencia](#licencia)
 
 ---
+
+## Características
+
+- **Responde siempre.** Primero consulta su memoria; si no alcanza, busca en la web, responde citando las fuentes `[n]` y después aprende lo verificado. Sin buscador disponible, responde con conocimiento general y lo marca como no verificado.
+- **Memoria con procedencia.** Cada relación recuerda de dónde vino (enseñada por ti, investigada, deducida, importada) y su fuente. Lo enseñado no se olvida; lo deducido sin supervisión caduca en semanas si nadie lo usa.
+- **Memoria de pasajes.** Guarda el texto de las fuentes y de lo que enseñas, para explicar con detalle y citar de dónde sale cada dato.
+- **Investigación profunda.** Divide un objetivo en preguntas, reúne fuentes, propone hipótesis y las contrasta con evidencias a favor y en contra antes de concluir.
+- **Aprendizaje autónomo.** En reposo, un proceso en segundo plano detecta conceptos relacionados sin conectar, formula una pregunta, busca evidencia y consolida solo lo verificado.
+- **Cálculo exacto.** Las preguntas numéricas van a una calculadora de precisión arbitraria, a un verificador de conjeturas y a un buscador de fórmulas de sucesiones; el modelo nunca rehace las cuentas.
+- **Conectores sin código.** Cualquier API HTTP (ERP, CRM, inventario) se declara en un archivo JSON y el asistente puede consultarla.
+- **Importación por lotes.** Carga cientos de miles de relaciones desde JSONL (por ejemplo, desde Wikidata) y deshace un lote entero si hace falta.
+- **Interfaces.** Panel web en tiempo real, API REST con respuestas en streaming (SSE), telemetría por WebSocket y una CLI (`sc`).
+
+## Cómo funciona
+
+```mermaid
+flowchart LR
+    U[Pregunta] --> P[Planificador<br/>intención, entidades, herramienta]
+    P -->|cálculo, hora, conector| T[Herramienta]
+    P -->|consulta| M[Memoria<br/>grafo + pasajes]
+    M -->|la memoria la cubre| R[Respuesta citada]
+    M -->|no la cubre| W[Búsqueda web<br/>SearXNG]
+    W --> R
+    W -.->|segundo plano| A[Aprendizaje verificado<br/>hechos + pasajes]
+    A -.-> M
+    T --> R
+```
+
+1. **Planificador.** Una sola llamada al modelo decide la intención (consultar o aprender), reescribe la pregunta con el historial de la conversación, extrae las entidades y elige una herramienta si hace falta.
+2. **Memoria.** Recupera las relaciones del grafo y los pasajes relevantes (búsqueda semántica con embeddings y búsqueda de texto completo).
+3. **Investigación.** Si alguna entidad no está cubierta, o el modelo indica que su memoria no alcanza, busca en SearXNG y responde citando las fuentes.
+4. **Aprendizaje.** En segundo plano extrae hechos de las fuentes, los valida contra ellas y consolida solo los verificados. El texto de las fuentes se guarda como pasajes.
+5. **Olvido.** Cada hora las relaciones y los pasajes que no se usan pierden fuerza según su procedencia; lo que cae por debajo del umbral se elimina.
+
+La arquitectura interna está documentada en [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requisitos
 
-### Mínimos (CPU, sin LLM real)
+| Componente | Necesario | Notas |
+|------------|-----------|-------|
+| [Rust](https://rustup.rs) estable | Sí | Desarrollado con Rust 1.94. |
+| [Ollama](https://ollama.com) | Sí, para respuestas reales | Usa la GPU automáticamente si la hay. Sin Ollama el servidor arranca en modo demostración. |
+| Modelo `qwen3.5:2b-q4_K_M` | Sí | 1,9 GB. Se puede usar otro modelo de Ollama con `OLLAMA_MODEL`. |
+| [Docker](https://www.docker.com) | Recomendado | Para ejecutar SearXNG, el buscador que permite investigar y verificar. |
+| Python 3 | Opcional | Solo para el script que genera datos desde Wikidata. |
 
-- **Rust 1.82+** — `rustup update stable`
-- **Windows 10/11 x64** (también compila en Linux/macOS)
-- 4 GB RAM, cualquier CPU con SSE4.2
+- **Sistemas operativos:** Windows 10/11, Linux y macOS.
+- **Memoria:** 4 GB de RAM libres como mínimo (el modelo de 2B más el servidor).
+- **Disco:** unos 3 GB para la compilación, más el modelo de Ollama.
+- **Red:** la primera compilación descarga ONNX Runtime, y el primer arranque descarga el modelo de embeddings multilingüe (~120 MB). Después funciona sin conexión, salvo las búsquedas web.
 
-### Producción con GPU (recomendado)
+## Instalación
 
-- **NVIDIA RTX** (8 GB+ VRAM recomendado para modelos 7B Q4)
-- **CUDA Toolkit 12.x** — [developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads)
-- El modelo GGUF en disco (ver [Instalación](#instalación-y-primer-arranque))
-
-### Opcionales
-
-- **Ollama** — alternativa a llama.cpp para gestión de modelos
-- **SearXNG** — instancia privada para el motor epistémico (TruthFilter + subconsciente)
-- **curl** — usado por `start_brain.bat` para verificar que el servidor levantó
-
----
-
-## Instalación y primer arranque
-
-```powershell
-# 1. Clonar el repositorio
-git clone <repo-url> SynaptoCore
-cd SynaptoCore
-
-# 2. Configurar el entorno
-Copy-Item .env.example .env
-notepad .env     # ajusta las rutas y variables (ver sección siguiente)
-
-# 3. Opción A — Un solo clic (Windows):
-.\start_brain.bat              # CPU, ServerMock
-.\start_brain.bat gpu          # RTX + llama.cpp
-.\start_brain.bat gpu embed    # RTX + embeddings semánticos
-
-# 3. Opción B — PowerShell avanzado:
-.\start_brain.ps1 -Gpu -Embeddings
-
-# 3. Opción C — Cargo directo:
-cargo run --release                                    # CPU
-cargo run --release --features cuda                    # RTX
-cargo run --release --features "cuda,embeddings"       # RTX + semántica
-```
-
-El dashboard abre automáticamente en `http://localhost:8080/` al detectar que el servidor responde.
-
-### Descargar un modelo GGUF
-
-```powershell
-# Opción A — HuggingFace CLI (instala con: pip install huggingface_hub[cli])
-huggingface-cli download bartowski/Qwen2.5-7B-Instruct-GGUF `
-    --include "qwen2.5-7b-instruct-q4_k_m.gguf" `
-    --local-dir C:\Models
-
-# Opción B — Ollama (gestiona modelos automáticamente)
-ollama pull qwen2.5:7b
-# Luego en .env: apunta SYNAPTOCORE_MODEL_PATH al archivo en ~/.ollama/models/...
-
-# Opción C — Modelo pequeño para pruebas (1.5 GB, 0.5B parámetros)
-huggingface-cli download bartowski/Qwen2.5-0.5B-Instruct-GGUF `
-    --include "qwen2.5-0.5b-instruct-q8_0.gguf" `
-    --local-dir C:\Models
-```
-
-Modifica `SYNAPTOCORE_MODEL_PATH` en `.env` con la ruta al archivo descargado.
-
----
-
-## Configuración (.env)
+### 1. Instala las herramientas
 
 ```bash
-# ── LLM ────────────────────────────────────────────────────────────────────
-SYNAPTOCORE_MODEL_PATH=C:\Models\qwen2.5-7b-instruct-q4_k_m.gguf
-SYNAPTOCORE_GPU_LAYERS=999          # 999 = todas las capas en VRAM
+# Rust (Linux/macOS; en Windows descarga rustup-init.exe desde https://rustup.rs)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# ── Base de Datos ───────────────────────────────────────────────────────────
-SC_DB_PATH=synaptocore_memory.db    # ruta relativa al directorio del proyecto
-
-# ── Servidor API ────────────────────────────────────────────────────────────
-SC_HOST=127.0.0.1
-SC_PORT=8080
-
-# ── Motor Epistémico (opcional) ─────────────────────────────────────────────
-SEARXNG_URL=http://localhost:8888   # sin esta var → subconsciente desconectado
-
-# ── Conectores externos (opcional) ──────────────────────────────────────────
-SYNAPTOCORE_CONNECTORS=conectores.json   # sin archivo → sin conectores
-ERP_API_TOKEN=...                        # secretos citados en el JSON como ${ERP_API_TOKEN}
-
-# ── Logging ─────────────────────────────────────────────────────────────────
-RUST_LOG=synaptocore=info,tower_http=warn
+# Ollama: descárgalo desde https://ollama.com y luego baja el modelo
+ollama pull qwen3.5:2b-q4_K_M
 ```
 
-Copia completa documentada en `.env.example`.
+### 2. Clona el repositorio
 
----
+```bash
+git clone https://github.com/yemsy26/SynaptoCore.git
+cd SynaptoCore
+```
 
-## Conectores externos
+### 3. Configura el entorno
 
-Cualquier sistema con API HTTP (ERP, CRM, inventario, una API propia, un motor de cálculo) se conecta
-declarándolo en `conectores.json` (ruta configurable con `SYNAPTOCORE_CONNECTORS`), sin tocar el código.
-El planificador ve el nombre y la descripción de cada conector y solo rellena sus parámetros: nunca
-elige URLs. Los secretos van en variables de entorno y se citan como `${NOMBRE}`.
+```bash
+cp .env.example .env          # PowerShell: Copy-Item .env.example .env
+```
+
+Los valores por defecto funcionan para una instalación local. Las variables disponibles se explican en [Configuración](#configuración).
+
+### 4. Levanta el buscador (recomendado)
+
+SearXNG permite que SynaptoCore investigue lo que no sabe y verifique lo que aprende. El repositorio incluye una configuración lista para usar:
+
+```bash
+docker run -d --name searxng-brain -p 8888:8080 --restart unless-stopped \
+  -v "$(pwd)/searxng-settings.yml:/etc/searxng/settings.yml" \
+  -v "$(pwd)/searxng-limiter.toml:/etc/searxng/limiter.toml" \
+  searxng/searxng
+```
+
+En PowerShell, sustituye `$(pwd)` por `${PWD}` y las barras invertidas finales por acentos graves (`` ` ``).
+
+> Antes de exponer SearXNG fuera de tu equipo, cambia `secret_key` en `searxng-settings.yml`.
+
+### 5. Arranca SynaptoCore
+
+**Windows (recomendado):** haz doble clic en `start_brain.bat`. El script comprueba Rust, Ollama y Docker, levanta SearXNG, compila, arranca el servidor y abre el panel en el navegador. También puedes usar `.\start_brain.ps1` desde PowerShell.
+
+**Linux, macOS o arranque manual:**
+
+```bash
+set -a; source .env; set +a      # el servidor no lee .env por sí mismo
+cargo run --release --bin synaptocore
+```
+
+La primera compilación tarda varios minutos. Cuando veas `SynaptoCore API escuchando en http://127.0.0.1:8080`, abre **http://localhost:8080**.
+
+### 6. Comprueba que funciona
+
+```bash
+curl http://localhost:8080/health
+```
+
+```json
+{ "status": "ok", "node_count": 23, "edge_count": 31, "avg_weight": 0.91, "passage_count": 0, "version": "0.17.0" }
+```
+
+En la consola del servidor debe aparecer `Backend LLM: Ollama (qwen3.5:2b-q4_K_M)`. Si aparece `ServerMock`, Ollama no está disponible: revisa [Solución de problemas](#solución-de-problemas).
+
+## Primeros pasos
+
+Abre el panel en **http://localhost:8080** y escribe en el chat.
+
+**1. Enséñale algo.** Las afirmaciones y las peticiones de memorizar se aprenden:
+
+> Memoriza que la sucursal del centro abre de lunes a viernes de 9 a 18 h y los sábados de 10 a 14 h. La responsable es Marta Ruiz.
+
+SynaptoCore extrae las relaciones, las añade al grafo y guarda tu texto tal cual.
+
+**2. Pregúntale por ello.** Responde desde su memoria y cita de dónde lo sabe:
+
+> ¿A qué hora abre la sucursal del centro los sábados?
+>
+> *La sucursal del centro abre los sábados de 10 a 14 h [1].* — Fuente: *Lo que me enseñaste*
+
+**3. Pregúntale algo que no sabe.** Lo investiga en la web, responde con las fuentes enlazadas y aprende en segundo plano:
+
+> ¿Qué es el grafeno?
+
+La próxima vez que preguntes por el grafeno responderá desde su memoria, citando las mismas fuentes, sin volver a buscar.
+
+**4. Pídele un cálculo.** El resultado es exacto y muestra qué se calculó:
+
+> ¿Cuántas combinaciones de 6 números hay en una lotería de 49?
+>
+> *C(49,6) = 13983816 (exacto)*
+
+**5. Lanza una investigación profunda.** Pulsa **Investigar** en el panel, escribe un objetivo (por ejemplo, *¿Quién descubrió la penicilina y en qué año?*) y sigue en vivo las preguntas, las fuentes y las hipótesis.
+
+## Guía de uso
+
+### Panel web
+
+En `http://localhost:8080` encontrarás:
+
+- **Chat** con respuestas en streaming, el origen de cada respuesta (memoria, web, herramienta, conocimiento general) y sus fuentes enlazadas.
+- **Grafo** de conocimiento interactivo; cada relación muestra su procedencia.
+- **Métricas**: conceptos, relaciones, peso medio y pasajes guardados.
+- **Actividad** del aprendizaje autónomo en tiempo real.
+- **Investigar**: lanza y sigue investigaciones profundas.
+
+### API REST
+
+Todas las rutas están bajo `http://localhost:8080`. La referencia completa, con ejemplos de petición y respuesta, está en [docs/API.md](docs/API.md).
+
+| Método | Ruta | Uso |
+|--------|------|-----|
+| `GET` | `/health` | Estado y métricas |
+| `POST` | `/api/v1/chat` | Chat con respuesta en streaming (SSE): aprende o responde según el mensaje |
+| `POST` | `/api/v1/query` | Consulta con respuesta completa en JSON |
+| `POST` | `/api/v1/learn` | Enseña un texto |
+| `GET` | `/api/v1/graph/all` | Instantánea del grafo |
+| `GET` | `/api/v1/graph/neighbors/{id}` | Vecinos de un concepto |
+| `GET` `POST` | `/api/v1/investigations` | Lista o inicia investigaciones profundas |
+| `GET` | `/api/v1/investigations/{id}` | Estado completo de una investigación |
+| `POST` | `/api/v1/investigations/{id}/cancel` | Cancela una investigación |
+| `GET` | `/api/v1/passages` | Pasajes guardados con su procedencia |
+| `DELETE` | `/api/v1/passages/{id}` | Borra un pasaje |
+| `POST` | `/api/v1/federation/export` | Exporta las novedades de las últimas 24 h como delta `.synapse` |
+| `GET` | `/ws/subconscious` | Telemetría en tiempo real (WebSocket) |
+
+Ejemplo rápido:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "¿Qué es el grafeno?"}'
+```
+
+```json
+{
+  "response": "El grafeno es una lámina de carbono de un átomo de grosor [1]...",
+  "session_id": "8f0c…",
+  "answered_from": "web",
+  "sources": [{ "n": 1, "title": "Grafeno - Wikipedia", "url": "https://es.wikipedia.org/wiki/Grafeno" }]
+}
+```
+
+Envía el mismo `session_id` en las siguientes peticiones para mantener el hilo: «¿Y para qué sirve?» se entiende como «¿Para qué sirve el grafeno?».
+
+### CLI `sc`
+
+Cliente de terminal para un servidor en marcha:
+
+```bash
+cargo install --path . --bin sc
+
+sc health                                   # estado del servidor
+sc query "¿Qué es el cortisol?"             # consulta
+sc learn "Rust fue creado por Graydon Hoare en Mozilla."
+sc learn --file notas.txt                   # enseña un archivo de texto
+sc export --out respaldo.synapse            # delta de las últimas 24 h
+sc watch                                    # actividad en tiempo real (Ctrl+C para salir)
+```
+
+Para usar otro servidor: `SC_HOST=http://192.168.1.50:8080 sc health` (URL completa, con `http://`).
+
+### Importar conocimiento
+
+`synaptocore importar` carga relaciones desde un archivo JSONL sin pasar por el modelo. Cada línea es una relación; `weight` es opcional (0,8 por defecto):
+
+```json
+{"subject": "Ecuador", "relation": "tiene_capital", "object": "Quito", "weight": 0.9}
+```
+
+```bash
+synaptocore importar paises.jsonl              # lote «paises» (nombre del archivo)
+synaptocore importar datos.jsonl --lote erp    # nombre de lote explícito
+synaptocore importar --lista                   # lotes importados
+synaptocore importar --deshacer paises         # retira el lote completo
+```
+
+- Ejecútalo en la carpeta donde está `synaptocore_memory.db` (la del servidor). Si el servidor está en marcha, reinícialo para que indexe los conceptos nuevos.
+- Cada concepto se une al que ya existe con el mismo nombre (sin distinguir tildes ni mayúsculas).
+- Lo importado no se olvida, y una relación que ya existía no se modifica: deshacer un lote nunca borra lo aprendido por otra vía.
+- Si la importación se interrumpe, repetir el comando continúa donde se quedó.
+
+`scripts/wikidata_tripletas.py` genera ese formato desde Wikidata, sin dependencias:
+
+```bash
+python scripts/wikidata_tripletas.py --preset paises -o paises.jsonl
+python scripts/wikidata_tripletas.py --clase Q11344 --propiedades P61:descubierto_por -o elementos.jsonl
+```
+
+### Investigación profunda
+
+Para preguntas que piden más que un dato. Trabaja en segundo plano, por rondas:
+
+1. **Preguntas:** divide el objetivo en preguntas de búsqueda; en cada ronda pregunta por lo que sigue sin resolver.
+2. **Fuentes:** busca cada pregunta y numera las fuentes `[n]`.
+3. **Hipótesis:** propone respuestas posibles.
+4. **Evidencias:** busca a favor y en contra de cada hipótesis y la juzga como *apoyada*, *refutada* o *sin confirmar*.
+5. **Conclusión:** cuando una hipótesis queda apoyada con certeza ≥ 0,7, o se agotan las rondas (3 por defecto, hasta 5), redacta la conclusión con citas y aprende lo verificado.
+
+Un veredicto solo cuenta si cita fuentes que el sistema le mostró, con certeza suficiente y sin fuentes en conflicto; ante la duda queda *sin confirmar*. Solo corre una investigación a la vez, su estado se guarda tras cada paso y el chat mantiene la prioridad sobre el modelo.
+
+### Conectores externos
+
+Cualquier sistema con API HTTP se conecta declarándolo en `conectores.json` (plantilla: `conectores.example.json`):
 
 ```json
 [
@@ -222,432 +298,134 @@ elige URLs. Los secretos van en variables de entorno y se citan como `${NOMBRE}`
 ]
 ```
 
-Plantilla completa en `conectores.example.json`. Con `POST`, los parámetros se envían como JSON. Un
-conector mal declarado (URL con un `{parámetro}` sin describir, variable de entorno ausente) se omite al
-arrancar con su motivo; los demás siguen funcionando.
+El asistente ve el nombre y la descripción de cada conector y solo rellena sus parámetros; nunca elige URLs. Los secretos se guardan en variables de entorno y se citan como `${NOMBRE}`. Con `POST`, los parámetros se envían como JSON. Un conector mal declarado se omite al arrancar, con su motivo, y el resto sigue funcionando.
 
-## Herramientas matemáticas
+### Herramientas matemáticas
 
-El modelo de 2B no calcula bien, así que las preguntas de cálculo van a tres herramientas que responden
-por sí mismas, sin que el modelo reescriba el resultado. El planificador traduce la pregunta a una
-expresión y la respuesta la repite, para que se vea qué se calculó:
+| Pregunta | Respuesta |
+|----------|-----------|
+| ¿Cuánto es 2^100? | `2^100 = 1267650600228229401496703205376 (exacto)` |
+| ¿Es primo 2^61-1? | `esprimo(2^61-1) = verdadero` |
+| Factoriza 360 | `360 = 2^3 × 3^2 × 5` |
+| Comprueba que n²+n+41 es primo para n de 0 a 100 | `«esprimo(n^2+n+41)» es falsa: falla en n = 40 … No es primo: 1681 = 41^2.` |
+| ¿Qué número sigue en 2, 6, 12, 20, 30? | `… los siguientes términos serían 42, 56, 72. Fórmula: a(n) = n^2 + n …` |
 
-| Pregunta | Herramienta | Respuesta |
-|----------|-------------|-----------|
-| ¿Cuánto es 2^100? | `Calculadora` | `2^100 = 1267650600228229401496703205376 (exacto)` |
-| ¿Cuántas combinaciones de 6 números hay en una lotería de 49? | `Calculadora` | `C(49,6) = 13983816 (exacto)` |
-| ¿Es primo 2^61-1? | `Calculadora` | `esprimo(2^61-1) = verdadero` |
-| comprueba que n^2+n+41 es primo para n de 0 a 100 | `Conjetura` | `«esprimo(n^2+n+41)» es falsa: falla en n = 40 (…). No es primo: 1681 = 41^2.` |
-| ¿qué número sigue en 2, 6, 12, 20, 30? | `Sucesion` | `… los siguientes términos serían 42, 56, 72. Fórmula: a(n) = n^2 + n …` |
+- **Calculadora:** enteros de cualquier tamaño y fracciones exactas (`0.1 + 0.2 == 0.3` es verdadero). Operadores `+ - * / ^ ! %`, comparaciones y `and`/`or`/`not`; funciones `raiz`, `abs`, `piso`, `techo`, `redondear`, `mcd`, `mcm`, `C(n,k)`, `fib`, `esprimo`, `factoriza`, `suma(k^2,k,1,10)`, `producto(k,k,1,5)`, y `sin cos tan asin acos atan ln log exp` con `pi` y `e` (marcadas como aproximadas).
+- **Conjetura:** comprueba una afirmación sobre `n` en un rango (1–1000 por defecto, hasta 100 000 valores) y da el primer contraejemplo. Si se cumple, lo presenta como una comprobación numérica, no como una demostración.
+- **Sucesión:** busca una fórmula polinómica, geométrica o de recurrencia que confirmen los términos dados y predice los tres siguientes.
 
-- **Calculadora**: enteros de cualquier tamaño y fracciones exactas (`0.1 + 0.2 == 0.3` es verdadero).
-  Operadores `+ - * / ^ ! %` y `mod`, comparaciones, `and`/`or`/`not`; funciones `raiz`, `abs`, `piso`,
-  `techo`, `redondear`, `mcd`, `mcm`, `C(n,k)`, `fib`, `esprimo` (Miller–Rabin: exacto hasta 3,3·10²⁴,
-  «primo probable» por encima), `factoriza`, `suma(k^2,k,1,10)`, `producto(k,k,1,5)`, y las reales
-  `sin cos tan asin acos atan ln log log10 log2 exp` con `pi` y `e` (resultado marcado como aproximado).
-- **Conjetura**: evalúa una afirmación sobre una variable para cada valor de un rango (por defecto 1–1000,
-  máximo 100 000) y da el primer contraejemplo con su motivo. Si se cumple, lo dice como lo que es: una
-  comprobación numérica en ese rango, no una demostración.
-- **Sucesion**: busca una fórmula polinómica (diferencias finitas), geométrica o de recurrencia de dos
-  términos que confirme al menos un término de sobra y predice los tres siguientes; también es una conjetura.
+La respuesta repite la expresión evaluada, así que un planteamiento equivocado queda a la vista. Límites: 400 caracteres por expresión, unas 120 000 cifras por número y 3 s por cálculo (6 s por conjetura).
 
-Límites: 400 caracteres por expresión, ~120 000 cifras por número, 3 s por cálculo (6 s por conjetura).
-Lo que el planificador plantea mal (`C(8,1)` para ordenar 8 libros, en lugar de `8!`) no se puede
-corregir aquí, pero queda a la vista en la respuesta.
+### Memoria de pasajes
 
-## Importar conocimiento por lotes
+Además de los hechos sueltos, SynaptoCore guarda el texto del que salen:
 
-`synaptocore importar` carga tripletas de un archivo JSONL directamente en el grafo, sin pasar por el LLM.
-Cada línea es una relación; `weight` es opcional (0.8 por defecto):
+- **Fuentes investigadas:** el fragmento de cada fuente, con su título, su URL y la pregunta que llevó a ella.
+- **Lo que enseñas:** tu texto tal cual, de forma permanente, aunque el modelo no consiga extraer hechos de él.
 
-```json
-{"subject": "Ecuador", "relation": "tiene_capital", "object": "Quito", "weight": 0.9}
+Al responder desde la memoria, hasta tres pasajes relevantes acompañan a la pregunta y la respuesta los cita como fuentes. La relevancia combina similitud semántica y coincidencia de palabras, para no perder términos poco comunes. Puedes revisarlos con `GET /api/v1/passages` y borrar uno equivocado con `DELETE /api/v1/passages/{id}`. Los pasajes investigados que no se usan en unos 13 meses se olvidan; los enseñados, nunca.
+
+### Federación
+
+`POST /api/v1/federation/export` (o `sc export`) genera un delta `.synapse` en JSON con los conceptos y relaciones de las últimas 24 horas, útil como respaldo incremental o para compartir conocimiento entre instancias. La importación de deltas está implementada en el módulo `federated_memory`, pero todavía no se expone por la API.
+
+## Configuración
+
+El servidor lee estas variables de entorno (los lanzadores de Windows las cargan desde `.env`):
+
+| Variable | Por defecto | Descripción |
+|----------|-------------|-------------|
+| `OLLAMA_HOST` | `http://localhost:11434` | URL de Ollama. |
+| `OLLAMA_MODEL` | `qwen3.5:2b-q4_K_M` | Modelo de Ollama que se usa. |
+| `SEARXNG_URL` | *(sin definir)* | URL de SearXNG. Sin ella no hay búsquedas web ni aprendizaje autónomo, y lo que no esté en memoria se responde como conocimiento general no verificado. |
+| `SYNAPTOCORE_PORT` | `8080` | Puerto del servidor. Escucha solo en `127.0.0.1`. |
+| `SYNAPTOCORE_CONNECTORS` | `conectores.json` | Archivo de conectores externos. |
+| `FASTEMBED_CACHE_DIR` | `.fastembed_cache` | Carpeta del modelo de embeddings. |
+| `SC_HOST` | `http://127.0.0.1:8080` | Servidor al que se conecta la CLI `sc`. |
+
+**Datos.** Toda la memoria vive en `synaptocore_memory.db` (SQLite), en la carpeta desde la que arrancas el servidor. Para respaldarla, copia el archivo con el servidor detenido o usa `sqlite3 synaptocore_memory.db ".backup respaldo.db"`. Para empezar de cero, detén el servidor y borra `synaptocore_memory.db*`.
+
+## Desarrollo
+
+### Estructura del proyecto
+
 ```
+SynaptoCore/
+├── src/
+│   ├── main.rs              # arranque, ciclos de fondo y subcomando `importar`
+│   ├── api_server.rs        # API REST, SSE y WebSocket (Axum)
+│   ├── llm_bridge.rs        # planificador, recuperación de contexto y respuesta
+│   ├── memory_graph.rs      # grafo en SQLite, índice vectorial y olvido
+│   ├── memory_graph/
+│   │   └── passages.rs      # memoria de pasajes (vector + FTS5)
+│   ├── subconscious.rs      # aprendizaje autónomo en reposo
+│   ├── truth_filter.rs      # SearXNG y validación de afirmaciones
+│   ├── research.rs          # aprendizaje a partir de fuentes
+│   ├── investigation.rs     # investigación profunda
+│   ├── math_tools.rs        # calculadora, conjeturas y sucesiones
+│   ├── connectors.rs        # conectores HTTP declarativos
+│   ├── importer.rs          # importación por lotes
+│   ├── dashboard.html       # panel web (incrustado en el binario)
+│   └── bin/sc.rs            # CLI
+├── scripts/                 # generador de datos desde Wikidata
+├── docs/API.md              # referencia de la API
+├── start_brain.bat / .ps1   # lanzadores para Windows
+└── searxng-*.{yml,toml}     # configuración de SearXNG
+```
+
+### Pruebas
 
 ```bash
-target/release/synaptocore importar paises.jsonl            # lote «paises» (nombre del archivo)
-target/release/synaptocore importar datos.jsonl --lote erp  # nombre de lote explícito
-target/release/synaptocore importar --lista
-target/release/synaptocore importar --deshacer paises
+cargo test                          # suite completa (con embeddings)
+cargo test --no-default-features    # sin ONNX Runtime: más rápido, sin descargas
+cargo test passages                 # un módulo concreto
 ```
 
-- Cada concepto se une al nodo que ya lo nombra (por su forma canónica: «Perú» = `peru`); los nuevos se vectorizan en bloque.
-- Lo importado no se olvida (procedencia `imported`) y una relación que el grafo ya tenía no se toca, así que `--deshacer` retira el lote entero sin borrar lo aprendido por otra vía.
-- Si el proceso se corta, repetir el mismo comando continúa donde iba.
-- Usa `synaptocore_memory.db` del directorio actual. Puede correr con el servidor en marcha, pero el servidor solo ve los conceptos nuevos en su índice semántico tras reiniciarlo.
-
-`scripts/wikidata_tripletas.py` genera ese JSONL desde Wikidata (solo biblioteca estándar de Python):
+Las pruebas usan modelos simulados y bases en memoria: no necesitan Ollama, SearXNG ni red. Las que dependen de servicios reales están marcadas con `#[ignore]`; por ejemplo, la calibración de relevancia de pasajes con el modelo de embeddings real:
 
 ```bash
-python scripts/wikidata_tripletas.py --preset paises -o paises.jsonl
-python scripts/wikidata_tripletas.py --clase Q11344 --propiedades P61:descubierto_por -o elementos.jsonl
+cargo test passage_similarity_calibration -- --ignored --nocapture
 ```
 
-Medido (release, CPU): 7 405 relaciones de 195 países en 1,6 s (+5,3 MB); 300 000 relaciones sintéticas
-con 147 000 conceptos en 186 s (≈1 600 líneas/s, ≈3 KB por concepto con sus relaciones, pico de 840 MB).
-Con ese grafo el servidor arranca en 2,7 s con 725 MB de RAM y responde desde la memoria en ≈1 s.
-
-## Investigación profunda
-
-Para preguntas que piden más que un dato. Desde el botón **Investigar** del dashboard (o por la API) le das un
-objetivo y trabaja en segundo plano, por rondas:
-
-1. **Preguntas**: divide el objetivo en preguntas de búsqueda; en rondas siguientes, pregunta por lo que sigue sin resolver.
-2. **Fuentes**: busca cada pregunta en SearXNG; cada fuente recibe un número estable [n].
-3. **Hipótesis**: propone respuestas posibles al objetivo.
-4. **Evidencias**: busca a favor y en contra de cada hipótesis y la juzga citando fuentes: *apoyada*, *refutada* o *sin confirmar*.
-5. Para cuando una hipótesis queda apoyada con certeza ≥ 0,7 o se agotan las rondas (3 por defecto, hasta 5),
-   redacta la conclusión con citas y aprende en el grafo lo verificado.
-
-Para que un veredicto cuente, el modelo tiene que citar fuentes que vio, con certeza ≥ 0,6 y sin fuentes en
-conflicto. Además, una hipótesis apoyada que nombra algo (p. ej. un producto) debe tenerlo en las fuentes que cita.
-Si no, queda «sin confirmar»: preferimos un «no concluyente» a una conclusión falsa.
-
-- Una investigación a la vez; mientras dura, el subconsciente espera y el chat sigue teniendo prioridad sobre el LLM.
-- El estado se guarda tras cada paso: el panel lo muestra en vivo y sobrevive a un reinicio (queda «interrumpida»).
-- Si SearXNG no responde (motores limitados), reintenta a los 20 s y a los 60 s antes de rendirse.
-- Medido: «¿Quién descubrió la penicilina y en qué año?» se resolvió en 19 s (3 hipótesis apoyadas con fuentes,
-  3 hechos aprendidos); el chat respondió en 0,9 s mientras tanto.
-
-Una investigación hace entre 5 y 15 búsquedas. Si SearXNG solo tiene activos brave, duckduckgo y google cse,
-estos motores se suspenden por exceso de peticiones; conviene activar más motores en `searxng-settings.yml`.
-
-## Memoria de pasajes
-
-El grafo guarda hechos sueltos (sujeto → relación → objeto); para explicar con detalle hace falta el texto del
-que salieron. SynaptoCore guarda ese texto como **pasajes**, cada uno con su procedencia:
-
-- **Fuentes investigadas**: al aprender de una investigación (en el chat o profunda), el fragmento de cada fuente
-  se guarda con su título, su URL y la pregunta que llevó a ella. Son citas, no afirmaciones propias.
-- **Lo que enseñas**: `/learn` y la intención «aprender» del chat guardan tu texto tal cual (permanente), aunque
-  el modelo no consiga extraer hechos de él. Una pregunta tomada por enseñanza no se guarda.
-- Nunca se guarda lo que redacta el modelo. Los textos se trocean a ≤ 500 caracteres (el modelo de embeddings
-  solo lee los primeros ~128 tokens) y no se duplican.
-
-Al responder desde la memoria, hasta 3 pasajes relevantes entran en el prompt numerados y la respuesta los cita
-como fuentes [n] («Lo que me enseñaste», o el título y la URL de la web). Con pasajes que nombran lo preguntado
-no se vuelve a buscar en la web: en la prueba en vivo, «¿Cuándo se descubrió la penicilina?» se respondió desde
-la memoria en 2 s, citando las fuentes de una investigación anterior.
-
-**Relevancia híbrida.** El modelo de embeddings no reconoce palabras raras («¿Qué es el grafeno?» ↔ su pasaje:
-coseno 0,29, por debajo de un pasaje que solo trata del tema, 0,49), así que la búsqueda combina vector y texto
-completo (FTS5, sin tildes y por raíces). Un pasaje es relevante si es muy parecido (≥ 0,55) o si nombra al menos
-la mitad de las palabras de la pregunta sin ser ajeno (≥ 0,20). Se calibra con
-`cargo test passage_similarity_calibration -- --ignored --nocapture`.
-
-Los pasajes se olvidan como las aristas de su procedencia, contando desde la última vez que fundamentaron una
-respuesta: lo investigado, tras ~13 meses sin usarse; lo enseñado, nunca. `GET /api/v1/passages` los lista y
-`DELETE /api/v1/passages/{id}` borra uno equivocado.
-
-## API REST
-
-Base URL: `http://localhost:8080`
-
-### `GET /health`
-
-Estado del servidor y métricas del grafo de memoria.
+### Compilación de producción
 
 ```bash
-curl http://localhost:8080/health
-```
-```json
-{
-  "status": "ok",
-  "node_count": 47,
-  "edge_count": 123,
-  "avg_weight": 0.814,
-  "passage_count": 16,
-  "version": "0.17.0"
-}
-```
-
-### `POST /api/v1/learn`
-
-Enseña texto libre al cerebro. El LLM extrae tripletas semánticas, las valida con TruthFilter y las consolida en el grafo.
-
-```bash
-curl -X POST http://localhost:8080/api/v1/learn \
-  -H "Content-Type: application/json" \
-  -d '{"text": "PostgreSQL es una base de datos relacional escrita en C que usa MVCC."}'
-```
-```json
-{
-  "triples_extracted": 3,
-  "nodes_created": 2,
-  "edges_created": 3,
-  "llm_attempts": 1
-}
-```
-
-### `POST /api/v1/query`
-
-Consulta con memoria de sesión. Si omites `session_id` se genera uno nuevo y se devuelve en la respuesta.
-
-```bash
-curl -X POST http://localhost:8080/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "¿En qué lenguaje está hecho PostgreSQL?", "session_id": "mi-sesion-1"}'
-```
-```json
-{
-  "response": "PostgreSQL está escrito en C.",
-  "session_id": "mi-sesion-1",
-  "answered_from": "memory",
-  "sources": []
-}
-```
-
-Multi-turno: el sistema reescribe automáticamente las referencias ambiguas usando el historial de la sesión:
-
-```bash
-# Turno 2 — "tiene" se resuelve a "PostgreSQL" por correferencia
-curl -X POST http://localhost:8080/api/v1/query \
-  -d '{"prompt": "¿Tiene versión móvil?", "session_id": "mi-sesion-1"}'
-```
-
-### `GET /api/v1/graph/all`
-
-Exporta el grafo completo (nodos + aristas) para visualización o depuración.
-
-```bash
-curl http://localhost:8080/api/v1/graph/all
-```
-```json
-{
-  "nodes": [
-    {"id": "postgresql", "name": "PostgreSQL", "weight": 0.95, ...},
-    ...
-  ],
-  "edges": [
-    {"source": "postgresql", "relation": "escrito_en", "target": "c", "weight": 0.87},
-    ...
-  ]
-}
-```
-
-### `GET /api/v1/graph/neighbors/{node_id}`
-
-Vecinos directos de un nodo (útil para explorar el grafo localmente).
-
-```bash
-curl "http://localhost:8080/api/v1/graph/neighbors/postgresql"
-```
-
-### Investigaciones (Paso 28)
-
-```bash
-curl -X POST http://localhost:8080/api/v1/investigations \
-  -H "Content-Type: application/json" \
-  -d '{"objective": "¿Quién descubrió la penicilina y en qué año?", "rounds": 3}'   # 202 · 409 si ya hay una · 503 sin SearXNG
-curl http://localhost:8080/api/v1/investigations                 # lista (resumen)
-curl http://localhost:8080/api/v1/investigations/{id}            # preguntas, fuentes, hipótesis, conclusión, aprendido
-curl -X POST http://localhost:8080/api/v1/investigations/{id}/cancel
-```
-
-### Pasajes (Paso 30)
-
-```bash
-curl "http://localhost:8080/api/v1/passages?limit=50"   # los más recientes: texto, título, url, origin, usos
-curl -X DELETE http://localhost:8080/api/v1/passages/{id}   # 204 · 404 si no existe
-```
-
-### `POST /api/v1/federation/export`
-
-Exporta un delta del grafo como archivo `.synapse` para sincronización multi-agente.
-
-```bash
-curl -X POST http://localhost:8080/api/v1/federation/export
-```
-
-### `GET /ws/subconscious`
-
-WebSocket de telemetría en tiempo real. Emite eventos del bucle subconsciente:
-
-```
-ws://localhost:8080/ws/subconscious
-```
-```json
-{"event_type": "sleep_cycle", "message": "Consolidé: postgresql→usa→mvcc (0.80)", "timestamp": 1729651234}
-{"event_type": "decay",       "message": "Podé 3 aristas con peso < 0.15", "timestamp": 1729651290}
-```
-
-### `GET /`
-
-Dashboard HTML con métricas en vivo, visualización del grafo y feed del subconsciente (actualización WebSocket automática).
-
----
-
-## CLI — sc
-
-La CLI `sc` es un cliente HTTP que se comunica con un servidor SynaptoCore en ejecución. Requiere que el servidor esté activo.
-
-```bash
-# Instalar el binario sc en PATH:
-cargo install --path . --bin sc
-```
-
-### Comandos disponibles
-
-```
-USAGE:
-    sc <COMMAND>
-
-COMMANDS:
-    query   Consulta al cerebro (con memoria de sesión opcional)
-    learn   Enseña texto o archivo al cerebro
-    export  Exporta el grafo como delta .synapse
-    watch   Suscribe al feed de telemetría en tiempo real (WebSocket)
-    health  Muestra el estado del servidor y métricas del grafo
-    help    Muestra ayuda de cualquier comando
-```
-
-### Ejemplos de uso
-
-```bash
-# Consulta simple
-sc query "¿Qué es el aprendizaje por refuerzo?"
-
-# Consulta con sesión persistente
-sc query --session mi-proyecto "¿Qué hace SynaptoCore?"
-sc query --session mi-proyecto "¿Y en qué lenguaje está escrito?"
-
-# Aprender desde texto
-sc learn "El aprendizaje por refuerzo es una rama del ML donde un agente aprende por recompensa."
-
-# Aprender desde archivo
-sc learn --file informe_tecnico.txt
-
-# Ver el grafo de memoria en JSON
-sc export --out grafo_backup.synapse
-
-# Monitoreo en tiempo real del subconsciente
-sc watch
-
-# Estado del servidor
-sc health
-```
-
-### Variable de entorno del cliente
-
-```bash
-# Por defecto sc apunta a http://127.0.0.1:8080
-# Para apuntar a un servidor remoto:
-set SC_HOST=http://192.168.1.100:8080
-sc health
-```
-
----
-
-## Memoria Federada (.synapse)
-
-El módulo `federated_memory` permite que múltiples instancias de SynaptoCore intercambien conocimiento sin una base de datos centralizada. El protocolo es simple: cada agente exporta un **delta** (conjunto de operaciones desde el último sync) a un archivo `.synapse`, y cualquier otro agente puede importarlo.
-
-### Formato del archivo .synapse
-
-Un `.synapse` es JSON con la siguiente estructura:
-
-```json
-{
-  "delta_id": "a3f2c1d4-...",
-  "agent_id": "synaptocore-abc123",
-  "timestamp": 1729651234,
-  "operations": [
-    {
-      "type": "UpsertNode",
-      "node": {
-        "id": "postgresql",
-        "name": "PostgreSQL",
-        "weight": 0.95,
-        "decay_rate": 0.01,
-        "embedding": null
-      }
-    },
-    {
-      "type": "UpsertEdge",
-      "source_id": "postgresql",
-      "relation": "escrito_en",
-      "target_id": "c",
-      "weight": 0.87
-    }
-  ]
-}
-```
-
-### Flujo de sincronización
-
-```
-Agente A                     Directorio compartido           Agente B
-────────                     ─────────────────────           ────────
-/api/v1/federation/export ──► delta_a1b2c3.synapse ──► POST /api/v1/federation/import
-                                                           (merge con resolución
-                                                            de conflictos por timestamp)
-```
-
-### Casos de uso
-
-- **Multi-sucursal**: cada tienda tiene su instancia de SynaptoCore. Sincronizan knowledge via `.synapse` en un directorio compartido (NAS, S3, SharePoint).
-- **Backup incremental**: exportar el grafo como delta y restaurarlo en otra máquina.
-- **Especialización**: un agente aprende sobre inventario, otro sobre clientes. Ambos comparten el núcleo común via `.synapse`.
-
----
-
-## Features opcionales
-
-| Feature | Activación | Descripción |
-|---------|-----------|-------------|
-| `llama-backend` | `--features llama-backend` | Backend LLM real (CPU con SIMD). Requiere modelo GGUF. |
-| `cuda` | `--features cuda` | llama.cpp con aceleración NVIDIA CUDA. Implica `llama-backend`. |
-| `vulkan` | `--features vulkan` | llama.cpp con aceleración Vulkan (AMD, Intel Arc). Implica `llama-backend`. |
-| `embeddings` | `--features embeddings` | fastembed (BGE-Small-EN v1.5). Habilita `semantic_search()`. |
-
-Sin ningún feature, el servidor arranca con `ServerMock` — útil para CI, tests, y desarrollo del grafo de memoria sin necesidad del modelo LLM.
-
----
-
-## Compilación de producción
-
-```powershell
-# Release optimizado (fat LTO, panic=abort, strip debuginfo):
 cargo build --release
-
-# Release con GPU RTX:
-cargo build --release --features cuda
-
-# Release completo (RTX + semántica):
-cargo build --release --features "cuda,embeddings"
-
-# Resultado: target/release/synaptocore.exe  (~4.7 MB)
-#            target/release/sc.exe           (CLI)
+# target/release/synaptocore(.exe)  servidor
+# target/release/sc(.exe)           CLI
 ```
 
-El perfil `[profile.release]` en `Cargo.toml` aplica `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`, `panic = "abort"` y `strip = "debuginfo"`. La primera compilación release tarda 1-3 minutos; las incrementales ~30 segundos.
+El perfil `release` usa LTO completo, una sola unidad de generación de código y `panic = "abort"`.
 
-Para profiling con NVIDIA Nsight usa el perfil alternativo:
+### Features de Cargo
 
-```powershell
-cargo build --profile release-gpu --features cuda
-# Binario en: target/release-gpu/synaptocore.exe (incluye símbolos de línea)
-```
+| Feature | Por defecto | Descripción |
+|---------|-------------|-------------|
+| `embeddings` | Sí | Búsqueda semántica con fastembed y ONNX Runtime. Sin ella, la recuperación es léxica. |
+| `llama-backend`, `cuda`, `vulkan` | No | Compilan los enlaces con llama.cpp. Experimental: el servidor usa Ollama como motor. |
 
----
+## Solución de problemas
 
-## Tests
+**El servidor dice `Usando ServerMock`.** No encuentra Ollama o el modelo. Comprueba que Ollama está en marcha (`ollama list`), que el modelo está descargado (`ollama pull qwen3.5:2b-q4_K_M`) y que `OLLAMA_HOST` es correcto.
 
-```powershell
-# Suite completa (242 tests, ~2.5s):
-cargo test
+**Las respuestas llevan «Según mi conocimiento general (no verificado)».** No hay buscador: define `SEARXNG_URL` y comprueba que SearXNG responde en `http://localhost:8888`.
 
-# Un módulo específico:
-cargo test connectors
+**SearXNG no devuelve resultados.** Algunos motores se suspenden temporalmente por exceso de peticiones. Activa más motores en `searxng-settings.yml` y reinicia el contenedor (`docker restart searxng-brain`).
 
-# Con logs visibles:
-cargo test -- --nocapture
-```
+**El puerto 8080 está ocupado.** Arranca con otro puerto: `SYNAPTOCORE_PORT=8081`.
 
-Los tests de integración que requieren servicios externos (SearXNG) están marcados con `#[ignore]` y no corren por defecto.
+**La primera compilación o el primer arranque tardan.** Es normal: se compilan las dependencias y se descargan ONNX Runtime y el modelo de embeddings (unos 120 MB, una sola vez).
 
----
+**Una respuesta usa un dato equivocado de la memoria.** Busca el pasaje en `GET /api/v1/passages` y bórralo con `DELETE /api/v1/passages/{id}`.
+
+## Contribuir
+
+Las contribuciones son bienvenidas. Lee [CONTRIBUTING.md](CONTRIBUTING.md) para preparar el entorno, las convenciones del código y cómo proponer cambios. Para reportar una vulnerabilidad, consulta [SECURITY.md](SECURITY.md).
 
 ## Licencia
 
-MIT — ver `LICENSE`.
+Distribuido bajo la licencia MIT. Consulta [LICENSE](LICENSE).
+
+## Autor
+
+**Ramón Burgos** — [@yemsy26](https://github.com/yemsy26)

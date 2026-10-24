@@ -1,0 +1,5 @@
+* text=auto
+
+# Los lanzadores de Windows necesitan CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
