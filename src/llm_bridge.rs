@@ -53,7 +53,10 @@ pub type BoxedTokenStream = Pin<Box<dyn Stream<Item = Result<String, BridgeError
 use std::collections::HashMap;
 
 use crate::error::MemoryError;
-use crate::memory_graph::{canonical_id, embed_texts, EdgeWrite, GraphAccess, MemoryGraph, RetrievalConfig};
+use crate::memory_graph::{
+    canonical_id, drafts_from_text, embed_texts, mentions, save_passages, EdgeWrite, GraphAccess, MemoryGraph,
+    RetrievalConfig,
+};
 use crate::prompts;
 use crate::tools::{ToolError, ToolRegistry};
 use crate::truth_filter::{BoxedSearch, SearchBackend, SearchHit};
@@ -88,6 +91,9 @@ const MAX_SYNTHESIS_TOKENS: i32 = 384;
 
 /// Fuentes web por investigación en caliente (Paso 24).
 const MAX_RESEARCH_SOURCES: usize = 5;
+
+/// Pasajes guardados en el prompt de memoria (Paso 30): ~3 × 500 caracteres.
+const MAX_PROMPT_PASSAGES: usize = 3;
 
 /// Temperatura para extracción: 0.1 = casi determinístico.
 /// Alta temperatura = más variedad = más alucinaciones en JSON estricto.
@@ -338,6 +344,20 @@ pub struct PreparedAnswer {
     /// misma (cálculo exacto). `answer`/`answer_stream` la devuelven sin
     /// llamar al modelo.
     pub direct:           Option<String>,
+    /// Paso 30: pasajes del prompt (en `sources`, en el mismo orden). Como
+    /// las aristas, se refuerzan si la respuesta se completa.
+    pub passage_ids:      Vec<String>,
+}
+
+impl PreparedAnswer {
+    /// Prompt del sistema: el del modo, salvo que la memoria traiga pasajes
+    /// numerados que citar (Paso 30).
+    fn system_prompt(&self) -> &'static str {
+        match self.mode {
+            AnswerMode::Memory if !self.sources.is_empty() => prompts::memory_passages_answer_system_prompt(),
+            mode => mode.system_prompt(),
+        }
+    }
 }
 
 
@@ -355,6 +375,9 @@ pub struct ExtractionResult {
 
     /// Número de intentos LLM necesarios (1 = éxito al primer intento).
     pub llm_attempts: u8,
+
+    /// Paso 30: pasajes nuevos con el texto tal cual.
+    pub passages_saved: usize,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -682,6 +705,18 @@ impl<B: LlmBackend> NeuralBridge<B> {
     ) -> Result<ExtractionResult, BridgeError> {
         log::debug!("Starting knowledge extraction for text ({} chars)", text.len());
 
+        // Paso 30: el texto se guarda tal cual, con el detalle que las
+        // tripletas pierden, aunque el modelo no consiga extraer hechos. Una
+        // pregunta que el planificador tomó por enseñanza no se guarda.
+        let passages_saved = if is_question_or_request(text) {
+            0
+        } else {
+            save_passages(graph, drafts_from_text(text, EdgeOrigin::Taught)).unwrap_or_else(|e| {
+                log::warn!("No se pudieron guardar los pasajes: {e}");
+                0
+            })
+        };
+
         // ── Retry loop de parsing ────────────────────────────────────
         let mut last_error: Option<String> = None;
         let mut attempts:   u8 = 0;
@@ -769,6 +804,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             nodes_created,
             edges_created,
             llm_attempts: attempts,
+            passages_saved,
         })
     }
 
@@ -797,6 +833,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
                 memory_context:   String::new(),
                 sources:          Vec::new(),
                 direct:           Some(direct),
+                passage_ids:      Vec::new(),
             });
         }
         let tool_output = plan.tool.as_ref().map(|call| self.run_tool(call));
@@ -807,11 +844,18 @@ impl<B: LlmBackend> NeuralBridge<B> {
         } else {
             plan.entities.clone()
         };
+        // Paso 30: la pregunta entera también, para buscar pasajes.
+        let question = &plan.rewritten_query;
+        let mut texts = probes.clone();
+        if !texts.contains(question) {
+            texts.push(question.clone());
+        }
         let embedder = graph.with_graph(|g| g.embedding_backend());
-        let vectors = embed_texts(embedder.as_ref(), &probes);
+        let vectors = embed_texts(embedder.as_ref(), &texts);
         // Todas o ninguna: sin vector para alguna sonda → fallback léxico.
         let probe_vecs: Option<Vec<Vec<f32>>> =
             probes.iter().map(|p| vectors.get(p).cloned()).collect();
+        let question_vec = vectors.get(question).map(Vec::as_slice);
 
         // ── 3. Recuperación semántica (único tramo con lock) ────────────
         let cfg = RetrievalConfig {
@@ -819,13 +863,33 @@ impl<B: LlmBackend> NeuralBridge<B> {
             focus: vec![plan.rewritten_query.clone()],
             ..RetrievalConfig::default()
         };
-        let context = graph
-            .with_graph(|g| g.retrieve_context(&probes, probe_vecs.as_deref(), &cfg))
+        let with_tool = tool_output.is_some();
+        let (context, passages) = graph
+            .with_graph(|g| -> Result<_, MemoryError> {
+                let context = g.retrieve_context(&probes, probe_vecs.as_deref(), &cfg)?;
+                // Con herramienta la respuesta sale de sus datos: sin pasajes.
+                let passages = if with_tool {
+                    Vec::new()
+                } else {
+                    g.relevant_passages(question, question_vec, MAX_PROMPT_PASSAGES)?
+                };
+                Ok((context, passages))
+            })
             .map_err(|e| BridgeError::GraphTraversal(e.to_string()))?;
         log::debug!(
-            "Contexto: {} semillas, {} aristas para {:?}",
-            context.seeds.len(), context.edges.len(), probes
+            "Contexto: {} semillas, {} aristas y {} pasajes para {:?}",
+            context.seeds.len(), context.edges.len(), passages.len(), probes
         );
+        // Una sonda que un pasaje NOMBRA está cubierta (como en el grafo, la
+        // similitud sola no basta).
+        let uncovered: Vec<String> = context.uncovered
+            .into_iter()
+            .filter(|probe| !passages.iter().any(|(p, _)| mentions(&format!("{} {}", p.title, p.text), probe)))
+            .collect();
+        let sources: Vec<SearchHit> = passages
+            .iter()
+            .map(|(p, _)| SearchHit { title: p.display_title(), url: p.url.clone().unwrap_or_default(), snippet: p.text.clone() })
+            .collect();
 
         // ── 4. Prompt de síntesis fundamentada ──────────────────────────
         let triples: Vec<(String, String, String, f64)> = context.edges
@@ -833,11 +897,14 @@ impl<B: LlmBackend> NeuralBridge<B> {
             .map(|e| (e.source.clone(), e.relation.clone(), e.target.clone(), e.weight))
             .collect();
         let graph_context = prompts::format_graph_context(&probes.join(", "), &triples);
-        let question = &plan.rewritten_query;
         let mode = if tool_output.is_some() { AnswerMode::Tool } else { AnswerMode::Memory };
         let user_prompt = match tool_output {
             Some(tool_result) => format!(
                 "Datos del sistema conectado:\n{tool_result}\n\nMemoria:\n{graph_context}\n\nPregunta: {question}"
+            ),
+            None if !sources.is_empty() => format!(
+                "Contexto:\n{graph_context}\n\nPasajes guardados:\n{}\n\nPregunta: {question}",
+                prompts::format_passages(&sources)
             ),
             None => format!("Contexto:\n{graph_context}\n\nPregunta: {question}"),
         };
@@ -846,10 +913,11 @@ impl<B: LlmBackend> NeuralBridge<B> {
             user_prompt,
             context_edge_ids: context.edges.into_iter().map(|e| e.edge_id).collect(),
             mode,
-            uncovered: context.uncovered,
+            uncovered,
             memory_context: graph_context,
-            sources: Vec::new(),
+            sources,
             direct: None,
+            passage_ids: passages.into_iter().map(|(p, _)| p.id).collect(),
         })
     }
 
@@ -866,6 +934,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             memory_context:   String::new(),
             sources:          Vec::new(),
             direct:           None,
+            passage_ids:      Vec::new(),
         }
     }
 
@@ -876,8 +945,8 @@ impl<B: LlmBackend> NeuralBridge<B> {
     ///     con la memoria relacionada; si no alcanza, el modelo responde
     ///     `[INVESTIGAR]` y se pasa a conocimiento general.
     pub fn research_first(&self, prepared: &PreparedAnswer) -> bool {
-        prepared.mode == AnswerMode::Memory
-            && (prepared.context_edge_ids.is_empty() || (!prepared.uncovered.is_empty() && self.search.is_some()))
+        let empty = prepared.context_edge_ids.is_empty() && prepared.passage_ids.is_empty();
+        prepared.mode == AnswerMode::Memory && (empty || (!prepared.uncovered.is_empty() && self.search.is_some()))
     }
 
     /// **Investigación en caliente** (Paso 24): busca en la web la pregunta
@@ -893,6 +962,8 @@ impl<B: LlmBackend> NeuralBridge<B> {
         // memoria del prompt no bastaba: reforzarla sumaba ruido en cada
         // pregunta nueva (7-9 aristas por consulta en la prueba en vivo).
         prepared.context_edge_ids.clear();
+        prepared.passage_ids.clear();
+        prepared.sources.clear();
         if hits.is_empty() {
             prepared.mode = AnswerMode::General;
             prepared.user_prompt = format!("Pregunta: {question}");
@@ -971,7 +1042,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             return Ok(direct.clone());
         }
         let text = self.backend.complete(
-            prepared.mode.system_prompt(),
+            prepared.system_prompt(),
             &prepared.user_prompt,
             MAX_SYNTHESIS_TOKENS,
             SYNTHESIS_TEMPERATURE,
@@ -989,7 +1060,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             return Ok(Box::pin(futures_util::stream::once(async { Ok(direct) })));
         }
         let stream = self.backend.stream_synthesis(
-            prepared.mode.system_prompt(),
+            prepared.system_prompt(),
             &prepared.user_prompt,
             MAX_SYNTHESIS_TOKENS,
             SYNTHESIS_TEMPERATURE,
@@ -1035,7 +1106,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             prepared = self.prepare_research(&plan, &prepared);
             answer = self.answer(&prepared)?;
         }
-        reinforce_context(graph, &prepared.context_edge_ids);
+        reinforce_context(graph, &prepared.context_edge_ids, &prepared.passage_ids);
         Ok((answer, prepared))
     }
 
@@ -1274,7 +1345,48 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
         },
     };
 
+    // Paso 30: red de seguridad del reloj. El 2B toma «¿a qué hora abre la
+    // sucursal?» (un horario) por la hora actual, y a veces no elige el reloj
+    // para «¿qué hora es?»: entonces investigaba en la web y guardaba como
+    // pasajes páginas de relojes, que luego respondían desde la memoria.
+    let tool = match tool {
+        Some(call) if call.name == "TimeTool" && asks_schedule(message) => None,
+        None if is_clock_question(message) => registry
+            .and_then(|r| r.resolve("TimeTool"))
+            .map(|name| ToolCall { name, params: serde_json::json!({}) }),
+        tool => tool,
+    };
+
     Plan { intent, rewritten_query, entities, tool, fallback: false }
+}
+
+/// Preguntas por la hora o la fecha actuales, en forma canónica.
+const CLOCK_QUESTIONS: &[&str] = &[
+    "que hora es", "que hora es ahora", "que hora tienes", "dime la hora", "me dices la hora",
+    "que dia es hoy", "que dia es", "que fecha es hoy", "que fecha es", "a que fecha estamos",
+    "a que dia estamos", "en que año estamos", "que año es",
+];
+
+/// Palabras del mensaje en forma canónica, separadas por un espacio.
+fn canonical_words(message: &str) -> String {
+    canonical_id(message)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// ¿Pregunta el mensaje por la hora o la fecha actuales? (Paso 30)
+fn is_clock_question(message: &str) -> bool {
+    let words = canonical_words(message);
+    let words = words.strip_prefix("y ").or_else(|| words.strip_prefix("oye ")).unwrap_or(&words);
+    CLOCK_QUESTIONS.contains(&words)
+}
+
+/// ¿Pregunta por un horario («¿a qué hora abre…?», «horario de…»)? (Paso 30)
+fn asks_schedule(message: &str) -> bool {
+    let words = canonical_words(message);
+    words.contains("a que hora") || words.split(' ').any(|w| w.starts_with("horario"))
 }
 
 /// Imperativos de petición que abren un mensaje, sin tildes ("explícame" →
@@ -1325,8 +1437,14 @@ fn is_question_or_request(message: &str) -> bool {
 /// "Neuronas que se disparan juntas, se conectan más fuerte": cada arista
 /// que fundamentó la respuesta sube `HEBBIAN_DELTA` y reinicia su curva del
 /// olvido. Best-effort: un fallo aquí no invalida una respuesta ya
-/// entregada. Devuelve cuántas aristas se reforzaron.
-pub fn reinforce_context<G: GraphAccess>(graph: &G, edge_ids: &[String]) -> usize {
+/// entregada. Devuelve cuántas aristas se reforzaron. Paso 30: los pasajes
+/// usados reinician su olvido.
+pub fn reinforce_context<G: GraphAccess>(graph: &G, edge_ids: &[String], passage_ids: &[String]) -> usize {
+    if !passage_ids.is_empty() {
+        if let Err(e) = graph.with_graph(|g| g.touch_passages(passage_ids)) {
+            log::warn!("No se pudo marcar el uso de los pasajes: {e}");
+        }
+    }
     if edge_ids.is_empty() {
         return 0;
     }
@@ -1517,7 +1635,7 @@ pub mod mock {
 mod tests {
     use super::*;
     use super::mock::MockLlmBackend;
-    use crate::memory_graph::MemoryGraph;
+    use crate::memory_graph::{MemoryGraph, PassageDraft};
 
     // ── JSON parsing ──────────────────────────────────────────
 
@@ -1621,6 +1739,36 @@ Espero que sea útil."#;
         // Paso 26: lo que enseña el usuario no se olvida.
         let hood = graph.get_neighbors("cortisol", crate::memory_graph::TraversalDirection::Outgoing).unwrap();
         assert!(hood.neighbors.iter().all(|(e, _)| e.origin == EdgeOrigin::Taught && e.source.is_none()));
+
+        // Paso 30: y el texto queda tal cual, como pasaje permanente.
+        assert_eq!(result.passages_saved, 1);
+        let passage = graph.recent_passages(5).unwrap().remove(0);
+        assert_eq!(passage.text, "El estrés crónico eleva el cortisol, que daña el hipocampo.");
+        assert_eq!((passage.origin, passage.display_title().as_str()), (EdgeOrigin::Taught, "Lo que me enseñaste"));
+    }
+
+    #[test]
+    fn test_clock_safety_net() {
+        let registry = time_registry();
+        let plan = |message: &str, tool: &str| parse_plan(&plan_json("query", message, &[], tool), message, Some(&registry));
+
+        assert_eq!(plan("¿A qué hora abre la sucursal los sábados?", "TimeTool").tool, None, "un horario no es la hora actual");
+        assert_eq!(plan("¿Cuál es el horario de la farmacia?", "TimeTool").tool, None);
+        assert_eq!(plan("¿Qué hora es?", "none").tool.map(|t| t.name).as_deref(), Some("TimeTool"));
+        assert_eq!(plan("Oye, ¿qué día es hoy?", "none").tool.map(|t| t.name).as_deref(), Some("TimeTool"));
+        assert_eq!(plan("¿En qué año estamos?", "TimeTool").tool.map(|t| t.name).as_deref(), Some("TimeTool"));
+        assert_eq!(plan("¿Qué hora es en Tokio cuando aquí son las 9?", "none").tool, None, "solo la pregunta exacta");
+        let no_clock = parse_plan(&plan_json("query", "¿Qué hora es?", &[], "none"), "¿Qué hora es?", None);
+        assert_eq!(no_clock.tool, None, "sin reloj registrado no se inventa");
+    }
+
+    #[test]
+    fn test_teaching_a_question_saves_no_passage() {
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        let mock = MockLlmBackend::new(vec![r#"{"triples": []}"#, r#"{"triples": []}"#]);
+        let result = NeuralBridge::new(mock).extract_and_memorize(&graph, "¿A qué hora abre la sucursal del centro?").unwrap();
+        assert_eq!(result.passages_saved, 0, "una pregunta tomada por enseñanza no es conocimiento");
+        assert_eq!(graph.passage_count().unwrap(), 0);
     }
 
     #[test]
@@ -2100,6 +2248,60 @@ Espero que sea útil."#;
         assert_eq!(prepared.mode, AnswerMode::Research);
         assert!(prepared.context_edge_ids.is_empty(), "una respuesta de la web no refuerza la memoria");
         assert!(bridge.backend.user_prompts()[2].contains("titanio es metal ligero"), "memoria + fuentes");
+    }
+
+    fn grafeno_passage() -> PassageDraft {
+        PassageDraft {
+            text:     "El grafeno es una lámina de carbono de un átomo de espesor, muy resistente.".into(),
+            title:    "Grafeno - Wikipedia".into(),
+            url:      Some("https://es.wikipedia.org/wiki/Grafeno".into()),
+            origin:   EdgeOrigin::Researched,
+            question: None,
+        }
+    }
+
+    /// Paso 30: un pasaje de una investigación anterior responde sin volver
+    /// a buscar, citado con su fuente.
+    #[test]
+    fn test_saved_passage_answers_and_cites_without_searching() {
+        let graph = titanio_graph();
+        save_passages(&graph, vec![grafeno_passage()]).unwrap();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué es el grafeno?", &["grafeno"], "none"),
+            "Una lámina de carbono de un átomo [1].".into(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["no debería buscarse"]));
+        let (answer, prepared) = bridge.ask(&graph, "¿Qué es el grafeno?", "").unwrap();
+
+        assert_eq!(answer, "Una lámina de carbono de un átomo [1].");
+        assert_eq!(prepared.mode, AnswerMode::Memory, "el pasaje nombra «grafeno»: no hace falta investigar");
+        assert_eq!(prepared.sources.len(), 1);
+        assert_eq!(prepared.sources[0].url, "https://es.wikipedia.org/wiki/Grafeno");
+        assert_eq!(prepared.system_prompt(), prompts::memory_passages_answer_system_prompt());
+        let prompt = &bridge.backend.user_prompts()[1];
+        assert!(prompt.contains("Pasajes guardados:
+[1] Grafeno - Wikipedia — El grafeno es una lámina"), "{prompt}");
+        assert_eq!(graph.recent_passages(1).unwrap()[0].uses, 1, "el pasaje que respondió reinicia su olvido");
+    }
+
+    /// Un pasaje que no nombra la entidad preguntada no evita investigarla,
+    /// y la respuesta investigada cita solo las fuentes web.
+    #[test]
+    fn test_passage_that_does_not_name_the_entity_still_researches() {
+        let graph = titanio_graph();
+        save_passages(&graph, drafts_from_text("El carbono forma el diamante y el grafito, dos minerales.", EdgeOrigin::Taught)).unwrap();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué es el carbono del grafeno?", &["grafeno"], "none"),
+            "El grafeno es carbono [1].".into(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["El grafeno es una forma de carbono."]));
+        let (_, prepared) = bridge.ask(&graph, "¿Qué es el carbono del grafeno?", "").unwrap();
+
+        assert_eq!(prepared.mode, AnswerMode::Research);
+        assert_eq!(prepared.sources.len(), 1);
+        assert_eq!(prepared.sources[0].snippet, "El grafeno es una forma de carbono.");
+        assert!(prepared.passage_ids.is_empty());
+        assert_eq!(graph.recent_passages(1).unwrap()[0].uses, 0, "no respondió: no se refuerza");
     }
 
     fn math_bridge(expression: &str) -> NeuralBridge<MockLlmBackend> {

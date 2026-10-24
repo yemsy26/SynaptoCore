@@ -416,6 +416,16 @@ Si el contexto no contiene la información necesaria para responder la pregunta,
 [INVESTIGAR] y nada más."
 }
 
+/// Respuesta desde la memoria con pasajes guardados (Paso 30): el texto de
+/// las fuentes y de lo enseñado permite explicar con detalle, citándolo.
+pub fn memory_passages_answer_system_prompt() -> &'static str {
+    "Eres SynaptoCore, un asistente con memoria a largo plazo. Responde la pregunta usando SOLO tu memoria: \
+el contexto y los pasajes guardados numerados. Explica con el detalle que aporten los pasajes, en el idioma de la \
+pregunta y de forma clara. Empieza directamente por la respuesta, sin hablar de «pasajes» ni de «contexto». Después de cada dato tomado de un pasaje, pon su número entre corchetes, por ejemplo: «Abre a las 9 [1].»
+Si tu memoria no contiene la información necesaria para responder la pregunta, responde exactamente \
+[INVESTIGAR] y nada más."
+}
+
 /// Respuesta con fuentes web numeradas (y la memoria, si aporta algo).
 pub fn research_answer_system_prompt() -> &'static str {
     "Eres SynaptoCore, un asistente con memoria a largo plazo. Responde la pregunta con la información \
@@ -440,11 +450,19 @@ si te piden información concreta que no conoces con seguridad, dilo y ofrece in
 
 /// Fuentes numeradas para el prompt: `[n] título — fragmento`.
 pub fn format_sources(hits: &[crate::truth_filter::SearchHit]) -> String {
-    const MAX_SNIPPET_CHARS: usize = 300;
+    format_numbered(hits, 300)
+}
+
+/// Pasajes guardados numerados (Paso 30), enteros: ya miden ≤ 500 caracteres.
+pub fn format_passages(passages: &[crate::truth_filter::SearchHit]) -> String {
+    format_numbered(passages, crate::memory_graph::MAX_PASSAGE_CHARS)
+}
+
+fn format_numbered(hits: &[crate::truth_filter::SearchHit], max_chars: usize) -> String {
     hits.iter()
         .enumerate()
         .map(|(i, h)| {
-            let snippet: String = h.snippet.chars().take(MAX_SNIPPET_CHARS).collect();
+            let snippet: String = h.snippet.chars().take(max_chars).collect();
             match h.title.trim() {
                 "" => format!("[{}] {}", i + 1, snippet.trim()),
                 title => format!("[{}] {} — {}", i + 1, title, snippet.trim()),

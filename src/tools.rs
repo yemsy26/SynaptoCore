@@ -191,8 +191,12 @@ impl Tool for TimeTool {
     }
 
     fn description(&self) -> &str {
+        // Paso 30: el 2B la elegía para «¿a qué hora abre la sucursal?» (un
+        // horario, no la hora actual). Una descripción en español la alejaba
+        // también de «¿qué hora es?»; basta con excluir los horarios.
         "Returns the current system date and time in ISO 8601 format. \
-         Use when the user asks about the current date, time, or year."
+         Use when the user asks about the current date, time, or year. \
+         Not for opening hours or schedules of places or events."
     }
 
     fn schema(&self) -> Value {

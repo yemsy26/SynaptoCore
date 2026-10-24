@@ -15,11 +15,12 @@ SynaptoCore es un sistema de memoria semántica persistente con razonamiento aut
 5. [Herramientas matemáticas](#herramientas-matemáticas)
 6. [Importar conocimiento por lotes](#importar-conocimiento-por-lotes)
 7. [Investigación profunda](#investigación-profunda)
-8. [API REST](#api-rest)
-9. [CLI — sc](#cli--sc)
-10. [Memoria Federada (.synapse)](#memoria-federada-synapse)
-11. [Features opcionales](#features-opcionales)
-12. [Compilación de producción](#compilación-de-producción)
+8. [Memoria de pasajes](#memoria-de-pasajes)
+9. [API REST](#api-rest)
+10. [CLI — sc](#cli--sc)
+11. [Memoria Federada (.synapse)](#memoria-federada-synapse)
+12. [Features opcionales](#features-opcionales)
+13. [Compilación de producción](#compilación-de-producción)
 
 ---
 
@@ -77,8 +78,10 @@ Usuario: "¿En qué lenguaje está hecho?"
 2. Planificador (1 llamada)      → intención, reescritura con el historial,
                                    entidades y herramienta: "¿En qué lenguaje está hecho PostgreSQL?"
 3. Memoria                       → contexto semántico del grafo para cada entidad
+                                   y pasajes guardados relevantes, citables como [n]
 4. Si la memoria no lo sabe      → busca en la web (SearXNG) y responde citando [n]
-5. Respuesta en streaming        → y, si investigó, aprende lo verificado en segundo plano
+5. Respuesta en streaming        → y, si investigó, guarda los pasajes de las fuentes
+                                   y aprende lo verificado en segundo plano
 6. SessionManager.push()         → guarda el turno
 7. API → { response, session_id, answered_from, sources }
 ```
@@ -309,6 +312,33 @@ Si no, queda «sin confirmar»: preferimos un «no concluyente» a una conclusi�
 Una investigación hace entre 5 y 15 búsquedas. Si SearXNG solo tiene activos brave, duckduckgo y google cse,
 estos motores se suspenden por exceso de peticiones; conviene activar más motores en `searxng-settings.yml`.
 
+## Memoria de pasajes
+
+El grafo guarda hechos sueltos (sujeto → relación → objeto); para explicar con detalle hace falta el texto del
+que salieron. SynaptoCore guarda ese texto como **pasajes**, cada uno con su procedencia:
+
+- **Fuentes investigadas**: al aprender de una investigación (en el chat o profunda), el fragmento de cada fuente
+  se guarda con su título, su URL y la pregunta que llevó a ella. Son citas, no afirmaciones propias.
+- **Lo que enseñas**: `/learn` y la intención «aprender» del chat guardan tu texto tal cual (permanente), aunque
+  el modelo no consiga extraer hechos de él. Una pregunta tomada por enseñanza no se guarda.
+- Nunca se guarda lo que redacta el modelo. Los textos se trocean a ≤ 500 caracteres (el modelo de embeddings
+  solo lee los primeros ~128 tokens) y no se duplican.
+
+Al responder desde la memoria, hasta 3 pasajes relevantes entran en el prompt numerados y la respuesta los cita
+como fuentes [n] («Lo que me enseñaste», o el título y la URL de la web). Con pasajes que nombran lo preguntado
+no se vuelve a buscar en la web: en la prueba en vivo, «¿Cuándo se descubrió la penicilina?» se respondió desde
+la memoria en 2 s, citando las fuentes de una investigación anterior.
+
+**Relevancia híbrida.** El modelo de embeddings no reconoce palabras raras («¿Qué es el grafeno?» ↔ su pasaje:
+coseno 0,29, por debajo de un pasaje que solo trata del tema, 0,49), así que la búsqueda combina vector y texto
+completo (FTS5, sin tildes y por raíces). Un pasaje es relevante si es muy parecido (≥ 0,55) o si nombra al menos
+la mitad de las palabras de la pregunta sin ser ajeno (≥ 0,20). Se calibra con
+`cargo test passage_similarity_calibration -- --ignored --nocapture`.
+
+Los pasajes se olvidan como las aristas de su procedencia, contando desde la última vez que fundamentaron una
+respuesta: lo investigado, tras ~13 meses sin usarse; lo enseñado, nunca. `GET /api/v1/passages` los lista y
+`DELETE /api/v1/passages/{id}` borra uno equivocado.
+
 ## API REST
 
 Base URL: `http://localhost:8080`
@@ -326,6 +356,7 @@ curl http://localhost:8080/health
   "node_count": 47,
   "edge_count": 123,
   "avg_weight": 0.814,
+  "passage_count": 16,
   "version": "0.17.0"
 }
 ```
@@ -411,6 +442,13 @@ curl -X POST http://localhost:8080/api/v1/investigations \
 curl http://localhost:8080/api/v1/investigations                 # lista (resumen)
 curl http://localhost:8080/api/v1/investigations/{id}            # preguntas, fuentes, hipótesis, conclusión, aprendido
 curl -X POST http://localhost:8080/api/v1/investigations/{id}/cancel
+```
+
+### Pasajes (Paso 30)
+
+```bash
+curl "http://localhost:8080/api/v1/passages?limit=50"   # los más recientes: texto, título, url, origin, usos
+curl -X DELETE http://localhost:8080/api/v1/passages/{id}   # 204 · 404 si no existe
 ```
 
 ### `POST /api/v1/federation/export`

@@ -17,6 +17,12 @@ use uuid::Uuid;
 use crate::error::MemoryError;
 use crate::types::{current_unix_ts, Edge, EdgeOrigin, Neighborhood, Node, Provenance};
 
+// Paso 30: memoria de pasajes (texto de las fuentes y de lo enseñado).
+mod passages;
+pub use passages::{
+    drafts_from_text, mentions, save_passages, split_into_passages, Passage, PassageDraft, MAX_PASSAGE_CHARS,
+};
+
 // ── Constantes de comportamiento cognitivo ────────────────────────────────────
 
 /// Incremento de peso por refuerzo Hebbiano.
@@ -193,6 +199,22 @@ pub fn backfill_embeddings<G: GraphAccess>(graph: &G, batch: usize) -> Result<us
         total += stored;
         if stored == 0 {
             break; // los nodos desaparecieron entre lectura y escritura
+        }
+    }
+    // Paso 30: los pasajes, igual (los anteriores al modelo o a un cambio de modelo).
+    loop {
+        let pending = graph.with_graph(|g| g.passages_missing_embedding(batch))?;
+        if pending.is_empty() {
+            break;
+        }
+        let texts: Vec<&str> = pending.iter().map(|(_, text)| text.as_str()).collect();
+        let vecs = backend.embed(&texts)?;                      // sin lock
+        let items: Vec<(String, Vec<f32>)> =
+            pending.into_iter().map(|(id, _)| id).zip(vecs).collect();
+        let stored = graph.with_graph(|g| g.store_passage_embeddings(&items))?;
+        total += stored;
+        if stored == 0 {
+            break;
         }
     }
     Ok(total)
@@ -458,6 +480,8 @@ pub struct MemoryGraph {
     /// Índice vectorial en RAM (Paso 22). `RefCell` basta: `MemoryGraph` ya
     /// es `!Sync` (rusqlite::Connection) y se comparte vía `Mutex`.
     index: RefCell<VectorIndex>,
+    /// Índice de los pasajes (Paso 30), aparte del de nodos.
+    passage_index: RefCell<VectorIndex>,
 }
 
 impl MemoryGraph {
@@ -469,7 +493,12 @@ impl MemoryGraph {
     /// Sin embedding backend — `semantic_search` usará LIKE fallback.
     pub fn open(path: &str) -> Result<Self, MemoryError> {
         let conn = Connection::open(path)?;
-        let mg = Self { conn, emb_backend: None, index: RefCell::new(VectorIndex::new(0)) };
+        let mg = Self {
+            conn,
+            emb_backend:   None,
+            index:         RefCell::new(VectorIndex::new(0)),
+            passage_index: RefCell::new(VectorIndex::new(0)),
+        };
         mg.apply_pragmas()?;
         mg.create_schema()?;
         mg.run_migrations()?;
@@ -494,8 +523,9 @@ impl MemoryGraph {
             log::warn!("No se pudo sincronizar el modelo de embeddings: {e}");
         }
         *self.index.get_mut() = VectorIndex::new(backend.dimensions());
+        *self.passage_index.get_mut() = VectorIndex::new(backend.dimensions());
         self.emb_backend = Some(backend);
-        if let Err(e) = self.reload_index() {
+        if let Err(e) = self.reload_index().and_then(|_| self.reload_passage_index()) {
             log::warn!("No se pudo cargar el índice vectorial: {e}");
         }
         self
@@ -523,7 +553,8 @@ impl MemoryGraph {
             .query_row("SELECT value FROM meta WHERE key = 'embedding_model'", [], |r| r.get(0))
             .optional()?;
         if stored.as_deref() != Some(model.as_str()) {
-            let cleared = self.conn.execute("UPDATE nodes SET embedding = NULL WHERE embedding IS NOT NULL", [])?;
+            let cleared = self.conn.execute("UPDATE nodes SET embedding = NULL WHERE embedding IS NOT NULL", [])?
+                + self.conn.execute("UPDATE passages SET embedding = NULL WHERE embedding IS NOT NULL", [])?;
             if cleared > 0 {
                 log::info!("Modelo de embeddings cambiado a '{model}': {cleared} vectores se regenerarán");
             }
@@ -701,6 +732,31 @@ impl MemoryGraph {
                 updated_at INTEGER NOT NULL,
                 data       TEXT NOT NULL
             ) STRICT;
+
+            -- ────────── TABLA: passages (Paso 30) ──────────
+            -- Fragmentos de texto con su procedencia: fuentes de las
+            -- investigaciones (title, url) y lo que enseña el usuario. El
+            -- texto normalizado es único: la misma fuente no se duplica.
+            -- last_used es el reloj del olvido (como last_accessed en edges).
+            CREATE TABLE IF NOT EXISTS passages (
+                id         TEXT PRIMARY KEY,
+                text       TEXT NOT NULL UNIQUE,
+                title      TEXT NOT NULL DEFAULT '',
+                url        TEXT,
+                origin     TEXT NOT NULL,
+                question   TEXT,
+                created_at INTEGER NOT NULL,
+                last_used  INTEGER NOT NULL,
+                uses       INTEGER NOT NULL DEFAULT 0,
+                embedding  BLOB
+            ) STRICT;
+
+            -- Índice de texto completo de los pasajes: sin tildes ni
+            -- mayúsculas, con prefijos («titan»* → titanio).
+            CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(
+                id UNINDEXED, title, text,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
         ")?;
         Ok(())
     }
@@ -1630,6 +1686,7 @@ impl MemoryGraph {
             node_count: node_count as u64,
             edge_count: edge_count as u64,
             avg_edge_weight: avg_weight,
+            passage_count: self.passage_count()?,
         })
     }
 
@@ -1867,11 +1924,15 @@ impl MemoryGraph {
         // que el subconsciente (Paso 4) investigue nodos sin contexto.
         let orphans_removed = self.prune_orphan_nodes()?;
 
+        // ── 5. Pasajes sin usar (Paso 30), con las mismas tasas ───────────
+        let passages_pruned = self.prune_stale_passages(rate_for, prune_threshold, now)?;
+
         Ok(DecayReport {
             edges_decayed:  updated_count as u64,
             edges_pruned:   pruned_count  as u64,
             nodes_removed:  orphans_removed as u64,
             edges_permanent: permanent,
+            passages_pruned: passages_pruned as u64,
             prune_threshold,
         })
     }
@@ -2214,6 +2275,8 @@ pub struct GraphStats {
     pub node_count:      u64,
     pub edge_count:      u64,
     pub avg_edge_weight: f64,
+    /// Pasajes guardados (Paso 30).
+    pub passage_count:   u64,
 }
 
 /// Instantánea completa del grafo para renderizado en el Dashboard (Paso 8).
@@ -2302,6 +2365,8 @@ pub struct DecayReport {
     pub nodes_removed:   u64,
     /// Aristas que no decaen por su procedencia (enseñadas, del sistema).
     pub edges_permanent: u64,
+    /// Pasajes olvidados por llevar demasiado sin usarse (Paso 30).
+    pub passages_pruned: u64,
     /// Umbral de poda usado.
     pub prune_threshold: f64,
 }

@@ -668,6 +668,7 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
       <div class="kpi"><span class="kpi-val" id="k-edges">—</span><span class="kpi-lbl">Aristas</span></div>
       <div class="kpi"><span class="kpi-val" id="k-weight">—</span><span class="kpi-lbl">Peso medio</span></div>
       <div class="kpi kpi--opt"><span class="kpi-val" id="k-degree">—</span><span class="kpi-lbl">Grado medio</span></div>
+      <div class="kpi kpi--opt" title="Textos guardados con su fuente (Paso 30)"><span class="kpi-val" id="k-passages">—</span><span class="kpi-lbl">Pasajes</span></div>
     </div>
 
     <div class="status">
@@ -1754,6 +1755,7 @@ async function pollHealth() {
     tween($('#k-edges'), d.edge_count);
     tween($('#k-weight'), d.avg_weight, 3);
     tween($('#k-degree'), d.node_count ? (2 * d.edge_count) / d.node_count : 0, 2);
+    tween($('#k-passages'), d.passage_count ?? 0);
 
     state.samples.push(d.node_count);
     if (state.samples.length > 40) state.samples.shift();
@@ -1869,7 +1871,7 @@ function appendAgent() {
       scrollChat();
     },
     meta(parts) { meta.innerHTML = parts.map(p => `<span>${escapeHtml(p)}</span>`).join(''); },
-    sources(list) {
+    sources(list, fromMemory) {
       if (!list?.length) return;
       const items = list.map(s => {
         const host = hostOf(s.url);
@@ -1879,7 +1881,9 @@ function appendAgent() {
           ? `<li><a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer"><b>[${s.n}]</b> ${label}</a>${hostTag}</li>`
           : `<li><b>[${s.n}]</b> ${label}</li>`;
       }).join('');
-      srcBox.innerHTML = `<div class="sources-head">${icon('globe')}Fuentes consultadas</div><ol>${items}</ol>`;
+      // Paso 30: desde la memoria son pasajes guardados, no una búsqueda nueva.
+      const head = fromMemory ? 'Pasajes de mi memoria' : 'Fuentes consultadas';
+      srcBox.innerHTML = `<div class="sources-head">${icon('globe')}${head}</div><ol>${items}</ol>`;
       srcBox.hidden = false;
       scrollChat();
     },
@@ -2014,7 +2018,7 @@ async function sendChat(text) {
           }
           if (bubble) {
             bubble.update(raw, false, p.sources);
-            bubble.sources(p.sources);
+            bubble.sources(p.sources, p.answered_from === 'memory');
             bubble.meta(parts);
           }
           if (card) card.meta(parts);

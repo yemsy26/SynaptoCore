@@ -43,7 +43,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -65,7 +65,7 @@ use crate::llm_bridge::{
     classify_answer_head, AnswerHead, AnswerMode, BoxedTokenStream, BridgeError, ExtractionResult, Intent,
     LlmBackend, NeuralBridge, Plan, PreparedAnswer,
 };
-use crate::memory_graph::{GraphSnapshot, InvestigationSummary, MemoryGraph, TraversalDirection};
+use crate::memory_graph::{GraphSnapshot, InvestigationSummary, MemoryGraph, Passage, TraversalDirection};
 use crate::priority::{BackgroundLlm, CognitivePriority};
 use crate::research;
 use crate::tools::ToolRegistry;
@@ -361,6 +361,8 @@ pub struct LearnResponse {
     pub nodes_created:     usize,
     pub edges_created:     usize,
     pub llm_attempts:      u8,
+    /// Paso 30: pasajes nuevos con el texto tal cual.
+    pub passages_saved:    usize,
 }
 
 #[derive(Serialize)]
@@ -369,6 +371,8 @@ pub struct HealthResponse {
     pub node_count: u64,
     pub edge_count: u64,
     pub avg_weight: f64,
+    /// Pasajes guardados (Paso 30).
+    pub passage_count: u64,
     pub version:    &'static str,
 }
 
@@ -525,6 +529,7 @@ pub async fn handle_health(
         node_count: stats.node_count,
         edge_count: stats.edge_count,
         avg_weight: stats.avg_edge_weight,
+        passage_count: stats.passage_count,
         version:    env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -716,17 +721,21 @@ pub async fn handle_query_stream(
                     .map(|t| format!("({} → {} → {})", t.subject, t.relation, t.object))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let confirmation = if res.triples.is_empty() {
-                    "He analizado tu mensaje, pero no identifiqué hechos o relaciones nuevas para memorizar en el grafo.".to_string()
-                } else {
-                    format!(
+                let mut confirmation = match (res.triples.is_empty(), res.passages_saved > 0) {
+                    (true, false) => "He analizado tu mensaje, pero no identifiqué hechos o relaciones nuevas para memorizar en el grafo.".to_string(),
+                    (true, true) => "No identifiqué hechos sueltos para el grafo, pero guardé tu texto tal cual en mi memoria.".to_string(),
+                    (false, _) => format!(
                         "🧠 He integrado esta información a mi red sináptica: {} tripletas asimiladas [{}] ({} nodos nuevos, {} conexiones).",
                         res.triples.len(),
                         summary_triples,
                         res.nodes_created,
                         res.edges_created
-                    )
+                    ),
                 };
+                // Paso 30: el texto completo también queda, para explicarlo con detalle.
+                if !res.triples.is_empty() && res.passages_saved > 0 {
+                    confirmation.push_str(" También guardé el texto tal cual.");
+                }
 
                 let payload = serde_json::json!({
                     "token": confirmation,
@@ -735,7 +744,8 @@ pub async fn handle_query_stream(
                     "intent": "learn",
                     "triples_count": res.triples.len(),
                     "nodes_created": res.nodes_created,
-                    "edges_created": res.edges_created
+                    "edges_created": res.edges_created,
+                    "passages_saved": res.passages_saved
                 }).to_string();
                 yield Ok(Event::default().data(payload));
 
@@ -832,8 +842,9 @@ pub async fn handle_query_stream(
                 // Paso 22: refuerzo hebbiano. Solo aquí, con la respuesta
                 // completada: un stream con error o cortado no refuerza nada.
                 let edge_ids = prepared.context_edge_ids.clone();
+                let passage_ids = prepared.passage_ids.clone();
                 let reinforced = tokio::task::spawn_blocking(move || {
-                    crate::llm_bridge::reinforce_context(&*graph_for_hebb, &edge_ids)
+                    crate::llm_bridge::reinforce_context(&*graph_for_hebb, &edge_ids, &passage_ids)
                 }).await.unwrap_or(0);
 
                 // Persistir en memoria de trabajo (Paso 13)
@@ -919,6 +930,7 @@ pub async fn handle_learn(
         nodes_created:     result.nodes_created,
         edges_created:     result.edges_created,
         llm_attempts:      result.llm_attempts,
+        passages_saved:    result.passages_saved,
     }))
 }
 
@@ -1231,6 +1243,45 @@ pub async fn handle_get_investigation(
     Ok(Json(serde_json::from_str(&data).map_err(|e| ApiError::internal(e.to_string()))?))
 }
 
+#[derive(Deserialize)]
+pub struct PassagesQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/v1/passages?limit=50` — pasajes guardados (Paso 30), los más
+/// recientes primero, con su procedencia: para revisar de dónde sale lo que
+/// la memoria cita.
+pub async fn handle_list_passages(
+    State(state): State<AppState>,
+    Query(query): Query<PassagesQuery>,
+) -> Result<Json<Vec<Passage>>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let graph = Arc::clone(&state.graph);
+    let list = tokio::task::spawn_blocking(move || {
+        let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        g.recent_passages(limit).map_err(ApiError::from)
+    })
+    .await??;
+    Ok(Json(list))
+}
+
+/// `DELETE /api/v1/passages/{id}` — borra un pasaje equivocado (Paso 30).
+pub async fn handle_delete_passage(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let graph = Arc::clone(&state.graph);
+    tokio::task::spawn_blocking(move || {
+        let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+        match g.delete_passage(&id)? {
+            true => Ok(StatusCode::NO_CONTENT),
+            false => Err(ApiError::not_found(format!("No existe el pasaje {id}"))),
+        }
+    })
+    .await?
+}
+
 /// `POST /api/v1/investigations/{id}/cancel` — el motor se detiene en su
 /// siguiente paso y conserva lo reunido.
 pub async fn handle_cancel_investigation(
@@ -1260,7 +1311,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/federation/export",    post(handle_federation_export))
         .route("/investigations",       get(handle_list_investigations).post(handle_start_investigation))
         .route("/investigations/{id}",  get(handle_get_investigation))
-        .route("/investigations/{id}/cancel", post(handle_cancel_investigation));
+        .route("/investigations/{id}/cancel", post(handle_cancel_investigation))
+        .route("/passages",             get(handle_list_passages))
+        .route("/passages/{id}",        axum::routing::delete(handle_delete_passage));
 
     Router::new()
         .route("/",                   get(handle_dashboard))
@@ -1437,6 +1490,32 @@ mod tests {
         assert!(json["edge_count"].is_number());
         assert!(json["avg_weight"].is_number());
         assert!(json["version"].is_string());
+    }
+
+    /// Paso 30: lo enseñado queda como pasaje, se lista con su procedencia
+    /// y se puede borrar.
+    #[tokio::test]
+    async fn test_learn_saves_passage_listed_and_deletable() {
+        let app = test_router(vec![
+            r#"{"triples": [{"subject": "sucursal_centro", "relation": "abre_a", "object": "las_9", "weight": 0.9}]}"#,
+        ]);
+        let text = "La sucursal del centro abre a las 9 y cierra a las 18, salvo los domingos.";
+        let (status, body) = send(app.clone(), post_json("/api/v1/learn", &format!(r#"{{"text": "{text}"}}"#))).await;
+        assert_eq!(status, StatusCode::OK);
+        let learned: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(learned["passages_saved"], 1);
+
+        let (_, body) = send(app.clone(), get_req("/api/v1/passages?limit=5")).await;
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list[0]["text"], text);
+        assert_eq!(list[0]["origin"], "taught");
+        let (_, body) = send(app.clone(), get_req("/health")).await;
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["passage_count"], 1);
+
+        let id = list[0]["id"].as_str().unwrap();
+        let delete = |id: &str| Request::builder().method(Method::DELETE).uri(format!("/api/v1/passages/{id}")).body(Body::empty()).unwrap();
+        assert_eq!(send(app.clone(), delete(id)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(send(app.clone(), delete(id)).await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

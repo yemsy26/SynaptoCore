@@ -192,6 +192,8 @@ Cada arista guarda de dónde vino (`edges.origin`) y su fuente (`edges.source`: 
 
 Si una arista se vuelve a aprender con una procedencia más duradera (`learn_edge`), sube de categoría y su reloj se reinicia: lo que el subconsciente dedujo pasa a «investigado» cuando una fuente lo confirma, y a «enseñado» si lo enseña el usuario; nunca baja; lo enseñado también reemplaza a lo importado, para que deshacer un lote no lo borre. El importador nunca modifica una arista existente. `DecayPolicy::Uniform(λ)` aplica el mismo λ a todo (demos y tests). La pasada del olvido solo lee las aristas que decaen.
 
+**Pasajes (Paso 30).** La misma pasada olvida los pasajes (`passages`: texto de las fuentes y de lo enseñado, ver `memory_graph/passages.rs`) con la tasa de su procedencia, contando desde `last_used`: un pasaje vale 1 cuando fundamenta una respuesta y se borra por debajo del umbral de poda (lo investigado, tras ~13 meses sin usarse; lo enseñado, nunca). Tienen su propio índice vectorial en RAM y un índice FTS5 (`passages_fts`) para la búsqueda híbrida.
+
 **Refuerzo Hebbiano**: cuando un nodo se consulta exitosamente (`semantic_search` retorna hit), se llama `MemoryGraph::reinforce_edge()` que incrementa `weight` y resetea `last_accessed`. Implementa "las neuronas que se activan juntas, se conectan."
 
 **Poda**: aristas con $w(t) < \text{prune\_threshold}$ (0.05 en producción) se eliminan en la limpieza horaria; lo que no se olvida nunca se poda.

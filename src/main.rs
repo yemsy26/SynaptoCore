@@ -515,9 +515,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prune_threshold: 0.05,    // θ: poda aristas con peso < 5%
                 });
                 match fc.run_nightly_cleanup(&graph) {
-                    Ok(r) if r.edges_pruned > 0 =>
-                        println!("[forgetting] Podadas {} aristas · {} nodos huérfanos",
-                            r.edges_pruned, r.nodes_removed),
+                    Ok(r) if r.edges_pruned > 0 || r.passages_pruned > 0 =>
+                        println!("[forgetting] Podadas {} aristas · {} nodos huérfanos · {} pasajes sin usar",
+                            r.edges_pruned, r.nodes_removed, r.passages_pruned),
                     Ok(_)  => {} // Nada que podar.
                     Err(e) => eprintln!("[forgetting] Error en limpieza: {}", e),
                 }

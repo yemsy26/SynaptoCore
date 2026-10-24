@@ -15,6 +15,8 @@
 //     VERIFIED con confianza > umbral, como el subconsciente.
 //   • Nunca aprende de la respuesta del propio modelo: solo de las fuentes.
 //   • El llamador pasa un LLM que cede el turno al chat (`BackgroundLlm`).
+//   • Paso 30: además guarda el texto de las fuentes como pasajes, con su
+//     título y URL, para explicar con detalle y citarlas más adelante.
 // ============================================================
 
 use serde::Deserialize;
@@ -22,7 +24,7 @@ use serde::Deserialize;
 use crate::llm_bridge::{
     node_name, parse_json_response, validate_triple, BridgeError, ExtractedTriple, LlmBackend,
 };
-use crate::memory_graph::{embed_texts, GraphAccess};
+use crate::memory_graph::{embed_texts, save_passages, split_into_passages, GraphAccess, PassageDraft};
 use crate::prompts;
 use crate::subconscious::{consolidate_triples, consolidation_allowed};
 use crate::truth_filter::{EpistemicValidator, SearchBackend, SearchHit};
@@ -44,6 +46,25 @@ pub struct ResearchLearning {
     pub extracted:    usize,
     /// Aristas nuevas en el grafo, como "sujeto→relación→objeto".
     pub consolidated: Vec<String>,
+    /// Pasajes nuevos con el texto de las fuentes (Paso 30).
+    pub passages:     usize,
+}
+
+/// Pasajes de las fuentes de una búsqueda: su fragmento, con título, URL y
+/// la pregunta que llevó a ellas.
+pub fn source_drafts(hits: &[SearchHit], question: &str) -> Vec<PassageDraft> {
+    hits.iter()
+        .flat_map(|h| {
+            let url = (!h.url.trim().is_empty()).then(|| h.url.trim().to_string());
+            split_into_passages(&h.snippet).into_iter().map(move |text| PassageDraft {
+                text,
+                title:    h.title.trim().to_string(),
+                url:      url.clone(),
+                origin:   EdgeOrigin::Researched,
+                question: Some(question.to_string()),
+            })
+        })
+        .collect()
 }
 
 /// Extrae, valida y consolida los hechos de las fuentes de una
@@ -67,6 +88,22 @@ where
         return Ok(ResearchLearning::default());
     }
 
+    // ── 0. El texto de las fuentes, con su procedencia (Paso 30) ─
+    // Son citas, no afirmaciones propias: se guardan sin validar y se citan
+    // con su fuente al responder.
+    let passages = match save_passages(graph, source_drafts(hits, question)) {
+        Ok(n) => {
+            if n > 0 {
+                log(&format!("📄 {n} pasaje(s) nuevos con el texto de las fuentes"));
+            }
+            n
+        }
+        Err(e) => {
+            log(&format!("⚠ No se pudieron guardar los pasajes: {e}"));
+            0
+        }
+    };
+
     // ── 1. Extracción de hechos de las fuentes ───────────────────
     #[derive(Deserialize)]
     struct Batch {
@@ -83,7 +120,7 @@ where
         Ok(batch) => batch.triples.into_iter().filter(validate_triple).take(MAX_RESEARCH_TRIPLES).collect(),
         Err(e) => {
             log(&format!("⚠ Extracción de la investigación no interpretable: {e}"));
-            return Ok(ResearchLearning::default());
+            return Ok(ResearchLearning { passages, ..Default::default() });
         }
     };
 
@@ -104,7 +141,7 @@ where
         }
     }
     if accepted.is_empty() {
-        return Ok(ResearchLearning { extracted: triples.len(), consolidated: Vec::new() });
+        return Ok(ResearchLearning { extracted: triples.len(), consolidated: Vec::new(), passages });
     }
 
     // ── 3. Embeddings fuera del lock y consolidación ─────────────
@@ -129,7 +166,7 @@ where
             })
             .collect()
     });
-    Ok(ResearchLearning { extracted: triples.len(), consolidated })
+    Ok(ResearchLearning { extracted: triples.len(), consolidated, passages })
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -174,6 +211,14 @@ mod tests {
         let edge = &hood.neighbors[0].0;
         assert_eq!(edge.origin, EdgeOrigin::Researched);
         assert_eq!(edge.source.as_deref(), Some("https://es.wikipedia.org/wiki/Titanio"));
+
+        // Paso 30: y el texto de la fuente, con título, URL y pregunta.
+        assert_eq!(learned.passages, 1);
+        let passage = &graph.recent_passages(5).unwrap()[0];
+        assert_eq!(passage.text, "William Gregor descubrió el titanio en 1791.");
+        assert_eq!((passage.title.as_str(), passage.url.as_deref()), ("Titanio", Some("https://es.wikipedia.org/wiki/Titanio")));
+        assert_eq!(passage.origin, EdgeOrigin::Researched);
+        assert_eq!(passage.question.as_deref(), Some("¿Quién descubrió el titanio?"));
     }
 
     #[test]
@@ -187,5 +232,6 @@ mod tests {
         let bad = learn_from_sources(&llm, &MockSearchBackend::empty(), &graph, "q", &[hit("x")], 0.5, &|_| {}).unwrap();
         assert!(bad.consolidated.is_empty());
         assert_eq!(graph.stats().unwrap().edge_count, 0);
+        assert_eq!(bad.passages, 0, "un fragmento de una letra no es un pasaje");
     }
 }
