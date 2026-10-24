@@ -11,3 +11,4 @@ synaptocore_memory.db*
 
 # Conectores de esta instalación (la plantilla versionada es conectores.example.json)
 conectores.json
+cerebros.json

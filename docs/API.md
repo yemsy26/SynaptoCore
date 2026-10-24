@@ -265,6 +265,65 @@ Borra un pasaje. Devuelve `204 No Content`, o `404` si no existe.
 
 ---
 
+## Cerebros
+
+### `GET /api/v1/brains`
+
+Motores, modelos disponibles y los cerebros en uso.
+
+```json
+{
+  "engines": [
+    {"id": "ollama", "label": "Ollama", "kind": "ollama", "base_url": "http://localhost:11434", "online": true, "error": null},
+    {"id": "lmstudio", "label": "LM Studio", "kind": "openai", "base_url": "http://localhost:1234", "online": false, "error": "..."}
+  ],
+  "models": [
+    {"engine": "ollama", "engine_label": "Ollama", "model": "qwen3.5:2b-q4_K_M", "display": "qwen3.5:2b-q4_K_M",
+     "params": "1.9B", "params_b": 1.9, "quantization": "Q4_K_M", "bits": 4.0, "context": null,
+     "loaded": true, "reasoning": "unknown", "tier": "ligero"}
+  ],
+  "rapido":   {"choice": {"engine": "ollama", "model": "qwen3.5:2b-q4_K_M"}, "label": "Ollama · qwen3.5:2b-q4_K_M",
+               "scope": {"tier": "ligero", "synthesis_tokens": 384, "prompt_passages": 3, "investigation_rounds": 3, "conclusion_tokens": 450}},
+  "profundo": {"choice": {"engine": "ollama", "model": "qwen3.5:2b-q4_K_M"}, "label": "Ollama · qwen3.5:2b-q4_K_M",
+               "scope": {"tier": "ligero", "synthesis_tokens": 384, "prompt_passages": 3, "investigation_rounds": 3, "conclusion_tokens": 450}}
+}
+```
+
+`reasoning`: `absent` (no razona), `optional` (se puede apagar), `always` (razona siempre) o `unknown`. `tier`: `ligero`, `medio` o `avanzado`.
+
+### `PUT /api/v1/brains`
+
+Cambia los cerebros sin reiniciar y guarda la elección en `cerebros.json`. `tier` es opcional (sin él, el nivel automático). Si alguno de los dos no está disponible, no se cambia ninguno (400).
+
+```json
+{
+  "rapido":   {"engine": "ollama", "model": "qwen3.5:2b-q4_K_M"},
+  "profundo": {"engine": "bionic", "model": "qwen3.6-35b-a3b", "tier": "avanzado"}
+}
+```
+
+Responde como `GET /api/v1/brains`.
+
+### `POST /api/v1/brains/test`
+
+Prueba un modelo con un JSON con esquema y una respuesta en streaming. Si no está cargado, la prueba incluye la carga.
+
+```json
+{"engine": "bionic", "model": "qwen3.6-35b-a3b"}
+```
+
+```json
+{
+  "engine": "bionic", "model": "qwen3.6-35b-a3b", "tier": "avanzado",
+  "json_ok": true, "json_detail": "{\"ok\": true, \"color\": \"azul\"}",
+  "stream_ok": true, "first_token_ms": 5818, "tokens_per_s": 13.4,
+  "sample": "La memoria a largo plazo es...", "total_ms": 31979,
+  "verdict": "apto", "notes": []
+}
+```
+
+`verdict`: `apto`, `apto con límites` o `no apto`; `notes` explica los límites.
+
 ## Federación
 
 ### `POST /api/v1/federation/export`

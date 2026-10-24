@@ -41,13 +41,19 @@ pub struct OllamaBackend {
 impl OllamaBackend {
     /// Construye el backend con URL y modelo explícitos.
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        // 120s: cubre el primer token de un modelo 7B cargando en VRAM/RAM.
+        Self::with_timeout(base_url, model, std::time::Duration::from_secs(120))
+    }
+
+    /// Paso 33a: con la espera según el nivel del cerebro (un 27B tarda en
+    /// cargar).
+    pub fn with_timeout(base_url: impl Into<String>, model: impl Into<String>, timeout: std::time::Duration) -> Self {
         let client = reqwest::blocking::Client::builder()
-            // 120s: cubre el primer token de un modelo 7B cargando en VRAM/RAM.
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(timeout)
             .build()
             .expect("reqwest client build siempre OK con opciones válidas");
         let async_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(timeout)
             .build()
             .expect("reqwest async client build siempre OK con opciones vÃ¡lidas");
         Self {
@@ -344,7 +350,7 @@ impl OllamaBackend {
 /// El orden de pasos garantiza que siempre devolvemos la parte más compacta
 /// y parseable posible. Si el texto no contiene JSON, se devuelve tal cual
 /// para que el llamador decida qué hacer.
-fn normalize_llm_output(s: &str) -> String {
+pub(crate) fn normalize_llm_output(s: &str) -> String {
     // Paso 1: strip de code fences (```json...``` o ```...```)
     let s = strip_code_fences(s);
 

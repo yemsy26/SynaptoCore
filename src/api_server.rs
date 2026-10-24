@@ -58,6 +58,7 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+use crate::brains::{self, BrainChoice, BrainHub, BrainInfo, BrainTest, BrainsConfig, EngineStatus, Scope, Tier};
 use crate::error::MemoryError;
 use crate::federated_memory::{self, FederationError};
 use crate::investigation::{self, Investigation, InvestigationStatus};
@@ -186,6 +187,21 @@ pub struct AppState {
     /// `None` sin SEARXNG_URL: las preguntas sin memoria se responden con
     /// conocimiento general etiquetado como no verificado.
     pub search: Option<BoxedSearch>,
+
+    /// Paso 33a: cerebro profundo (responder, pensar, investigar). `None` →
+    /// el mismo que `llm`, que es el rápido (planificar, extraer, validar).
+    pub deep: Option<Arc<dyn LlmBackend + Send + Sync + 'static>>,
+
+    /// Paso 33a: catálogo y cambio de cerebros. `None` sin motores reales
+    /// (pruebas): `/api/v1/brains` responde 503.
+    pub brains: Option<Arc<BrainHub>>,
+}
+
+impl AppState {
+    /// Cerebro que redacta respuestas e investiga.
+    fn deep_llm(&self) -> Arc<dyn LlmBackend + Send + Sync + 'static> {
+        self.deep.clone().unwrap_or_else(|| Arc::clone(&self.llm))
+    }
 }
 
 /// Lo necesario para construir el bridge del chat dentro de `spawn_blocking`.
@@ -193,6 +209,7 @@ pub struct AppState {
 #[derive(Clone)]
 struct ChatDeps {
     llm:    Arc<dyn LlmBackend + Send + Sync + 'static>,
+    deep:   Arc<dyn LlmBackend + Send + Sync + 'static>,
     tools:  Arc<ToolRegistry>,
     search: Option<BoxedSearch>,
 }
@@ -201,13 +218,17 @@ impl ChatDeps {
     fn from_state(state: &AppState) -> Self {
         Self {
             llm:    Arc::clone(&state.llm),
+            deep:   state.deep_llm(),
             tools:  Arc::clone(&state.tool_registry),
             search: state.search.clone(),
         }
     }
 
+    /// Paso 33a: el rápido planifica y extrae; el profundo responde.
     fn bridge(&self) -> NeuralBridge<Arc<dyn LlmBackend + Send + Sync + 'static>> {
-        let bridge = NeuralBridge::new(Arc::clone(&self.llm)).with_tools(Arc::clone(&self.tools));
+        let bridge = NeuralBridge::new(Arc::clone(&self.llm))
+            .with_tools(Arc::clone(&self.tools))
+            .with_deep(Arc::clone(&self.deep));
         match &self.search {
             Some(search) => bridge.with_search(search.clone()),
             None => bridge,
@@ -220,6 +241,8 @@ impl ChatDeps {
 struct LearnDeps {
     graph:    Arc<Mutex<MemoryGraph>>,
     llm:      Arc<dyn LlmBackend + Send + Sync + 'static>,
+    /// Paso 33a: la investigación profunda usa el cerebro profundo.
+    deep:     Arc<dyn LlmBackend + Send + Sync + 'static>,
     priority: Arc<CognitivePriority>,
     search:   Option<BoxedSearch>,
     events:   EventSender,
@@ -230,6 +253,7 @@ impl LearnDeps {
         Self {
             graph:    Arc::clone(&state.graph),
             llm:      Arc::clone(&state.llm),
+            deep:     state.deep_llm(),
             priority: Arc::clone(&state.priority),
             search:   state.search.clone(),
             events:   state.events_tx.clone(),
@@ -280,7 +304,7 @@ fn spawn_investigation(deps: LearnDeps, mut inv: Investigation) {
     let Some(search) = deps.search.clone() else { return };
     tokio::task::spawn_blocking(move || {
         let llm: Arc<dyn LlmBackend + Send + Sync> =
-            Arc::new(BackgroundLlm::new(Arc::clone(&deps.llm), Arc::clone(&deps.priority)));
+            Arc::new(BackgroundLlm::new(Arc::clone(&deps.deep), Arc::clone(&deps.priority)));
         let events = deps.events.clone();
         let graph = Arc::clone(&deps.graph);
         let mut checkpoint = |state: &Investigation, msg: &str| -> bool {
@@ -1207,7 +1231,8 @@ pub async fn handle_start_investigation(
     if state.search.is_none() {
         return Err(ApiError::unavailable("Investigar necesita búsqueda web: configura SEARXNG_URL"));
     }
-    let inv = Investigation::new(objective, req.rounds.unwrap_or(investigation::DEFAULT_ROUNDS));
+    // Paso 33a: las rondas por defecto, según el alcance del cerebro profundo.
+    let inv = Investigation::new(objective, req.rounds.unwrap_or(state.deep_llm().scope().investigation_rounds));
     let graph = Arc::clone(&state.graph);
     let initial = inv.clone();
     tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
@@ -1220,6 +1245,85 @@ pub async fn handle_start_investigation(
     .await??;
     spawn_investigation(LearnDeps::from_state(&state), inv.clone());
     Ok((StatusCode::ACCEPTED, Json(inv)))
+}
+
+// ── Cerebros (Paso 33a) ──────────────────────────────────────
+
+/// Un cerebro en uso: qué se eligió, cómo se llama y su alcance.
+#[derive(Serialize)]
+pub struct ActiveBrainDto {
+    pub choice: BrainChoice,
+    pub label:  String,
+    pub scope:  Scope,
+}
+
+/// `GET /api/v1/brains`: motores, modelos disponibles y los cerebros en uso.
+#[derive(Serialize)]
+pub struct BrainsResponse {
+    pub engines:  Vec<EngineStatus>,
+    pub models:   Vec<BrainInfo>,
+    pub rapido:   ActiveBrainDto,
+    pub profundo: ActiveBrainDto,
+}
+
+#[derive(Deserialize)]
+pub struct BrainTestRequest {
+    pub engine: String,
+    pub model:  String,
+    #[serde(default)]
+    pub tier:   Option<Tier>,
+}
+
+fn brain_hub(state: &AppState) -> Result<Arc<BrainHub>, ApiError> {
+    state.brains.clone().ok_or_else(|| ApiError::unavailable("Los cerebros no se pueden cambiar en este modo"))
+}
+
+async fn brains_response(hub: Arc<BrainHub>) -> Result<BrainsResponse, ApiError> {
+    Ok(tokio::task::spawn_blocking(move || {
+        let (engines, models) = brains::discover(&hub.engines);
+        let dto = |slot: &brains::BrainSlot| {
+            let active = slot.get();
+            ActiveBrainDto { choice: active.choice.clone(), label: active.label.clone(), scope: active.scope }
+        };
+        BrainsResponse { engines, models, rapido: dto(&hub.rapido), profundo: dto(&hub.profundo) }
+    }).await?)
+}
+
+/// `GET /api/v1/brains` — catálogo de los motores y cerebros en uso.
+pub async fn handle_brains(State(state): State<AppState>) -> Result<Json<BrainsResponse>, ApiError> {
+    Ok(Json(brains_response(brain_hub(&state)?).await?))
+}
+
+/// `PUT /api/v1/brains` — cambia los cerebros en caliente y guarda la
+/// elección en `cerebros.json`. Si alguno no está disponible, no cambia nada.
+pub async fn handle_set_brains(
+    State(state): State<AppState>,
+    Json(config): Json<BrainsConfig>,
+) -> Result<Json<BrainsResponse>, ApiError> {
+    let hub = brain_hub(&state)?;
+    let applying = Arc::clone(&hub);
+    tokio::task::spawn_blocking(move || applying.apply(&config)).await?.map_err(ApiError::bad_request)?;
+    let msg = format!("🧠 Cerebros: rápido {} · profundo {}", hub.rapido.get().label, hub.profundo.get().label);
+    println!("  {msg}");
+    let _ = state.events_tx.send(SubconsciousEvent::new("Cycle", msg).to_json());
+    Ok(Json(brains_response(hub).await?))
+}
+
+/// `POST /api/v1/brains/test` — prueba un cerebro con lo que el sistema le
+/// pide de verdad: un JSON con esquema y una respuesta en stream.
+pub async fn handle_test_brain(
+    State(state): State<AppState>,
+    Json(req): Json<BrainTestRequest>,
+) -> Result<Json<BrainTest>, ApiError> {
+    let hub = brain_hub(&state)?;
+    let choice = BrainChoice { engine: req.engine, model: req.model, tier: req.tier };
+    let (backend, info) = tokio::task::spawn_blocking(move || hub.backend_for(&choice))
+        .await?
+        .map_err(ApiError::bad_request)?;
+    // Mientras se prueba, el subconsciente cede el modelo.
+    let _fg = state.priority.enter();
+    let tier = req.tier.unwrap_or(info.tier);
+    Ok(Json(brains::test_brain(backend, info, tier).await))
 }
 
 /// `GET /api/v1/investigations` — las últimas investigaciones (resumen).
@@ -1320,7 +1424,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/investigations/{id}",  get(handle_get_investigation))
         .route("/investigations/{id}/cancel", post(handle_cancel_investigation))
         .route("/passages",             get(handle_list_passages))
-        .route("/passages/{id}",        axum::routing::delete(handle_delete_passage));
+        .route("/passages/{id}",        axum::routing::delete(handle_delete_passage))
+        .route("/brains",               get(handle_brains).put(handle_set_brains))
+        .route("/brains/test",          post(handle_test_brain));
 
     Router::new()
         .route("/",                   get(handle_dashboard))
@@ -1378,6 +1484,8 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        None,
         };
         build_router(state)
@@ -1400,6 +1508,8 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        None,
         };
         build_router(state)
@@ -1458,6 +1568,8 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        Some(BoxedSearch::new(crate::truth_filter::MockSearchBackend::empty())),
         });
 
@@ -1852,6 +1964,8 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        None,
         };
         let app = build_router(state);
@@ -1887,6 +2001,8 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        None,
         };
 
@@ -1917,6 +2033,8 @@ mod tests {
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             // Sin gracia: el aprendizaje en segundo plano no espera 1,5 s.
             priority:      Arc::new(CognitivePriority::new(std::time::Duration::ZERO)),
+            deep:          None,
+            brains:        None,
             search:        Some(BoxedSearch::new(crate::truth_filter::MockSearchBackend::new(vec![web]))),
         }
     }
@@ -2047,6 +2165,8 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        None,
         };
         let app = build_router(state);
@@ -2171,6 +2291,8 @@ mod tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        None,
         };
         let app = build_router(state);

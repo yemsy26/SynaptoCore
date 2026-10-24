@@ -38,6 +38,7 @@ SynaptoCore es un servidor escrito en Rust que da a un modelo de lenguaje local 
 - **Cálculo exacto.** Las preguntas numéricas van a una calculadora de precisión arbitraria, a un verificador de conjeturas y a un buscador de fórmulas de sucesiones; el modelo nunca rehace las cuentas.
 - **Conectores sin código.** Cualquier API HTTP (ERP, CRM, inventario) se declara en un archivo JSON y el asistente puede consultarla.
 - **Importación por lotes.** Carga cientos de miles de relaciones desde JSONL (por ejemplo, desde Wikidata) y deshace un lote entero si hace falta.
+- **Varios cerebros.** Usa modelos de Ollama y de servidores compatibles con OpenAI (LM Studio, Bionic, llama.cpp) a la vez: uno rápido para planificar y extraer, y otro profundo para responder e investigar. Lo que se le pide a cada uno depende de su tamaño, para que un modelo pequeño no quede desbordado. Se cambian desde el panel sin reiniciar.
 - **Interfaces.** Panel web en tiempo real, API REST con respuestas en streaming (SSE), telemetría por WebSocket y una CLI (`sc`).
 
 ## Cómo funciona
@@ -71,6 +72,7 @@ La arquitectura interna está documentada en [ARCHITECTURE.md](ARCHITECTURE.md).
 | [Rust](https://rustup.rs) estable | Sí | Desarrollado con Rust 1.94. |
 | [Ollama](https://ollama.com) | Sí, para respuestas reales | Usa la GPU automáticamente si la hay. Sin Ollama el servidor arranca en modo demostración. |
 | Modelo `qwen3.5:2b-q4_K_M` | Sí | 1,9 GB. Se puede usar otro modelo de Ollama con `OLLAMA_MODEL`. |
+| [LM Studio](https://lmstudio.ai) u otro servidor compatible con OpenAI | Opcional | Para usar más modelos como cerebros (ver [Cerebros](#cerebros)). |
 | [Docker](https://www.docker.com) | Recomendado | Para ejecutar SearXNG, el buscador que permite investigar y verificar. |
 | Python 3 | Opcional | Solo para el script que genera datos desde Wikidata. |
 
@@ -271,6 +273,27 @@ python scripts/wikidata_tripletas.py --preset paises -o paises.jsonl
 python scripts/wikidata_tripletas.py --clase Q11344 --propiedades P61:descubierto_por -o elementos.jsonl
 ```
 
+### Cerebros
+
+El botón **Cerebros** del panel muestra los motores encontrados (Ollama, LM Studio en el puerto 1234 y Bionic en el 1235) con sus modelos, su tamaño, su compresión y si están cargados. Hay dos funciones:
+
+| Cerebro | Qué hace | Conviene |
+|---------|----------|----------|
+| Rápido | Planifica cada mensaje, extrae hechos, valida y mueve el aprendizaje en segundo plano. | Un modelo pequeño y rápido (2-4B). |
+| Profundo | Redacta las respuestas e investiga a fondo. | El modelo más capaz que quepa en tu equipo. |
+
+Cada cerebro tiene un **nivel** que sale de su tamaño y decide cuánto se le pide:
+
+| Nivel | Modelos | Respuestas de hasta | Pasajes en el prompt | Rondas al investigar |
+|-------|---------|---------------------|----------------------|----------------------|
+| Ligero | 4B o menos | 384 tokens | 3 | 3 |
+| Medio | 5 a 14B | 768 tokens | 5 | 3 |
+| Avanzado | 15B o más | 1536 tokens | 8 | 4 |
+
+Un modelo muy comprimido (1-2 bits por peso) baja un nivel, y el nivel se puede fijar a mano. **Probar** comprueba un cerebro antes de usarlo: si devuelve el JSON que necesitan el planificador y la extracción, si responde en streaming, su velocidad y si razona siempre. **Usar estos cerebros** los cambia sin reiniciar y guarda la elección en `cerebros.json`.
+
+Funciona con modelos que razonan: se les pide no razonar cuando lo admiten y, a los que razonan siempre, se les da más margen y se descarta el razonamiento de la respuesta. Si al arrancar un cerebro guardado no está disponible (por ejemplo, LM Studio cerrado), se usa el modelo de `OLLAMA_MODEL` y se avisa en la consola. En un equipo con poca memoria de vídeo, un cerebro profundo grande responde con más calidad pero tarda más.
+
 ### Investigación profunda
 
 Para preguntas que piden más que un dato. Trabaja en segundo plano, por rondas:
@@ -338,7 +361,9 @@ El servidor lee estas variables de entorno (los lanzadores de Windows las cargan
 | Variable | Por defecto | Descripción |
 |----------|-------------|-------------|
 | `OLLAMA_HOST` | `http://localhost:11434` | URL de Ollama. |
-| `OLLAMA_MODEL` | `qwen3.5:2b-q4_K_M` | Modelo de Ollama que se usa. |
+| `OLLAMA_MODEL` | `qwen3.5:2b-q4_K_M` | Modelo de Ollama que se usa mientras no se elijan otros cerebros. |
+| `SYNAPTOCORE_OPENAI_URLS` | `http://localhost:1234,http://localhost:1235` | Servidores compatibles con OpenAI donde buscar cerebros (LM Studio, Bionic, llama.cpp), separados por comas. |
+| `SYNAPTOCORE_BRAINS` | `cerebros.json` | Archivo donde se guarda la elección de cerebros. |
 | `SEARXNG_URL` | *(sin definir)* | URL de SearXNG. Sin ella no hay búsquedas web ni aprendizaje autónomo, y lo que no esté en memoria se responde como conocimiento general no verificado. |
 | `SYNAPTOCORE_PORT` | `8080` | Puerto del servidor. Escucha solo en `127.0.0.1`. |
 | `SYNAPTOCORE_CONNECTORS` | `conectores.json` | Archivo de conectores externos. |
@@ -357,6 +382,9 @@ SynaptoCore/
 │   ├── main.rs              # arranque, ciclos de fondo y subcomando `importar`
 │   ├── api_server.rs        # API REST, SSE y WebSocket (Axum)
 │   ├── llm_bridge.rs        # planificador, recuperación de contexto y respuesta
+│   ├── brains.rs            # cerebros: catálogo, nivel, alcance y cambio en caliente
+│   ├── ollama_backend.rs    # motor Ollama
+│   ├── openai_backend.rs    # motor compatible con OpenAI (LM Studio, Bionic)
 │   ├── memory_graph.rs      # grafo en SQLite, índice vectorial y olvido
 │   ├── memory_graph/
 │   │   └── passages.rs      # memoria de pasajes (vector + FTS5)

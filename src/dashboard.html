@@ -594,6 +594,32 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
 .inv-history-item .when { font: 11px var(--mono); color: var(--text-3); }
 
 /* ================================================================
+   CEREBROS (Paso 33a) — panel lateral
+   ================================================================ */
+.drawer .panel-head .icon.cpu { color: var(--cyan-2); }
+.brain-engines { display: flex; flex-wrap: wrap; gap: 6px; }
+.brain-role { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line-2); border-radius: 12px; background: rgba(255,255,255,.02); }
+.brain-help { font-size: 12px; line-height: 1.45; color: var(--text-3); }
+.brain-role select {
+  width: 100%; min-width: 0; height: 30px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line-2);
+  background: var(--glass-strong); color: var(--text); font: inherit; font-size: 12.5px;
+}
+.brain-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-3); }
+.brain-row select { width: auto; flex: 1; }
+.brain-scope { font-size: 12px; line-height: 1.45; color: var(--text-2); }
+.brain-scope b { color: var(--text); font-weight: 600; }
+.brain-test { display: grid; gap: 6px; font-size: 12px; line-height: 1.45; }
+.brain-test:empty { display: none; }
+.brain-test .checks { display: flex; flex-wrap: wrap; gap: 10px; color: var(--text-2); }
+.brain-test ul { margin: 0; padding-left: 18px; color: var(--text-3); }
+.brain-test .sample { padding: 8px 10px; border-radius: 8px; background: rgba(255,255,255,.03); color: var(--text-2); font-style: italic; overflow-wrap: anywhere; }
+.inv-chip[data-s="ok"] { color: var(--emerald); background: rgba(52,211,153,.12); }
+.inv-chip[data-s="warn"] { color: var(--amber); background: rgba(251,191,36,.12); }
+.inv-chip[data-s="bad"], .inv-chip[data-s="off"] { color: var(--rose); background: rgba(251,113,133,.12); }
+.brains-foot { display: flex; align-items: center; gap: 8px; }
+.brains-foot .note { flex: 1; font-size: 11.5px; color: var(--text-3); line-height: 1.4; }
+
+/* ================================================================
    RESPONSIVE
    ================================================================ */
 @media (max-width: 1480px) { .kpi--opt { display: none; } }
@@ -677,6 +703,7 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
     </div>
 
     <div class="actions">
+      <button class="btn" id="btn-brains" data-icon="cpu" title="Elegir los cerebros (modelos) del sistema"><span class="btn-label">Cerebros</span></button>
       <button class="btn" id="btn-investigate" data-icon="bulb" title="Investigación profunda con hipótesis y evidencias"><span class="btn-label">Investigar</span></button>
       <button class="btn btn-primary" id="btn-teach" data-icon="book"><span class="btn-label">Enseñar</span></button>
       <button class="btn btn-icon" id="btn-refresh" data-icon="refresh" title="Sincronizar grafo y métricas" aria-label="Sincronizar"></button>
@@ -886,6 +913,22 @@ kbd { font: 10px var(--mono); padding: 0 5px; border-radius: 4px; border: 1px so
   </div>
 </aside>
 
+<!-- ============================================================
+     CEREBROS (Paso 33a) — /api/v1/brains
+     ============================================================ -->
+<aside class="drawer glass" id="brains-drawer" aria-labelledby="brains-title" aria-hidden="true">
+  <div class="panel-head">
+    <span data-icon="cpu"></span>
+    <div>
+      <div class="panel-title" id="brains-title">Cerebros</div>
+      <div class="panel-sub">Ollama · LM Studio · Bionic — cerebro rápido y profundo</div>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn btn-sm btn-square" id="brains-close" data-icon="x" title="Cerrar (Esc)" aria-label="Cerrar"></button>
+  </div>
+  <div class="inv-scroll" id="brains-body"><p class="inv-empty">Buscando motores…</p></div>
+</aside>
+
 <div class="toast glass" id="toast" role="status"></div>
 
 <script>
@@ -926,6 +969,7 @@ const ICONS = {
   xcircle: '<circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/>',
   info:    '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 7.5v.01"/>',
   dot:     '<circle cx="12" cy="12" r="3"/>',
+  cpu:     '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M10 10h4v4h-4zM9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
   memory:  '<path d="M4 7h16v10H4z"/><path d="M8 7V4M12 7V4M16 7V4M8 20v-3M12 20v-3M16 20v-3"/>',
 };
 const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ''}</svg>`;
@@ -2098,6 +2142,157 @@ async function submitTeach() {
 }
 
 // ================================================================
+// CEREBROS (Paso 33a)
+// ================================================================
+const TIER_LABEL = { ligero: 'Ligero', medio: 'Medio', avanzado: 'Avanzado' };
+const BRAIN_ROLES = {
+  rapido:   { title: 'Cerebro rápido',   help: 'Planifica, extrae hechos, valida y mueve el subconsciente: muchas llamadas pequeñas. Conviene uno pequeño y rápido.' },
+  profundo: { title: 'Cerebro profundo', help: 'Redacta las respuestas e investiga a fondo. Aquí rinde un modelo grande; su nivel decide cuánto se le pide.' },
+};
+const VERDICT_CHIP = { 'apto': 'ok', 'apto con límites': 'warn', 'no apto': 'bad' };
+const brains = { open: false, data: null };
+const withIcons = root => { $$('[data-icon]', root).forEach(el => el.insertAdjacentHTML('afterbegin', icon(el.dataset.icon))); return root; };
+
+function openBrains() {
+  if (inv.open) closeInvestigations();
+  brains.open = true;
+  const d = $('#brains-drawer');
+  d.classList.add('open');
+  d.setAttribute('aria-hidden', 'false');
+  loadBrains();
+}
+
+function closeBrains() {
+  brains.open = false;
+  const d = $('#brains-drawer');
+  d.classList.remove('open');
+  d.setAttribute('aria-hidden', 'true');
+}
+
+async function loadBrains() {
+  try {
+    const r = await fetch(`${API}/api/v1/brains`);
+    if (!r.ok) throw new Error(await apiError(r));
+    brains.data = await r.json();
+    renderBrains();
+  } catch (e) {
+    $('#brains-body').innerHTML = `<p class="inv-error">No se pudieron leer los cerebros: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+const brainKey = (engine, model) => `${engine}|${model}`;
+
+function brainOption(m) {
+  return [m.model, m.params, m.quantization, m.loaded ? 'cargado' : null,
+          m.reasoning === 'always' ? 'razona siempre' : null, TIER_LABEL[m.tier]].filter(Boolean).join(' · ');
+}
+
+function scopeText(sc) {
+  return `nivel <b>${TIER_LABEL[sc.tier]}</b>: respuestas de hasta <b>${sc.synthesis_tokens}</b> tokens, ` +
+         `<b>${sc.prompt_passages}</b> pasajes en el prompt y <b>${sc.investigation_rounds}</b> rondas al investigar`;
+}
+
+function renderBrains() {
+  const d = brains.data;
+  const engines = d.engines.map(e =>
+    `<span class="inv-chip" data-s="${e.online ? 'ok' : 'off'}" title="${escapeHtml(e.base_url + (e.error ? ' — ' + e.error : ''))}">` +
+    `${escapeHtml(e.label)}${e.online ? '' : ' · apagado'}</span>`).join('');
+  const roles = Object.entries(BRAIN_ROLES).map(([role, meta]) => {
+    const active = d[role];
+    const current = brainKey(active.choice.engine, active.choice.model);
+    const groups = d.engines.filter(e => e.online).map(e => {
+      const opts = d.models.filter(m => m.engine === e.id).map(m => {
+        const key = brainKey(m.engine, m.model);
+        return `<option value="${escapeHtml(key)}"${key === current ? ' selected' : ''}>${escapeHtml(brainOption(m))}</option>`;
+      }).join('');
+      return opts ? `<optgroup label="${escapeHtml(e.label)}">${opts}</optgroup>` : '';
+    }).join('');
+    const missing = d.models.some(m => brainKey(m.engine, m.model) === current) ? ''
+      : `<option value="${escapeHtml(current)}" selected>${escapeHtml(active.choice.model)} (no disponible)</option>`;
+    const tier = active.choice.tier || '';
+    return `<section class="brain-role" data-role="${role}">
+      <div class="inv-sec">${meta.title}</div>
+      <div class="brain-help">${meta.help}</div>
+      <select class="brain-model" aria-label="${meta.title}">${missing}${groups}</select>
+      <div class="brain-row">
+        <label>Nivel</label>
+        <select class="brain-tier" aria-label="Nivel del ${meta.title.toLowerCase()}">
+          <option value="">Automático</option>
+          ${Object.entries(TIER_LABEL).map(([v, l]) => `<option value="${v}"${v === tier ? ' selected' : ''}>${l}</option>`).join('')}
+        </select>
+        <button class="btn btn-sm brain-try" type="button" data-icon="play">Probar</button>
+      </div>
+      <div class="brain-scope">En uso: <b>${escapeHtml(active.label)}</b> — ${scopeText(active.scope)}.</div>
+      <div class="brain-test"></div>
+    </section>`;
+  }).join('');
+  const body = $('#brains-body');
+  body.innerHTML = `
+    <section><div class="inv-sec">Motores</div><div class="brain-engines">${engines}</div></section>
+    ${roles}
+    <div class="brains-foot">
+      <span class="note">El nivel automático sale del tamaño del modelo (uno de 1-2 bits baja un nivel). La elección se guarda en cerebros.json.</span>
+      <button class="btn btn-primary btn-sm" id="brains-save" type="button" data-icon="check">Usar estos cerebros</button>
+    </div>`;
+  withIcons(body);
+}
+
+function brainChoice(role) {
+  const box = $(`.brain-role[data-role="${role}"]`);
+  const [engine, ...rest] = $('.brain-model', box).value.split('|');
+  const tier = $('.brain-tier', box).value;
+  return { engine, model: rest.join('|'), ...(tier ? { tier } : {}) };
+}
+
+async function saveBrains() {
+  const btn = $('#brains-save');
+  btn.disabled = true;
+  try {
+    const r = await fetch(`${API}/api/v1/brains`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rapido: brainChoice('rapido'), profundo: brainChoice('profundo') }),
+    });
+    if (!r.ok) throw new Error(await apiError(r));
+    brains.data = await r.json();
+    renderBrains();
+    toast(`Cerebros en uso: rápido ${brains.data.rapido.label} · profundo ${brains.data.profundo.label}`, 'ok');
+  } catch (e) {
+    toast(`No se cambiaron los cerebros: ${e.message}`, 'bad');
+    btn.disabled = false;
+  }
+}
+
+async function testBrain(role) {
+  const box = $(`.brain-role[data-role="${role}"]`);
+  const out = $('.brain-test', box);
+  const btn = $('.brain-try', box);
+  btn.disabled = true;
+  out.innerHTML = '<div class="inv-status"><span class="inv-spin"></span>Probando… si el modelo no está cargado, primero se carga en memoria.</div>';
+  try {
+    const r = await fetch(`${API}/api/v1/brains/test`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(brainChoice(role)),
+    });
+    if (!r.ok) throw new Error(await apiError(r));
+    const t = await r.json();
+    const mark = ok => ok ? '✓' : '✗';
+    const speed = t.tokens_per_s ? `${t.tokens_per_s.toFixed(1)} tokens/s` : 'velocidad sin medir';
+    const first = t.first_token_ms != null ? `primer token en ${(t.first_token_ms / 1000).toFixed(1)} s` : '';
+    out.innerHTML = `
+      <div class="inv-status"><span class="inv-chip" data-s="${VERDICT_CHIP[t.verdict] || 'warn'}">${escapeHtml(t.verdict)}</span>
+        nivel ${TIER_LABEL[t.tier]} · ${(t.total_ms / 1000).toFixed(1)} s en total</div>
+      <div class="checks"><span>${mark(t.json_ok)} JSON con esquema</span><span>${mark(t.stream_ok)} respuesta en stream</span>
+        <span>${escapeHtml(speed)}</span>${first ? `<span>${escapeHtml(first)}</span>` : ''}</div>
+      ${t.notes.length ? `<ul>${t.notes.map(n => `<li>${escapeHtml(n)}</li>`).join('')}</ul>` : ''}
+      ${t.json_ok ? '' : `<div class="brain-help">${escapeHtml(t.json_detail)}</div>`}
+      ${t.sample ? `<div class="sample">${escapeHtml(t.sample)}</div>` : ''}`;
+  } catch (e) {
+    out.innerHTML = `<p class="inv-error">La prueba falló: ${escapeHtml(e.message)}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ================================================================
 // INVESTIGACIÓN PROFUNDA (Paso 28)
 // ================================================================
 const INV_STATUS = { running: 'En curso', done: 'Completa', cancelled: 'Cancelada', failed: 'Fallida', interrupted: 'Interrumpida' };
@@ -2110,6 +2305,7 @@ const VERDICT = {
 const inv = { open: false, current: null, data: null, timer: null };
 
 function openInvestigations() {
+  if (brains.open) closeBrains();
   inv.open = true;
   const d = $('#inv-drawer');
   d.classList.add('open');
@@ -2299,6 +2495,15 @@ function bindUI() {
   // Topbar
   $('#btn-teach').addEventListener('click', openTeach);
   $('#btn-investigate').addEventListener('click', () => (inv.open ? closeInvestigations() : openInvestigations()));
+  $('#btn-brains').addEventListener('click', () => (brains.open ? closeBrains() : openBrains()));
+
+  // Cerebros (Paso 33a)
+  $('#brains-close').addEventListener('click', closeBrains);
+  $('#brains-drawer').addEventListener('click', e => {
+    if (e.target.closest('#brains-save')) { saveBrains(); return; }
+    const test = e.target.closest('.brain-try');
+    if (test) testBrain(test.closest('.brain-role').dataset.role);
+  });
 
   // Investigación profunda
   $('#inv-close').addEventListener('click', closeInvestigations);
@@ -2370,6 +2575,7 @@ function bindUI() {
     if (e.key === 'Escape') {
       closeTeach();
       if (inv.open) closeInvestigations();
+      if (brains.open) closeBrains();
       clearSelection();
       $('#search-results').innerHTML = '';
     }

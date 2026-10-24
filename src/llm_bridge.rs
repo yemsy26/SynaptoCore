@@ -52,6 +52,7 @@ pub type BoxedTokenStream = Pin<Box<dyn Stream<Item = Result<String, BridgeError
 
 use std::collections::HashMap;
 
+use crate::brains::Scope;
 use crate::error::MemoryError;
 use crate::memory_graph::{
     canonical_id, drafts_from_text, embed_texts, mentions, save_passages, EdgeWrite, GraphAccess, MemoryGraph,
@@ -85,15 +86,8 @@ const CONTEXT_SIZE: u32 = 4096;
 /// JSON de 10 triples = ~300 tokens. 512 es margen generoso.
 const MAX_EXTRACT_TOKENS: i32 = 512;
 
-/// Máximo de tokens a generar en síntesis de respuesta. Paso 24: 256 → 384,
-/// las respuestas con fuentes citadas se cortaban a media frase.
-const MAX_SYNTHESIS_TOKENS: i32 = 384;
-
 /// Fuentes web por investigación en caliente (Paso 24).
 const MAX_RESEARCH_SOURCES: usize = 5;
-
-/// Pasajes guardados en el prompt de memoria (Paso 30): ~3 × 500 caracteres.
-const MAX_PROMPT_PASSAGES: usize = 3;
 
 /// Temperatura para extracción: 0.1 = casi determinístico.
 /// Alta temperatura = más variedad = más alucinaciones en JSON estricto.
@@ -483,6 +477,12 @@ pub trait LlmBackend {
         let full = self.complete(system_prompt, user_prompt, max_tokens, temperature)?;
         Ok(Box::pin(futures_util::stream::once(async move { Ok(full) })))
     }
+
+    /// Paso 33a: cuánto se le pide a este cerebro (longitud de respuesta,
+    /// pasajes, rondas). Por defecto, lo de un modelo ligero de 2B.
+    fn scope(&self) -> Scope {
+        Scope::default()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -662,12 +662,30 @@ pub struct NeuralBridge<B: LlmBackend> {
     /// Buscador web para investigar en caliente (Paso 24). `None` → las
     /// preguntas sin memoria se responden con conocimiento general etiquetado.
     search: Option<BoxedSearch>,
+    /// Paso 33a: cerebro que redacta las respuestas (el profundo). `None` →
+    /// el mismo que planifica y extrae.
+    deep: Option<Arc<dyn LlmBackend + Send + Sync>>,
 }
 
 impl<B: LlmBackend> NeuralBridge<B> {
     /// Crea un nuevo bridge con el backend dado.
     pub fn new(backend: B) -> Self {
-        Self { backend, tool_registry: None, search: None }
+        Self { backend, tool_registry: None, search: None, deep: None }
+    }
+
+    /// Paso 33a: las respuestas las redacta este cerebro, con su alcance
+    /// (longitud de respuesta, pasajes en el prompt).
+    pub fn with_deep(mut self, deep: Arc<dyn LlmBackend + Send + Sync>) -> Self {
+        self.deep = Some(deep);
+        self
+    }
+
+    /// Cerebro que redacta las respuestas.
+    fn writer(&self) -> &dyn LlmBackend {
+        match &self.deep {
+            Some(deep) => deep.as_ref(),
+            None => &self.backend,
+        }
     }
 
     /// Conecta el buscador web para la investigación en caliente (Paso 24).
@@ -911,6 +929,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             ..RetrievalConfig::default()
         };
         let with_tool = tool_output.is_some();
+        let passages_wanted = self.writer().scope().prompt_passages;
         let (context, passages) = graph
             .with_graph(|g| -> Result<_, MemoryError> {
                 let context = g.retrieve_context(&probes, probe_vecs.as_deref(), &cfg)?;
@@ -918,7 +937,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
                 let passages = if with_tool {
                     Vec::new()
                 } else {
-                    g.relevant_passages(question, question_vec, MAX_PROMPT_PASSAGES)?
+                    g.relevant_passages(question, question_vec, passages_wanted)?
                 };
                 Ok((context, passages))
             })
@@ -1121,10 +1140,11 @@ impl<B: LlmBackend> NeuralBridge<B> {
         if let Some(direct) = &prepared.direct {
             return Ok(direct.clone());
         }
-        let text = self.backend.complete(
+        let writer = self.writer();
+        let text = writer.complete(
             prepared.system_prompt(),
             &prepared.user_prompt,
-            MAX_SYNTHESIS_TOKENS,
+            writer.scope().synthesis_tokens,
             SYNTHESIS_TEMPERATURE,
         )?;
         Ok(match prepared.mode {
@@ -1139,10 +1159,11 @@ impl<B: LlmBackend> NeuralBridge<B> {
         if let Some(direct) = prepared.direct.clone() {
             return Ok(Box::pin(futures_util::stream::once(async { Ok(direct) })));
         }
-        let stream = self.backend.stream_synthesis(
+        let writer = self.writer();
+        let stream = writer.stream_synthesis(
             prepared.system_prompt(),
             &prepared.user_prompt,
-            MAX_SYNTHESIS_TOKENS,
+            writer.scope().synthesis_tokens,
             SYNTHESIS_TEMPERATURE,
         )?;
         Ok(match prepared.mode {
@@ -1686,6 +1707,9 @@ pub enum BridgeError {
     GraphInit(String),
     #[error("Ollama HTTP error: {0}")]
     OllamaHttp(String),
+    /// Paso 33a: motor compatible con OpenAI (LM Studio, Bionic, llama.cpp).
+    #[error("Error del motor {engine}: {message}")]
+    EngineHttp { engine: String, message: String },
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1745,6 +1769,10 @@ impl LlmBackend for std::sync::Arc<dyn LlmBackend + Send + Sync + 'static> {
         temperature:   f32,
     ) -> Result<BoxedTokenStream, BridgeError> {
         (**self).stream_synthesis(system_prompt, user_prompt, max_tokens, temperature)
+    }
+
+    fn scope(&self) -> Scope {
+        (**self).scope()
     }
 }
 
@@ -2515,6 +2543,49 @@ Espero que sea útil."#;
                         "Mi perro se llama Toby", "Vale, la reunión con el proveedor es el jueves a las 10"] {
             assert_eq!(learn(message), Intent::Learn, "{message}");
         }
+    }
+
+    /// Un cerebro de prueba con el alcance de otro nivel.
+    struct Scoped(MockLlmBackend, Scope);
+
+    impl LlmBackend for Scoped {
+        fn complete(&self, s: &str, u: &str, max_tokens: i32, t: f32) -> Result<String, BridgeError> {
+            self.0.complete(s, u, max_tokens, t)
+        }
+        fn scope(&self) -> Scope {
+            self.1
+        }
+    }
+
+    /// Paso 33a: el rápido planifica; el profundo redacta con su alcance
+    /// (más pasajes en el prompt).
+    #[test]
+    fn test_deep_brain_writes_the_answer_with_its_scope() {
+        let graph = titanio_graph();
+        let drafts: Vec<PassageDraft> = (0..6).map(|i| PassageDraft {
+            text:     format!("El titanio se usa en la pieza {i} por ser ligero y resistente a la corrosión."),
+            title:    format!("Titanio {i}"),
+            url:      Some(format!("https://ejemplo.org/titanio/{i}")),
+            origin:   EdgeOrigin::Researched,
+            question: None,
+        }).collect();
+        save_passages(&graph, drafts).unwrap();
+        let fast = MockLlmBackend::new(vec![plan_json("query", "¿Para qué se usa el titanio?", &["titanio"], "none")]);
+        let deep = Arc::new(Scoped(MockLlmBackend::new(vec!["Respuesta del cerebro profundo."]),
+                                   crate::brains::Tier::Avanzado.scope()));
+        let bridge = NeuralBridge::new(fast).with_deep(deep.clone());
+        let (answer, prepared) = bridge.ask(&graph, "¿Para qué se usa el titanio?", "").unwrap();
+
+        assert_eq!(answer, "Respuesta del cerebro profundo.");
+        assert_eq!(bridge.backend.call_count(), 1, "el rápido solo planifica");
+        assert_eq!(deep.0.call_count(), 1);
+        assert!(prepared.sources.len() > 3, "el alcance avanzado admite más pasajes: {}", prepared.sources.len());
+
+        let light = NeuralBridge::new(MockLlmBackend::new(vec![
+            plan_json("query", "¿Para qué se usa el titanio?", &["titanio"], "none"), "Breve.".into(),
+        ]));
+        let (_, prepared) = light.ask(&graph, "¿Para qué se usa el titanio?", "").unwrap();
+        assert_eq!(prepared.sources.len(), 3, "sin cerebro profundo, el alcance ligero de siempre");
     }
 
     #[test]

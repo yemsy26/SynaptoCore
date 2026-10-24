@@ -200,6 +200,10 @@ impl<L: LlmBackend> LlmBackend for BackgroundLlm<L> {
         self.yield_to_foreground();
         self.inner.stream_synthesis(system_prompt, user_prompt, max_tokens, temperature)
     }
+
+    fn scope(&self) -> crate::brains::Scope {
+        self.inner.scope()
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

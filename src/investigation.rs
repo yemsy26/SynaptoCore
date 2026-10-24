@@ -35,8 +35,8 @@ use crate::research;
 use crate::truth_filter::{SearchBackend, SearchHit};
 use crate::types::current_unix_ts;
 
-/// Rondas por defecto y máximas.
-pub const DEFAULT_ROUNDS: u32 = 3;
+/// Rondas máximas (Paso 33a: las de por defecto dependen del alcance del
+/// cerebro profundo).
 pub const MAX_ROUNDS: u32 = 5;
 
 /// Esperas antes de reintentar una ronda cuyas búsquedas fallaron todas
@@ -62,7 +62,6 @@ const SNIPPET_CHARS: usize = 300;
 
 const PLAN_TOKENS: i32 = 256;
 const JUDGE_TOKENS: i32 = 256;
-const CONCLUSION_TOKENS: i32 = 450;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -640,7 +639,7 @@ fn conclude<L: LlmBackend>(llm: &L, inv: &Investigation) -> Result<String, Bridg
         if cited.is_empty() { "(ninguna citada)".to_string() } else { inv.format_sources(&cited) }
     );
     let any_supported = inv.hypotheses.iter().any(|h| h.verdict == Verdict::Supported);
-    let raw = llm.complete(prompts::investigation_conclusion_system_prompt(any_supported), &user, CONCLUSION_TOKENS, 0.3)?;
+    let raw = llm.complete(prompts::investigation_conclusion_system_prompt(any_supported), &user, llm.scope().conclusion_tokens, 0.3)?;
     let text = strip_think(&raw);
     Ok(if text.is_empty() {
         "No se pudo redactar la conclusión; revisa las hipótesis y sus fuentes.".into()

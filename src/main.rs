@@ -26,6 +26,7 @@
 #![allow(dead_code)]
 
 mod api_server;
+mod brains;
 mod connectors;
 mod error;
 mod federated_memory;
@@ -36,6 +37,7 @@ mod llm_bridge;
 mod math_tools;
 mod memory_graph;
 mod ollama_backend;
+mod openai_backend;
 mod priority;
 mod prompts;
 mod research;
@@ -50,7 +52,7 @@ use std::sync::{Arc, Mutex};
 
 use memory_graph::MemoryGraph;
 use llm_bridge::{BridgeError, LlmBackend};
-use ollama_backend::OllamaBackend;
+use brains::BrainHub;
 use priority::{BackgroundLlm, CognitivePriority, YieldEvent};
 use truth_filter::{BoxedSearch, MockSearchBackend, SearxngBackend};
 use forgetting_curve::{DecayPolicy, ForgettingConfig, ForgettingCurve};
@@ -253,34 +255,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("✓ Conocimiento base insertado en el grafo\n");
     }
 
-    // ── 3. Inicializar el backend LLM ─────────────────────────────────────────
-    // Prioridad: OllamaBackend (si Ollama responde y el modelo existe) →
-    // ServerMock (fallback demo sin LLM real).
-    // Para llama.cpp directo: cargo run --features cuda (carga GGUF local).
+    // ── 3. Cerebros (Paso 33a) ───────────────────────────────────────────────
+    // Ollama y los motores compatibles con OpenAI (LM Studio, Bionic). La
+    // elección de cerebro rápido y profundo se guarda en cerebros.json; sin
+    // ella, OLLAMA_MODEL para todo, como antes. Si no hay ningún modelo
+    // disponible: ServerMock (demo sin LLM real).
     //
-    // spawn_blocking (Paso 21): OllamaBackend usa `reqwest::blocking`, que no
-    // puede construirse ni usarse en un hilo del runtime async. En debug,
-    // reqwest lo comprueba creando y destruyendo un runtime interno, lo que
-    // provocaba el panic "Cannot drop a runtime in a context where blocking is
-    // not allowed" al arrancar. En release esa comprobación no existe, pero el
-    // health-check seguía bloqueando un worker de Tokio.
-    let (llm, llm_label) = tokio::task::spawn_blocking(
-        || -> (Arc<dyn LlmBackend + Send + Sync + 'static>, String) {
-            let ollama = OllamaBackend::from_env();
-            let label_candidate = format!("Ollama ({})", ollama.model);
-            match ollama.health_check() {
-                Ok(()) => {
-                    println!("✓ Backend LLM: {}\n", label_candidate);
-                    (Arc::new(ollama), label_candidate)
-                }
-                Err(e) => {
-                    println!("⚠ Ollama no disponible: {e}");
-                    println!("  Usando ServerMock (demo sin LLM real)\n");
-                    (Arc::new(ServerMock), "ServerMock (fallback)".to_string())
-                }
-            }
-        },
-    ).await?;
+    // spawn_blocking (Paso 21): los backends usan `reqwest::blocking`, que no
+    // puede construirse ni usarse en un hilo del runtime async (en debug
+    // provocaba el panic "Cannot drop a runtime in a context where blocking
+    // is not allowed" al arrancar).
+    let hub = Arc::new(tokio::task::spawn_blocking(|| {
+        BrainHub::start(Arc::new(ServerMock), "ServerMock (demo sin LLM real)")
+    }).await?);
+    let llm: Arc<dyn LlmBackend + Send + Sync + 'static> = hub.rapido.clone();
+    let deep: Arc<dyn LlmBackend + Send + Sync + 'static> = hub.profundo.clone();
+    println!("✓ Cerebro rápido:   {} ({:?})", hub.rapido.get().label, hub.rapido.get().scope.tier);
+    println!("✓ Cerebro profundo: {} ({:?})
+", hub.profundo.get().label, hub.profundo.get().scope.tier);
+    let llm_label = hub.profundo.get().label.clone();
 
     // Canal de broadcast para telemetría en tiempo real (Paso 9).
     // Capacidad 128: si el cliente WS es lento y el buffer se llena,
@@ -331,6 +324,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions:      Arc::new(SessionManager::new()),
         tool_registry: Arc::clone(&tool_registry),
         priority:      Arc::clone(&priority),
+        deep:          Some(Arc::clone(&deep)),
+        brains:        Some(Arc::clone(&hub)),
         search:        search.clone(),
     };
 
@@ -1026,6 +1021,8 @@ mod integration_tests {
             sessions:      Arc::new(SessionManager::new()),
             tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
             priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        None,
             search:        None,
         };
 
