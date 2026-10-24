@@ -184,19 +184,24 @@ pub struct Plan {
     pub fallback:        bool,
     /// Paso 31: el usuario pidió buscar en internet («búscalo en la web»).
     pub web_requested:   bool,
+    /// Paso 32: pregunta por el propio usuario («¿cómo me llamo?»). La
+    /// responde lo que contó de sí (nodo `usuario`), nunca la web.
+    pub about_user:      bool,
 }
 
 impl Plan {
     /// Plan seguro: consulta sin herramienta, con el mensaje original como
     /// sonda semántica. Nunca escribe en memoria ni llama a sistemas externos.
     pub fn fallback(message: &str) -> Self {
+        let about_user = asks_about_user(message);
         Self {
             intent:          Intent::Query,
             rewritten_query: message.to_string(),
-            entities:        Vec::new(),
+            entities:        if about_user { vec![USER_ENTITY.to_string()] } else { Vec::new() },
             tool:            None,
             fallback:        true,
             web_requested:   asks_for_web(message),
+            about_user,
         }
     }
 
@@ -384,6 +389,8 @@ pub struct PreparedAnswer {
     pub memory_relevant:  bool,
     /// Paso 31: el usuario pidió buscar en internet.
     pub web_requested:    bool,
+    /// Paso 32: pregunta por el propio usuario: nunca se investiga.
+    pub about_user:       bool,
 }
 
 impl PreparedAnswer {
@@ -873,6 +880,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
                 passage_ids:      Vec::new(),
                 memory_relevant:  false,
                 web_requested:    false,
+                about_user:       false,
             });
         }
         let tool_output = plan.tool.as_ref().map(|call| self.run_tool(call));
@@ -915,6 +923,13 @@ impl<B: LlmBackend> NeuralBridge<B> {
                 Ok((context, passages))
             })
             .map_err(|e| BridgeError::GraphTraversal(e.to_string()))?;
+        // Paso 32: de lo que el usuario es solo sabe él. Una página web con
+        // su nombre es de otra persona («Moncho Burgos», concesionario).
+        let passages: Vec<_> = if plan.about_user {
+            passages.into_iter().filter(|(p, _)| p.origin == EdgeOrigin::Taught).collect()
+        } else {
+            passages
+        };
         log::debug!(
             "Contexto: {} semillas, {} aristas y {} pasajes para {:?}",
             context.seeds.len(), context.edges.len(), passages.len(), probes
@@ -933,6 +948,10 @@ impl<B: LlmBackend> NeuralBridge<B> {
         // de las entidades o con un pasaje muy parecido a la pregunta.
         let memory_relevant = uncovered.len() < probes.len()
             || passages.iter().any(|(_, score)| *score >= STRONG_SIMILARITY);
+        // Paso 32: sin nada del usuario en la memoria, se le dice; el modelo
+        // con un contexto ajeno respondía «Me llamo SynaptoCore».
+        let direct = (plan.about_user && !uncovered.is_empty() && passages.is_empty())
+            .then(|| prompts::UNKNOWN_ABOUT_USER.to_string());
 
         // ── 4. Prompt de síntesis fundamentada ──────────────────────────
         let triples: Vec<(String, String, String, f64)> = context.edges
@@ -952,17 +971,20 @@ impl<B: LlmBackend> NeuralBridge<B> {
             None => format!("Contexto:\n{graph_context}\n\nPregunta: {question}"),
         };
 
+        // Sin usar la memoria (respuesta directa), no se refuerza nada.
+        let used = direct.is_none();
         Ok(PreparedAnswer {
             user_prompt,
-            context_edge_ids: context.edges.into_iter().map(|e| e.edge_id).collect(),
+            context_edge_ids: context.edges.into_iter().filter(|_| used).map(|e| e.edge_id).collect(),
             mode,
             uncovered,
             memory_context: graph_context,
             sources,
-            direct: None,
+            direct,
             passage_ids: passages.into_iter().map(|(p, _)| p.id).collect(),
             memory_relevant,
             web_requested: plan.web_requested,
+            about_user: plan.about_user,
         })
     }
 
@@ -982,6 +1004,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
             passage_ids:      Vec::new(),
             memory_relevant:  false,
             web_requested:    false,
+            about_user:       false,
         }
     }
 
@@ -998,7 +1021,8 @@ impl<B: LlmBackend> NeuralBridge<B> {
     /// 12 aristas y 3 pasajes sobre BitNet en memoria, porque `ai` y `vram`
     /// no nombraban ningún concepto; no había refuerzo hebbiano.
     pub fn research_first(&self, prepared: &PreparedAnswer) -> bool {
-        if prepared.mode != AnswerMode::Memory {
+        // Paso 32: de quién es el usuario, la web no sabe nada.
+        if prepared.mode != AnswerMode::Memory || prepared.about_user {
             return false;
         }
         let empty = prepared.context_edge_ids.is_empty() && prepared.passage_ids.is_empty();
@@ -1159,8 +1183,12 @@ impl<B: LlmBackend> NeuralBridge<B> {
         if prepared.mode == AnswerMode::Memory
             && classify_answer_head(&answer, true) == AnswerHead::Research
         {
-            prepared = self.prepare_research(&plan, &prepared);
-            answer = self.answer(&prepared)?;
+            if prepared.about_user {
+                answer = prompts::UNKNOWN_ABOUT_USER.to_string();
+            } else {
+                prepared = self.prepare_research(&plan, &prepared);
+                answer = self.answer(&prepared)?;
+            }
         }
         reinforce_context(graph, &prepared.context_edge_ids, &prepared.passage_ids);
         Ok((answer, prepared))
@@ -1350,8 +1378,10 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
 
     // Asimetría de riesgo: un falso "learn" escribe en la memoria a largo
     // plazo; un falso "query" solo responde. Preguntas y peticiones nunca
-    // se memorizan, diga lo que diga el modelo.
-    let intent = if text("i", "intent").eq_ignore_ascii_case("learn")
+    // se memorizan, diga lo que diga el modelo. Paso 32: lo que el usuario
+    // cuenta de sí mismo («Mi nombre es…») se aprende aunque el modelo no lo
+    // vea: lo tomaba por conversación y lo buscaba en la web.
+    let intent = if (text("i", "intent").eq_ignore_ascii_case("learn") || states_about_user(message))
         && !is_question_or_request(message)
         && !opens_without_statement(message)
         && !is_acknowledgement(message)
@@ -1362,10 +1392,16 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
     };
 
     // Una reescritura vacía o desbocada (el modelo "responde" en lugar de
-    // reescribir) no es fiable: mejor el mensaje original.
+    // reescribir) no es fiable: mejor el mensaje original. Al aprender,
+    // tampoco una que pregunta o recorta mucho el mensaje: de «…saber si
+    // sabías mi nombre. Mi nombre es Ramón Burgos…» el 2B dejaba «¿Sabes mi
+    // nombre?» y se extraía de la pregunta, sin el nombre (Paso 32).
     let rewritten = text("q", "rewritten_query");
+    let length = rewritten.chars().count();
     let max_len = message.chars().count() * 3 + 200;
-    let rewritten_query = if rewritten.is_empty() || rewritten.chars().count() > max_len {
+    let lossy = intent == Intent::Learn
+        && (is_question_or_request(rewritten) || length * 10 < message.chars().count() * 6);
+    let rewritten_query = if rewritten.is_empty() || length > max_len || lossy {
         message.to_string()
     } else {
         rewritten.to_string()
@@ -1385,6 +1421,12 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
         if entities.len() == MAX_PLAN_ENTITIES {
             break;
         }
+    }
+    // Paso 32: de una pregunta sobre el usuario, la única sonda es él; las
+    // del modelo («nombre») traían aristas de otros conceptos.
+    let about_user = intent == Intent::Query && asks_about_user(message);
+    if about_user {
+        entities = vec![USER_ENTITY.to_string()];
     }
 
     let tool = match text("t", "tool") {
@@ -1417,7 +1459,51 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
         tool => tool,
     };
 
-    Plan { intent, rewritten_query, entities, tool, fallback: false, web_requested: asks_for_web(message) }
+    Plan { intent, rewritten_query, entities, tool, fallback: false, web_requested: asks_for_web(message), about_user }
+}
+
+/// Nodo del grafo que representa a quien escribe (Paso 32): la extracción
+/// pone «usuario» como sujeto de lo que cuenta de sí mismo.
+const USER_ENTITY: &str = "usuario";
+
+/// Frases con las que el usuario cuenta algo de sí mismo, en forma canónica.
+const USER_STATEMENTS: &[&str] = &[
+    "mi nombre es", "me llamo", "yo soy", "no soy", "mi apellido es", "mis apellidos son", "naci en", "naci el",
+    "vivo en", "trabajo en", "trabajo como", "me dedico a", "mi cumpleaños es", "soy el creador", "soy la creadora",
+    "soy el autor", "soy la autora", "soy el fundador", "soy la fundadora",
+];
+
+/// Preguntas sobre el propio usuario, en forma canónica. Pueden no llevar
+/// signos («sabes como me llamo»).
+const USER_QUESTIONS: &[&str] = &[
+    "como me llamo", "sabes mi nombre", "sabias mi nombre", "recuerdas mi nombre", "conoces mi nombre",
+    "cual es mi nombre", "dime mi nombre", "cual es mi apellido", "quien soy", "que sabes de mi",
+    "que sabes sobre mi", "que recuerdas de mi", "me conoces", "cuantos años tengo", "cual es mi edad",
+    "donde vivo", "donde trabajo", "en que trabajo", "a que me dedico", "cuando es mi cumpleaños", "donde naci",
+];
+
+/// ¿Cuenta el mensaje algo del propio usuario? (Paso 32) No tras un
+/// interrogativo («sabes cómo me llamo»), y «Me llamó la atención…» no es un
+/// nombre.
+fn states_about_user(message: &str) -> bool {
+    const QUESTION_WORDS: &[&str] = &["como", "cual", "quien", "donde", "que", "cuando"];
+    let words = format!(" {} ", canonical_words(message));
+    let stated = |phrase: &str| {
+        let needle = format!(" {phrase} ");
+        words.match_indices(&needle).any(|(i, _)| {
+            let before = words[..i].rsplit(' ').next().unwrap_or("");
+            !QUESTION_WORDS.contains(&before)
+        })
+    };
+    !words.contains(" me llamo la atencion ")
+        && (words.starts_with(" soy ") || USER_STATEMENTS.iter().any(|s| stated(s)))
+}
+
+/// ¿Pregunta el mensaje por el propio usuario? (Paso 32) Si además cuenta
+/// algo de sí («…saber si sabías mi nombre. Mi nombre es…»), enseña.
+fn asks_about_user(message: &str) -> bool {
+    let words = format!(" {} ", canonical_words(message));
+    USER_QUESTIONS.iter().any(|q| words.contains(&format!(" {q} "))) && !states_about_user(message)
 }
 
 /// Comienzos que expresan un deseo o una duda, no un hecho (Paso 31). Con la
@@ -1432,7 +1518,7 @@ const NON_STATEMENT_OPENERS: &[&str] = &[
 /// («Quiero que recuerdes que…»).
 const MEMORIZE_REQUESTS: &[&str] = &[
     "memoriza", "memorizalo", "que memorices", "recuerda que", "que recuerdes", "anota que", "que anotes",
-    "apunta que", "que apuntes", "guarda que", "que guardes", "que aprendas",
+    "apunta que", "que apuntes", "guarda que", "que guardes", "que aprendas", "que sepas",
 ];
 
 /// ¿Empieza el mensaje con algo que no afirma un hecho? (Paso 31)
@@ -2429,6 +2515,93 @@ Espero que sea útil."#;
                         "Mi perro se llama Toby", "Vale, la reunión con el proveedor es el jueves a las 10"] {
             assert_eq!(learn(message), Intent::Learn, "{message}");
         }
+    }
+
+    #[test]
+    fn test_statements_and_questions_about_the_user() {
+        for yes in ["Me llamo Ramón Burgos", "Mi nombre es Ana y trabajo en ventas", "Soy el creador de SynaptoCore",
+                    "no solo soy ramon burgos no soy parte de mundo de vehiculo esa es otra persona",
+                    "Vivo en Santo Domingo", "Mi cumpleaños es el 3 de mayo"] {
+            assert!(states_about_user(yes), "{yes}");
+        }
+        for no in ["Me llamó la atención el grafeno", "El titanio es un metal ligero", "¿Cómo me llamo?"] {
+            assert!(!states_about_user(no), "{no}");
+        }
+        for yes in ["sabes como me llamo", "¿Cómo me llamo?", "¿Qué sabes de mí?", "¿Quién soy?", "Recuerdas mi nombre",
+                    "¿Cuántos años tengo?"] {
+            assert!(asks_about_user(yes), "{yes}");
+        }
+        let teaching = "solo me referi a una pregunta para saber si sabias mi nombre como no sabes te lo dire mi \
+                        nombre es ramon burgos el creado de este sistema synaptocore";
+        for no in [teaching, "¿Cómo te llamas?", "¿Quién creó SynaptoCore?", "¿Qué es el grafeno?"] {
+            assert!(!asks_about_user(no), "{no}");
+        }
+    }
+
+    /// El 2B tomó la presentación por una pregunta y la reescribió como
+    /// «¿Sabes mi nombre?»: se aprende igual, y del mensaje entero.
+    #[test]
+    fn test_what_the_user_tells_about_themself_is_learned_from_the_whole_message() {
+        let message = "solo me referi a una pregunta para saber si sabias mi nombre como no sabes te lo dire mi \
+                       nombre es ramon burgos el creado de este sistema synaptocore";
+        let plan = parse_plan(&plan_json("query", "¿Sabes mi nombre?", &["ramon burgos"], "none"), message, None);
+        assert_eq!(plan.intent, Intent::Learn);
+        assert_eq!(plan.rewritten_query, message);
+        assert!(!plan.about_user);
+        let plan = parse_plan(&plan_json("learn", "Mi nombre es Ana", &[], "none"), "Mi nombre es Ana", None);
+        assert_eq!(plan.rewritten_query, "Mi nombre es Ana", "una reescritura que no pierde nada se usa");
+        let reference = parse_plan(&plan_json("learn", "La capital de Francia es París", &[], "none"),
+                                   "Su capital es París", None);
+        assert_eq!(reference.rewritten_query, "La capital de Francia es París", "la correferencia sigue resuelta");
+    }
+
+    /// «sabes como me llamo» sin nada del usuario en la memoria: se le dice,
+    /// sin buscar en la web (encontraba canciones) ni usar pasajes web.
+    #[test]
+    fn test_question_about_the_user_never_researches() {
+        let graph = titanio_graph();
+        let mut web_page = grafeno_passage();
+        web_page.text = "Say «My name is» in Spanish with «me llamo»: ¿cómo me llamo? Me llamo Pedro.".into();
+        save_passages(&graph, vec![web_page]).unwrap();
+        let message = "sabes como me llamo";
+        let mock = MockLlmBackend::new(vec![plan_json("query", message, &["nombre"], "none")]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["no debería buscarse"]));
+        let (answer, prepared) = bridge.ask(&graph, message, "").unwrap();
+
+        assert_eq!(answer, prompts::UNKNOWN_ABOUT_USER);
+        assert!(prepared.about_user);
+        assert_eq!(prepared.mode, AnswerMode::Memory);
+        assert!(prepared.sources.is_empty(), "una página web no sabe quién es el usuario");
+        assert!(prepared.context_edge_ids.is_empty() && prepared.passage_ids.is_empty(), "nada usado, nada reforzado");
+        assert_eq!(bridge.backend.call_count(), 1, "solo el planificador");
+    }
+
+    /// Lo que el usuario contó de sí (nodo `usuario`) responde; si aun así el
+    /// modelo pide investigar, no se va a la web.
+    #[test]
+    fn test_question_about_the_user_answers_from_the_user_node() {
+        let graph = titanio_graph();
+        graph.insert_node(&Node::new(USER_ENTITY, "concept", "usuario")).unwrap();
+        graph.insert_node(&Node::new("ramon_burgos", "concept", "ramon burgos")).unwrap();
+        graph.insert_edge(USER_ENTITY, "se_llama", "ramon_burgos", 1.0).unwrap();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Cómo me llamo?", &["nombre"], "none"),
+            "Te llamas Ramón Burgos.".into(),
+            plan_json("query", "¿Qué sabes de mí?", &[], "none"),
+            prompts::RESEARCH_MARKER.to_string(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["no debería buscarse"]));
+        let (answer, prepared) = bridge.ask(&graph, "¿Cómo me llamo?", "").unwrap();
+        assert_eq!(answer, "Te llamas Ramón Burgos.");
+        assert!(!prepared.context_edge_ids.is_empty(), "lo usado se refuerza");
+        let prompt = &bridge.backend.user_prompts()[1];
+        assert!(prompt.contains("se_llama") || prompt.contains("se llama"), "{prompt}");
+        assert!(!prompt.contains("titanio"), "la sonda es el usuario, no «nombre»: {prompt}");
+
+        let (answer, prepared) = bridge.ask(&graph, "¿Qué sabes de mí?", "").unwrap();
+        assert_eq!(answer, prompts::UNKNOWN_ABOUT_USER);
+        assert_eq!(prepared.mode, AnswerMode::Memory);
+        assert_eq!(bridge.backend.call_count(), 4, "sin búsqueda ni otra respuesta");
     }
 
     #[test]

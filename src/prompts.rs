@@ -46,11 +46,16 @@ REGLAS ESTRICTAS:
 4. "relation" es un verbo o frase verbal corta que conecta subject y object. Máximo 3 palabras.
 5. "weight" es un número entre 0.0 y 1.0 que indica la certeza de la relación (1.0 = hecho establecido, 0.5 = inferido, 0.2 = especulativo).
 6. Extrae TODAS las relaciones relevantes del texto. Mínimo 1, máximo 10.
-7. Normaliza los nombres: usa snake_case sin tildes. Ejemplo: "inteligencia artificial" → "inteligencia_artificial".
+7. Normaliza los nombres: usa snake_case sin tildes ni artículos. Ejemplo: "inteligencia artificial" → "inteligencia_artificial".
+8. Quien escribe es el usuario: cuando habla de sí mismo (yo, me, mi, soy), el sujeto es "usuario", también si dice su nombre ("usuario" se_llama ...).
 
 EJEMPLO:
 Texto: "El estrés crónico eleva el cortisol, que daña el hipocampo y reduce la memoria."
-Salida: {"triples": [{"subject": "estres_cronico", "relation": "eleva", "object": "cortisol", "weight": 0.95}, {"subject": "cortisol", "relation": "daña", "object": "hipocampo", "weight": 0.9}, {"subject": "cortisol", "relation": "reduce", "object": "memoria", "weight": 0.85}]}"#
+Salida: {"triples": [{"subject": "estres_cronico", "relation": "eleva", "object": "cortisol", "weight": 0.95}, {"subject": "cortisol", "relation": "daña", "object": "hipocampo", "weight": 0.9}, {"subject": "cortisol", "relation": "reduce", "object": "memoria", "weight": 0.85}]}
+
+EJEMPLO (el usuario habla de sí mismo: el sujeto es "usuario"):
+Texto: "Me llamo Ana y trabajo en ventas."
+Salida: {"triples": [{"subject": "usuario", "relation": "se_llama", "object": "ana", "weight": 1.0}, {"subject": "usuario", "relation": "trabaja_en", "object": "ventas", "weight": 1.0}]}"#
 }
 
 /// Construye el prompt de síntesis de respuesta con contexto del grafo.
@@ -408,10 +413,16 @@ pub const RESEARCH_MARKER: &str = "[INVESTIGAR]";
 /// No se confía en el modelo: con 2B la ponía incluso en respuestas citadas.
 pub const GENERAL_KNOWLEDGE_LABEL: &str = "Según mi conocimiento general (no verificado): ";
 
+/// Respuesta a una pregunta sobre el propio usuario cuando la memoria no sabe
+/// nada de él (Paso 32): la web no puede saberlo.
+pub const UNKNOWN_ABOUT_USER: &str = "Todavía no lo sé: no me lo has contado. Si me lo dices (por ejemplo, \
+«Me llamo Ana» o «Trabajo en ventas»), lo recordaré.";
+
 /// Respuesta desde la memoria, con salida de escape hacia la investigación.
 pub fn memory_answer_system_prompt() -> &'static str {
     "Eres SynaptoCore, un asistente con memoria a largo plazo. Responde la pregunta usando SOLO el \
-conocimiento de tu memoria que aparece en el contexto, en el idioma de la pregunta, de forma clara y breve.
+conocimiento de tu memoria que aparece en el contexto, en el idioma de la pregunta, de forma clara y breve. \
+En tu memoria, «usuario» es la persona que te escribe: háblale de tú («Te llamas…»).
 Si el contexto no contiene la información necesaria para responder la pregunta, responde exactamente \
 [INVESTIGAR] y nada más."
 }
@@ -421,7 +432,8 @@ Si el contexto no contiene la información necesaria para responder la pregunta,
 pub fn memory_passages_answer_system_prompt() -> &'static str {
     "Eres SynaptoCore, un asistente con memoria a largo plazo. Responde la pregunta usando SOLO tu memoria: \
 el contexto y los pasajes guardados numerados. Explica con el detalle que aporten los pasajes, en el idioma de la \
-pregunta y de forma clara. Empieza directamente por la respuesta, sin hablar de «pasajes» ni de «contexto». Pon el número del pasaje entre corchetes justo después de cada dato que tomes de él, como [1].
+pregunta y de forma clara. Empieza directamente por la respuesta, sin hablar de «pasajes» ni de «contexto». Pon el número del pasaje entre corchetes justo después de cada dato que tomes de él, como [1]. \
+En tu memoria, «usuario» es la persona que te escribe: háblale de tú («Te llamas…»).
 Si tu memoria no contiene la información necesaria para responder la pregunta, responde exactamente \
 [INVESTIGAR] y nada más."
 }

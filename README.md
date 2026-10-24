@@ -30,6 +30,7 @@ SynaptoCore es un servidor escrito en Rust que da a un modelo de lenguaje local 
 ## Características
 
 - **Memoria primero, web después.** Si su memoria sabe algo de lo que preguntas, responde con ella y refuerza lo que usó. Solo busca en la web si la memoria no tiene nada al respecto, si el modelo indica que no le alcanza o si se lo pides («búscalo en internet»); entonces responde citando las fuentes `[n]` y aprende lo verificado. Sin buscador disponible, responde con conocimiento general y lo marca como no verificado.
+- **Te recuerda a ti.** Lo que cuentas de ti mismo («Me llamo Ana», «Trabajo en ventas») queda en tu perfil de la memoria. Las preguntas sobre ti («¿cómo me llamo?», «¿qué sabes de mí?») se responden con eso y nunca se buscan en la web; si aún no se lo has contado, te lo dice.
 - **Memoria con procedencia.** Cada relación recuerda de dónde vino (enseñada por ti, investigada, deducida, importada) y su fuente. Lo enseñado no se olvida; lo deducido sin supervisión caduca en semanas si nadie lo usa.
 - **Memoria de pasajes.** Guarda el texto de las fuentes y de lo que enseñas, para explicar con detalle y citar de dónde sale cada dato.
 - **Investigación profunda.** Divide un objetivo en preguntas, reúne fuentes, propone hipótesis y las contrasta con evidencias a favor y en contra antes de concluir.
@@ -416,6 +417,8 @@ El perfil `release` usa LTO completo, una sola unidad de generación de código 
 **El puerto 8080 está ocupado.** Arranca con otro puerto: `SYNAPTOCORE_PORT=8081`.
 
 **La primera compilación o el primer arranque tardan.** Es normal: se compilan las dependencias y se descargan ONNX Runtime y el modelo de embeddings (unos 120 MB, una sola vez).
+
+**Sigue comportándose como antes de actualizar.** El servidor que ya estaba en marcha usa el ejecutable con el que arrancó. Ciérralo y vuelve a abrir `start_brain.bat`, que recompila si el código cambió.
 
 **Investigó en la web algo que yo le había enseñado.** Comprueba que al enseñarlo respondió «He integrado esta información…»: si contestó como a una pregunta, no lo aprendió como enseñanza (reformúlalo como afirmación o empieza por «Memoriza que…»). Con preguntas muy indirectas («¿qué uso con poca gráfica?» en lugar de nombrar BitNet o la VRAM), la memoria puede no reconocer de qué hablas: nombrar el concepto ayuda.
 

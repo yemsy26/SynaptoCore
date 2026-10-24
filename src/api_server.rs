@@ -816,6 +816,13 @@ pub async fn handle_query_stream(
                                     yield Ok(token_event(&h));
                                 }
                             }
+                            // Paso 32: de quién es el usuario, la web no sabe nada.
+                            AnswerHead::Research if prepared.about_user => {
+                                let text = crate::prompts::UNKNOWN_ABOUT_USER;
+                                full_response.push_str(text);
+                                yield Ok(token_event(text));
+                                break;
+                            }
                             AnswerHead::Research => {
                                 head = None;
                                 yield Ok(researching_event(&plan.rewritten_query));
@@ -1969,6 +1976,29 @@ mod tests {
         assert!(text.contains("lenguaje de sistemas"));
         assert!(text.contains(r#""answered_from":"web""#));
         assert!(text.contains(r#""reinforced_edges":0"#), "la memoria no bastó: no se refuerza: {text}");
+    }
+
+    /// Paso 32: una pregunta sobre el usuario no escala a la web aunque el
+    /// modelo lo pida: la web no sabe quién es.
+    #[tokio::test]
+    async fn test_chat_question_about_the_user_does_not_escalate() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        {
+            let g = graph.lock().unwrap();
+            g.insert_node(&Node::new("usuario", "concept", "usuario")).unwrap();
+            g.insert_node(&Node::new("ventas", "concept", "ventas")).unwrap();
+            g.insert_edge("usuario", "trabaja_en", "ventas", 1.0).unwrap();
+        }
+        let state = research_state(&graph, vec![
+            r#"{"i":"query","q":"¿Cómo me llamo?","e":["nombre"],"t":"none","p":{}}"#,
+            "[INVESTIGAR]",
+        ], vec!["Me llamo Pedro"]);
+
+        let (_, body) = send(build_router(state), post_json("/api/v1/chat", r#"{"prompt":"¿Cómo me llamo?"}"#)).await;
+        let text = String::from_utf8(body).unwrap();
+        assert!(!text.contains("researching"), "{text}");
+        assert!(text.contains("Todavía no lo sé"), "{text}");
+        assert!(text.contains(r#""answered_from":"memory""#), "{text}");
     }
 
     #[tokio::test]
