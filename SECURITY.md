@@ -2,23 +2,25 @@
 
 ## Versiones con soporte
 
-Solo la última versión publicada en la rama `main` recibe correcciones de seguridad.
+Las correcciones de seguridad se publican en la rama `main`. Usa siempre la versión más reciente.
 
-## Cómo reportar una vulnerabilidad
+## Reportar una vulnerabilidad
 
-No abras un issue público. Usa el reporte privado de GitHub: pestaña **Security** del repositorio → **Report a vulnerability**.
+Si encuentras un problema de seguridad, repórtalo de forma privada desde la pestaña **Security** de este repositorio, con el botón **Report a vulnerability**. No lo publiques en un issue.
 
-Incluye, si es posible:
+Para que podamos reproducirlo, incluye:
 
-- una descripción del problema y su impacto;
+- una descripción del problema y de su impacto;
 - los pasos para reproducirlo;
 - la versión o el commit afectado.
 
 Recibirás una primera respuesta en un plazo de siete días.
 
-## Recomendaciones de despliegue
+## Uso seguro
 
-- El servidor escucha solo en `127.0.0.1` y no tiene autenticación: no lo expongas a la red sin un proxy inverso con autenticación.
-- Cambia `secret_key` en `searxng-settings.yml` antes de exponer SearXNG fuera de tu equipo.
-- Guarda los tokens de los conectores en variables de entorno (`${NOMBRE}` en `conectores.json`), nunca en el archivo, y no subas `.env` ni `conectores.json` al repositorio.
-- `synaptocore_memory.db` contiene todo lo aprendido: trátalo como un dato privado.
+SynaptoCore está pensado para ejecutarse en tu propio equipo:
+
+- **Acceso local.** El servidor escucha solo en `127.0.0.1` y no incluye autenticación. Si necesitas usarlo desde otra máquina, colócalo detrás de un proxy inverso con autenticación.
+- **SearXNG.** La `secret_key` de `searxng-settings.yml` es un valor de ejemplo. Si vas a exponer tu instancia de SearXNG fuera de tu equipo, sustitúyela por una clave propia.
+- **Secretos.** Los tokens de los conectores se leen de variables de entorno (`${NOMBRE}` en `conectores.json`). Tus archivos `.env` y `conectores.json` están excluidos del control de versiones.
+- **Datos.** `synaptocore_memory.db` contiene todo lo que el sistema ha aprendido. Guárdalo y compártelo como un dato privado.

@@ -117,7 +117,7 @@ docker run -d --name searxng-brain -p 8888:8080 --restart unless-stopped \
 
 En PowerShell, sustituye `$(pwd)` por `${PWD}` y las barras invertidas finales por acentos graves (`` ` ``).
 
-> Antes de exponer SearXNG fuera de tu equipo, cambia `secret_key` en `searxng-settings.yml`.
+> La `secret_key` de `searxng-settings.yml` es un valor de ejemplo. Si vas a exponer SearXNG fuera de tu equipo, sustitúyela por una clave propia.
 
 ### 5. Arranca SynaptoCore
 
