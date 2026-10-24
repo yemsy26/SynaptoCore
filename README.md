@@ -29,7 +29,7 @@ SynaptoCore es un servidor escrito en Rust que da a un modelo de lenguaje local 
 
 ## Características
 
-- **Responde siempre.** Primero consulta su memoria; si no alcanza, busca en la web, responde citando las fuentes `[n]` y después aprende lo verificado. Sin buscador disponible, responde con conocimiento general y lo marca como no verificado.
+- **Memoria primero, web después.** Si su memoria sabe algo de lo que preguntas, responde con ella y refuerza lo que usó. Solo busca en la web si la memoria no tiene nada al respecto, si el modelo indica que no le alcanza o si se lo pides («búscalo en internet»); entonces responde citando las fuentes `[n]` y aprende lo verificado. Sin buscador disponible, responde con conocimiento general y lo marca como no verificado.
 - **Memoria con procedencia.** Cada relación recuerda de dónde vino (enseñada por ti, investigada, deducida, importada) y su fuente. Lo enseñado no se olvida; lo deducido sin supervisión caduca en semanas si nadie lo usa.
 - **Memoria de pasajes.** Guarda el texto de las fuentes y de lo que enseñas, para explicar con detalle y citar de dónde sale cada dato.
 - **Investigación profunda.** Divide un objetivo en preguntas, reúne fuentes, propone hipótesis y las contrasta con evidencias a favor y en contra antes de concluir.
@@ -46,8 +46,9 @@ flowchart LR
     U[Pregunta] --> P[Planificador<br/>intención, entidades, herramienta]
     P -->|cálculo, hora, conector| T[Herramienta]
     P -->|consulta| M[Memoria<br/>grafo + pasajes]
-    M -->|la memoria la cubre| R[Respuesta citada]
-    M -->|no la cubre| W[Búsqueda web<br/>SearXNG]
+    M -->|sabe algo de la pregunta| R[Respuesta citada]
+    M -->|nada relevante o «búscalo en internet»| W[Búsqueda web<br/>SearXNG]
+    R -.->|el modelo pide investigar| W
     W --> R
     W -.->|segundo plano| A[Aprendizaje verificado<br/>hechos + pasajes]
     A -.-> M
@@ -56,7 +57,7 @@ flowchart LR
 
 1. **Planificador.** Una sola llamada al modelo decide la intención (consultar o aprender), reescribe la pregunta con el historial de la conversación, extrae las entidades y elige una herramienta si hace falta.
 2. **Memoria.** Recupera las relaciones del grafo y los pasajes relevantes (búsqueda semántica con embeddings y búsqueda de texto completo).
-3. **Investigación.** Si alguna entidad no está cubierta, o el modelo indica que su memoria no alcanza, busca en SearXNG y responde citando las fuentes.
+3. **Investigación.** Busca en SearXNG y responde citando las fuentes solo si la memoria no nombra nada de lo preguntado, si el modelo indica que lo que recuerda no alcanza, o si pides expresamente buscar en internet. Si la memoria sabe algo, responde con ella y refuerza lo que usó.
 4. **Aprendizaje.** En segundo plano extrae hechos de las fuentes, los valida contra ellas y consolida solo los verificados. El texto de las fuentes se guarda como pasajes.
 5. **Olvido.** Cada hora las relaciones y los pasajes que no se usan pierden fuerza según su procedencia; lo que cae por debajo del umbral se elimina.
 
@@ -164,7 +165,7 @@ SynaptoCore extrae las relaciones, las añade al grafo y guarda tu texto tal cua
 
 > ¿Qué es el grafeno?
 
-La próxima vez que preguntes por el grafeno responderá desde su memoria, citando las mismas fuentes, sin volver a buscar.
+La próxima vez que preguntes por el grafeno responderá desde su memoria, citando las mismas fuentes, sin volver a buscar. Si quieres información actualizada aunque ya lo sepa, pídelo: «Busca en internet las novedades del grafeno».
 
 **4. Pídele un cálculo.** El resultado es exacto y muestra qué se calculó:
 
@@ -415,6 +416,8 @@ El perfil `release` usa LTO completo, una sola unidad de generación de código 
 **El puerto 8080 está ocupado.** Arranca con otro puerto: `SYNAPTOCORE_PORT=8081`.
 
 **La primera compilación o el primer arranque tardan.** Es normal: se compilan las dependencias y se descargan ONNX Runtime y el modelo de embeddings (unos 120 MB, una sola vez).
+
+**Investigó en la web algo que yo le había enseñado.** Comprueba que al enseñarlo respondió «He integrado esta información…»: si contestó como a una pregunta, no lo aprendió como enseñanza (reformúlalo como afirmación o empieza por «Memoriza que…»). Con preguntas muy indirectas («¿qué uso con poca gráfica?» en lugar de nombrar BitNet o la VRAM), la memoria puede no reconocer de qué hablas: nombrar el concepto ayuda.
 
 **Una respuesta usa un dato equivocado de la memoria.** Busca el pasaje en `GET /api/v1/passages` y bórralo con `DELETE /api/v1/passages/{id}`.
 

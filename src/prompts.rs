@@ -323,7 +323,7 @@ r#"Eres el planificador de SynaptoCore. Analiza el último mensaje del usuario y
 {{"i":"query" | "learn","q":"...","e":["..."],"t":"none" | "NombreHerramienta","p":{{...}}}}
 
 CAMPOS:
-1. "i" (intención): por defecto "query". Usa "learn" SOLO si el mensaje afirma un hecho nuevo ("Rust es un lenguaje compilado", "PostgreSQL usa MVCC") o pide memorizar algo ("Memoriza que la sucursal abre a las 9"). Preguntas (aunque no lleven signos), peticiones ("Explícame…", "Háblame de…", "Dime…", "Cuéntame…"), saludos y conversación son SIEMPRE "query". Si dudas, "query".
+1. "i" (intención): por defecto "query". Usa "learn" si el mensaje AFIRMA algo: una frase que dice cómo es algo, qué hace, cuándo o quién, sea un hecho general, técnico o de tu entorno ("El grafeno conduce la electricidad", "Nuestra sucursal cierra los lunes", "Los modelos BitNet usan pesos ternarios para reducir el consumo de VRAM"), o pide memorizar algo ("Memoriza que la sucursal abre a las 9"). Preguntas (aunque no lleven signos), peticiones ("Explícame…", "Háblame de…", "Dime…", "Cuéntame…", "Quiero saber…", "Necesito…"), saludos y conversación son SIEMPRE "query". Si dudas, "query".
 2. "q" (consulta reescrita): el mensaje reescrito de forma autocontenida, sustituyendo pronombres, referencias ("eso", "ese producto") o el sujeto omitido ("Y cómo afecta al sueño") por lo que indique el historial. Si ya es autocontenido, cópialo igual. Mismo idioma.
 3. "e" (entidades): de 1 a 4 conceptos clave del mensaje, en minúsculas y sin artículos ("postgresql", "cortisol", "inteligencia artificial"). Lista vacía si no hay ninguno (por ejemplo, un saludo).
 4. "t" (herramienta): usa una herramienta SOLO si la pregunta pide datos que esa herramienta proporciona según su descripción (datos en tiempo real, de un sistema conectado, fecha/hora actual) o un cálculo matemático (operaciones, primos, comprobar una afirmación sobre números, continuar una sucesión). Para conocimiento general responde "none".
@@ -421,7 +421,7 @@ Si el contexto no contiene la información necesaria para responder la pregunta,
 pub fn memory_passages_answer_system_prompt() -> &'static str {
     "Eres SynaptoCore, un asistente con memoria a largo plazo. Responde la pregunta usando SOLO tu memoria: \
 el contexto y los pasajes guardados numerados. Explica con el detalle que aporten los pasajes, en el idioma de la \
-pregunta y de forma clara. Empieza directamente por la respuesta, sin hablar de «pasajes» ni de «contexto». Después de cada dato tomado de un pasaje, pon su número entre corchetes, por ejemplo: «Abre a las 9 [1].»
+pregunta y de forma clara. Empieza directamente por la respuesta, sin hablar de «pasajes» ni de «contexto». Pon el número del pasaje entre corchetes justo después de cada dato que tomes de él, como [1].
 Si tu memoria no contiene la información necesaria para responder la pregunta, responde exactamente \
 [INVESTIGAR] y nada más."
 }

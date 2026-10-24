@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use crate::error::MemoryError;
 use crate::memory_graph::{
     canonical_id, drafts_from_text, embed_texts, mentions, save_passages, EdgeWrite, GraphAccess, MemoryGraph,
-    RetrievalConfig,
+    RetrievalConfig, STRONG_SIMILARITY,
 };
 use crate::prompts;
 use crate::tools::{ToolError, ToolRegistry};
@@ -182,6 +182,8 @@ pub struct Plan {
     /// `true` si se usó el plan por defecto (LLM sin respuesta o JSON
     /// irrecuperable).
     pub fallback:        bool,
+    /// Paso 31: el usuario pidió buscar en internet («búscalo en la web»).
+    pub web_requested:   bool,
 }
 
 impl Plan {
@@ -194,6 +196,7 @@ impl Plan {
             entities:        Vec::new(),
             tool:            None,
             fallback:        true,
+            web_requested:   asks_for_web(message),
         }
     }
 
@@ -246,7 +249,36 @@ pub fn is_small_talk(message: &str) -> bool {
         }
         break;
     }
-    rest.is_empty() || SMALL_TALK.contains(&rest.as_str())
+    rest.is_empty() || SMALL_TALK.contains(&rest.as_str()) || is_acknowledgement(message)
+}
+
+/// Agradecimientos y conformidad, el más largo primero (Paso 31).
+const ACKNOWLEDGEMENTS: &[&str] = &[
+    "muchas gracias", "mil gracias", "de acuerdo", "muy bien", "gracias", "vale", "okay", "ok", "perfecto",
+    "genial", "entendido", "excelente",
+];
+
+/// ¿Es un agradecimiento o una conformidad con un comentario breve que no
+/// pregunta ni pide nada? («Gracias, eso me sirve», «Ok, muy interesante»).
+/// Iba a la memoria y, sin nada que nombrar, a la web. Tras un «Vale» puede
+/// venir un hecho nuevo («Vale, la reunión es el jueves a las 10»): por eso
+/// el comentario tiene que ser corto.
+fn is_acknowledgement(message: &str) -> bool {
+    const MAX_COMMENT_WORDS: usize = 5;
+    const QUESTION_STARTS: &[&str] = &["que", "como", "cual", "cuales", "quien", "donde", "cuando", "cuanto", "por"];
+    if message.contains('?') || message.contains('¿') {
+        return false;
+    }
+    let words = canonical_words(message);
+    let Some(comment) = ACKNOWLEDGEMENTS.iter().find_map(|a| {
+        if words == *a { Some("") } else { words.strip_prefix(&format!("{a} ")) }
+    }) else {
+        return false;
+    };
+    let comment: Vec<&str> = comment.split(' ').filter(|w| !w.is_empty()).collect();
+    comment.len() <= MAX_COMMENT_WORDS
+        && !comment.first().is_some_and(|w| QUESTION_STARTS.contains(w))
+        && !comment.iter().any(|w| REQUEST_VERBS.contains(w))
 }
 
 /// De dónde sale la respuesta (Paso 24). Se informa al cliente en el
@@ -347,6 +379,11 @@ pub struct PreparedAnswer {
     /// Paso 30: pasajes del prompt (en `sources`, en el mismo orden). Como
     /// las aristas, se refuerzan si la respuesta se completa.
     pub passage_ids:      Vec<String>,
+    /// Paso 31: la memoria nombra algo de lo preguntado (alguna entidad
+    /// cubierta) o trae un pasaje muy parecido a la pregunta.
+    pub memory_relevant:  bool,
+    /// Paso 31: el usuario pidió buscar en internet.
+    pub web_requested:    bool,
 }
 
 impl PreparedAnswer {
@@ -834,6 +871,8 @@ impl<B: LlmBackend> NeuralBridge<B> {
                 sources:          Vec::new(),
                 direct:           Some(direct),
                 passage_ids:      Vec::new(),
+                memory_relevant:  false,
+                web_requested:    false,
             });
         }
         let tool_output = plan.tool.as_ref().map(|call| self.run_tool(call));
@@ -890,6 +929,10 @@ impl<B: LlmBackend> NeuralBridge<B> {
             .iter()
             .map(|(p, _)| SearchHit { title: p.display_title(), url: p.url.clone().unwrap_or_default(), snippet: p.text.clone() })
             .collect();
+        // Paso 31: ¿hay memoria sobre lo preguntado? Basta con que nombre una
+        // de las entidades o con un pasaje muy parecido a la pregunta.
+        let memory_relevant = uncovered.len() < probes.len()
+            || passages.iter().any(|(_, score)| *score >= STRONG_SIMILARITY);
 
         // ── 4. Prompt de síntesis fundamentada ──────────────────────────
         let triples: Vec<(String, String, String, f64)> = context.edges
@@ -918,6 +961,8 @@ impl<B: LlmBackend> NeuralBridge<B> {
             sources,
             direct: None,
             passage_ids: passages.into_iter().map(|(p, _)| p.id).collect(),
+            memory_relevant,
+            web_requested: plan.web_requested,
         })
     }
 
@@ -935,18 +980,29 @@ impl<B: LlmBackend> NeuralBridge<B> {
             sources:          Vec::new(),
             direct:           None,
             passage_ids:      Vec::new(),
+            memory_relevant:  false,
+            web_requested:    false,
         }
     }
 
-    /// ¿Investigar ANTES de responder? (Paso 24) Solo en modo memoria (con
-    /// herramienta ya hay datos en tiempo real):
-    ///   - sin contexto: la memoria no sabe nada; o
-    ///   - alguna entidad sin cubrir y hay buscador. Sin buscador se intenta
-    ///     con la memoria relacionada; si no alcanza, el modelo responde
-    ///     `[INVESTIGAR]` y se pasa a conocimiento general.
+    /// ¿Investigar ANTES de responder? Solo en modo memoria (con herramienta
+    /// ya hay datos en tiempo real). Paso 31, memoria primero:
+    ///   - sin contexto: la memoria no sabe nada; o, con buscador,
+    ///   - el usuario pidió buscar en internet, o
+    ///   - lo recuperado no nombra nada de lo preguntado (ninguna entidad
+    ///     cubierta ni pasaje muy parecido): contexto de otros conceptos.
+    /// Si la memoria nombra algo, responde con ella delante y, si no le
+    /// alcanza, el modelo pide investigar (`[INVESTIGAR]`). Antes bastaba una
+    /// entidad sin cubrir para ir a la web: «¿Qué innovación de IA de
+    /// Microsoft usa pesos ternarios para ahorrar VRAM?» se investigaba con
+    /// 12 aristas y 3 pasajes sobre BitNet en memoria, porque `ai` y `vram`
+    /// no nombraban ningún concepto; no había refuerzo hebbiano.
     pub fn research_first(&self, prepared: &PreparedAnswer) -> bool {
+        if prepared.mode != AnswerMode::Memory {
+            return false;
+        }
         let empty = prepared.context_edge_ids.is_empty() && prepared.passage_ids.is_empty();
-        prepared.mode == AnswerMode::Memory && (empty || (!prepared.uncovered.is_empty() && self.search.is_some()))
+        empty || (self.search.is_some() && (prepared.web_requested || !prepared.memory_relevant))
     }
 
     /// **Investigación en caliente** (Paso 24): busca en la web la pregunta
@@ -1295,7 +1351,11 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
     // Asimetría de riesgo: un falso "learn" escribe en la memoria a largo
     // plazo; un falso "query" solo responde. Preguntas y peticiones nunca
     // se memorizan, diga lo que diga el modelo.
-    let intent = if text("i", "intent").eq_ignore_ascii_case("learn") && !is_question_or_request(message) {
+    let intent = if text("i", "intent").eq_ignore_ascii_case("learn")
+        && !is_question_or_request(message)
+        && !opens_without_statement(message)
+        && !is_acknowledgement(message)
+    {
         Intent::Learn
     } else {
         Intent::Query
@@ -1357,7 +1417,45 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
         tool => tool,
     };
 
-    Plan { intent, rewritten_query, entities, tool, fallback: false }
+    Plan { intent, rewritten_query, entities, tool, fallback: false, web_requested: asks_for_web(message) }
+}
+
+/// Comienzos que expresan un deseo o una duda, no un hecho (Paso 31). Con la
+/// regla de «learn» que reconoce afirmaciones cortas, el 2B tomaba «Me
+/// interesa aprender sobre BitNet» por una enseñanza.
+const NON_STATEMENT_OPENERS: &[&str] = &[
+    "me interesa", "me gustaria", "me pregunto", "me puedes", "me podrias", "quiero", "quisiera",
+    "necesito", "tengo una duda", "tengo una pregunta", "estoy buscando",
+];
+
+/// Peticiones de memorizar, que sí son enseñanza aunque empiecen así
+/// («Quiero que recuerdes que…»).
+const MEMORIZE_REQUESTS: &[&str] = &[
+    "memoriza", "memorizalo", "que memorices", "recuerda que", "que recuerdes", "anota que", "que anotes",
+    "apunta que", "que apuntes", "guarda que", "que guardes", "que aprendas",
+];
+
+/// ¿Empieza el mensaje con algo que no afirma un hecho? (Paso 31)
+fn opens_without_statement(message: &str) -> bool {
+    let words = canonical_words(message);
+    let padded = format!(" {words} ");
+    let opens = NON_STATEMENT_OPENERS.iter().any(|o| words == *o || words.starts_with(&format!("{o} ")));
+    opens && !MEMORIZE_REQUESTS.iter().any(|m| padded.contains(&format!(" {m} ")))
+}
+
+/// Verbos y lugares de una petición explícita de buscar en internet (Paso 31).
+const WEB_VERBS: &[&str] = &[
+    "busca", "buscalo", "buscala", "buscame", "buscar", "investiga", "investigalo", "investigala", "investigar",
+    "consulta", "consultar", "mira", "mirar", "revisa", "revisar", "averigua", "averiguar", "search",
+];
+const WEB_PLACES: &[&str] = &["en internet", "en la web", "en google", "online", "en linea", "on the web"];
+
+/// ¿Pide el mensaje buscar en internet? («Busca en la web qué es BitNet»,
+/// «búscalo en internet»). Entonces se investiga aunque haya memoria.
+fn asks_for_web(message: &str) -> bool {
+    let words = format!(" {} ", canonical_words(message));
+    let has = |phrase: &str| words.contains(&format!(" {phrase} "));
+    words.contains(" googlea") || (WEB_VERBS.iter().any(|v| has(v)) && WEB_PLACES.iter().any(|p| has(p)))
 }
 
 /// Preguntas por la hora o la fecha actuales, en forma canónica.
@@ -2282,6 +2380,82 @@ Espero que sea útil."#;
         assert!(prompt.contains("Pasajes guardados:
 [1] Grafeno - Wikipedia — El grafeno es una lámina"), "{prompt}");
         assert_eq!(graph.recent_passages(1).unwrap()[0].uses, 1, "el pasaje que respondió reinicia su olvido");
+    }
+
+    /// Paso 31, memoria primero: si la memoria nombra alguna de las entidades,
+    /// responde con ella aunque otra quede sin cubrir (el modelo pediría
+    /// investigar si no le alcanza). Antes una sola sin cubrir iba a la web.
+    #[test]
+    fn test_memory_first_when_some_entity_is_covered() {
+        let graph = titanio_graph();
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", "¿Qué aleaciones ligeras usan titanio?", &["titanio", "aleaciones ligeras"], "none"),
+            "El titanio es un metal ligero.".into(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["no debería buscarse"]));
+        let (answer, prepared) = bridge.ask(&graph, "¿Qué aleaciones ligeras usan titanio?", "").unwrap();
+
+        assert_eq!(prepared.mode, AnswerMode::Memory);
+        assert_eq!(prepared.uncovered, ["aleaciones ligeras"]);
+        assert!(prepared.memory_relevant);
+        assert_eq!(answer, "El titanio es un metal ligero.");
+        assert_eq!(bridge.backend.call_count(), 2, "planificador + respuesta, sin búsqueda");
+        assert!(!prepared.context_edge_ids.is_empty(), "la memoria usada se refuerza");
+    }
+
+    /// «Búscalo en internet» investiga aunque la memoria lo sepa.
+    #[test]
+    fn test_explicit_web_request_researches_despite_memory() {
+        let graph = titanio_graph();
+        let message = "Busca en internet cómo es el titanio";
+        let mock = MockLlmBackend::new(vec![
+            plan_json("query", message, &["titanio"], "none"),
+            "Es ligero y resistente [1].".into(),
+        ]);
+        let bridge = NeuralBridge::new(mock).with_search(web(vec!["El titanio es ligero y resistente."]));
+        let (_, prepared) = bridge.ask(&graph, message, "").unwrap();
+        assert_eq!(prepared.mode, AnswerMode::Research);
+        assert_eq!(prepared.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_acknowledgements_and_wishes_are_never_taught() {
+        let learn = |message: &str| parse_plan(&plan_json("learn", message, &[], "none"), message, None).intent;
+        for message in ["Gracias, eso me sirve", "Me interesa aprender sobre BitNet", "Ok, muy interesante",
+                        "Necesito información sobre el cortisol", "Quiero saber qué es el grafeno"] {
+            assert_eq!(learn(message), Intent::Query, "{message}");
+        }
+        for message in ["Quiero que recuerdes que la sucursal abre a las 9", "Nuestra sucursal del norte cierra los lunes.",
+                        "Mi perro se llama Toby", "Vale, la reunión con el proveedor es el jueves a las 10"] {
+            assert_eq!(learn(message), Intent::Learn, "{message}");
+        }
+    }
+
+    #[test]
+    fn test_acknowledgements_are_small_talk() {
+        for yes in ["Gracias, eso me sirve", "Ok, muy interesante", "Vale, gracias por la info", "Perfecto", "Muchas gracias!"] {
+            assert!(is_small_talk(yes), "{yes}");
+        }
+        for no in ["Gracias, ¿y qué es el grafeno?", "Vale, ahora explícame los pesos ternarios",
+                   "Vale, la reunión con el proveedor es el jueves a las 10", "Gracias por qué"] {
+            assert!(!is_small_talk(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn test_asks_for_web() {
+        for yes in [
+            "Busca en internet qué es BitNet", "Búscalo en la web", "¿Puedes buscar en Google los pesos ternarios?",
+            "Investiga online quién creó Rust", "googlea BitNet",
+        ] {
+            assert!(asks_for_web(yes), "{yes}");
+        }
+        for no in [
+            "¿Qué es BitNet?", "¿Cómo funciona la privacidad en internet?", "Busca el sentido de la vida",
+            "Explícame la web semántica",
+        ] {
+            assert!(!asks_for_web(no), "{no}");
+        }
     }
 
     /// Un pasaje que no nombra la entidad preguntada no evita investigarla,

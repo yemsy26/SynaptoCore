@@ -42,7 +42,7 @@ pub const MAX_PASSAGES_PER_TEXT: usize = 40;
 // con palabras raras («grafeno», 0,29); solo del tema 0,14-0,49; ajeno
 // -0,05-0,19. Un pasaje es relevante si es muy parecido, o si nombra al
 // menos la mitad de las palabras de la pregunta sin ser ajeno.
-const STRONG_SIMILARITY: f32 = 0.55;
+pub const STRONG_SIMILARITY: f32 = 0.55;
 const WEAK_SIMILARITY: f32 = 0.20;
 const MIN_LEXICAL: f32 = 0.5;
 /// Peso de la coincidencia de palabras al ordenar.

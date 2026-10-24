@@ -21,6 +21,7 @@ use crate::types::{current_unix_ts, Edge, EdgeOrigin, Neighborhood, Node, Proven
 mod passages;
 pub use passages::{
     drafts_from_text, mentions, save_passages, split_into_passages, Passage, PassageDraft, MAX_PASSAGE_CHARS,
+    STRONG_SIMILARITY,
 };
 
 // ── Constantes de comportamiento cognitivo ────────────────────────────────────
