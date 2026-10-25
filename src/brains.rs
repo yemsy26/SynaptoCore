@@ -28,6 +28,9 @@ use crate::llm_bridge::{BoxedTokenStream, BridgeError, LlmBackend};
 use crate::ollama_backend::OllamaBackend;
 use crate::openai_backend::{OpenAiBackend, Reasoning};
 
+mod memory;
+pub use memory::{memory_fit, memory_info, MemoryFit, MemoryInfo};
+
 /// Archivo con la elección de cerebros (se puede cambiar con
 /// `SYNAPTOCORE_BRAINS`).
 pub const DEFAULT_CONFIG_FILE: &str = "cerebros.json";
@@ -185,6 +188,8 @@ pub struct BrainInfo {
     pub quantization: Option<String>,
     pub bits:         Option<f32>,
     pub context:      Option<u64>,
+    /// Paso 33b: tamaño del archivo del modelo, lo que ocupa al cargarlo.
+    pub size_bytes:   Option<u64>,
     pub loaded:       bool,
     pub reasoning:    Reasoning,
     pub tier:         Tier,
@@ -274,6 +279,7 @@ fn discover_ollama(client: &reqwest::blocking::Client, engine: &Engine) -> Resul
             // Ollama: el backend pide siempre `think: false`.
             reasoning: Reasoning::Unknown,
             tier: Tier::for_model(params_b, bits),
+            size_bytes: m["size"].as_u64(),
             model, params, params_b, quantization, bits, context: None,
         })
     }).collect())
@@ -303,7 +309,7 @@ fn discover_openai(client: &reqwest::blocking::Client, engine: &Engine) -> Resul
             engine: engine.id.clone(),
             engine_label: engine.label.clone(),
             display: model.clone(),
-            params: None, quantization: None, bits: None, context: None, loaded: false,
+            params: None, quantization: None, bits: None, context: None, size_bytes: None, loaded: false,
             reasoning: Reasoning::Unknown,
             tier: Tier::for_model(params_b, None),
             model, params_b,
@@ -336,6 +342,7 @@ fn lmstudio_brain(engine: &Engine, m: &serde_json::Value) -> Option<BrainInfo> {
         quantization: m["quantization"]["name"].as_str().map(String::from),
         loaded: !instances.is_empty(),
         tier: Tier::for_model(params_b, bits),
+        size_bytes: m["size_bytes"].as_u64(),
         model, params, params_b, bits, context, reasoning,
     })
 }
@@ -849,7 +856,8 @@ mod tests {
     async fn test_brain_test_reports_json_and_stream() {
         let info = BrainInfo {
             engine: "ollama".into(), engine_label: "Ollama".into(), model: "m".into(), display: "m".into(),
-            params: None, params_b: Some(2.0), quantization: None, bits: Some(1.0), context: None, loaded: true,
+            params: None, params_b: Some(2.0), quantization: None, bits: Some(1.0), context: None,
+            size_bytes: None, loaded: true,
             reasoning: Reasoning::Unknown, tier: Tier::Ligero,
         };
         let good: Arc<dyn LlmBackend + Send + Sync> =

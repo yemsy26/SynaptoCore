@@ -292,6 +292,8 @@ Cada cerebro tiene un **nivel** que sale de su tamaño y decide cuánto se le pi
 
 Un modelo muy comprimido (1-2 bits por peso) baja un nivel, y el nivel se puede fijar a mano. **Probar** comprueba un cerebro antes de usarlo: si devuelve el JSON que necesitan el planificador y la extracción, si responde en streaming, su velocidad y si razona siempre. **Usar estos cerebros** los cambia sin reiniciar y guarda la elección en `cerebros.json`.
 
+**Memoria.** El panel muestra la RAM y la VRAM libres y, al elegir, estima si los cerebros caben: suma lo que ocupará cada modelo que aún no está cargado (su archivo más un margen para el contexto) y lo compara con la memoria libre. Avisa si van justos o si no caben, nombra el modelo que más ocupa y lista los modelos cargados que no son cerebros, que ocupan memoria sin usarse. Dos modelos grandes a la vez pueden dejar el equipo sin memoria y hacer que Ollama o LM Studio dejen de responder.
+
 Funciona con modelos que razonan: se les pide no razonar cuando lo admiten y, a los que razonan siempre, se les da más margen y se descarta el razonamiento de la respuesta. Si al arrancar un cerebro guardado no está disponible (por ejemplo, LM Studio cerrado), se usa el modelo de `OLLAMA_MODEL` y se avisa en la consola. En un equipo con poca memoria de vídeo, un cerebro profundo grande responde con más calidad pero tarda más.
 
 ### Investigación profunda

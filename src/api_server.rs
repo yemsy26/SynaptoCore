@@ -58,7 +58,9 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-use crate::brains::{self, BrainChoice, BrainHub, BrainInfo, BrainTest, BrainsConfig, EngineStatus, Scope, Tier};
+use crate::brains::{
+    self, BrainChoice, BrainHub, BrainInfo, BrainTest, BrainsConfig, EngineStatus, MemoryFit, MemoryInfo, Scope, Tier,
+};
 use crate::error::MemoryError;
 use crate::federated_memory::{self, FederationError};
 use crate::investigation::{self, Investigation, InvestigationStatus};
@@ -1264,6 +1266,10 @@ pub struct BrainsResponse {
     pub models:   Vec<BrainInfo>,
     pub rapido:   ActiveBrainDto,
     pub profundo: ActiveBrainDto,
+    /// Paso 33b: RAM y VRAM libres ahora mismo.
+    pub memory:   MemoryInfo,
+    /// Paso 33b: si los cerebros en uso caben en memoria.
+    pub fit:      MemoryFit,
 }
 
 #[derive(Deserialize)]
@@ -1285,7 +1291,9 @@ async fn brains_response(hub: Arc<BrainHub>) -> Result<BrainsResponse, ApiError>
             let active = slot.get();
             ActiveBrainDto { choice: active.choice.clone(), label: active.label.clone(), scope: active.scope }
         };
-        BrainsResponse { engines, models, rapido: dto(&hub.rapido), profundo: dto(&hub.profundo) }
+        let memory = brains::memory_info();
+        let fit = brains::memory_fit(&hub.config(), &models, &memory);
+        BrainsResponse { engines, models, rapido: dto(&hub.rapido), profundo: dto(&hub.profundo), memory, fit }
     }).await?)
 }
 
@@ -1307,6 +1315,19 @@ pub async fn handle_set_brains(
     println!("  {msg}");
     let _ = state.events_tx.send(SubconsciousEvent::new("Cycle", msg).to_json());
     Ok(Json(brains_response(hub).await?))
+}
+
+/// `POST /api/v1/brains/fit` — si unos cerebros (aún sin elegir) cabrían en
+/// la memoria libre (Paso 33b). El panel lo pregunta al cambiar la selección.
+pub async fn handle_brain_fit(
+    State(state): State<AppState>,
+    Json(config): Json<BrainsConfig>,
+) -> Result<Json<MemoryFit>, ApiError> {
+    let hub = brain_hub(&state)?;
+    Ok(Json(tokio::task::spawn_blocking(move || {
+        let (_, models) = brains::discover(&hub.engines);
+        brains::memory_fit(&config, &models, &brains::memory_info())
+    }).await?))
 }
 
 /// `POST /api/v1/brains/test` — prueba un cerebro con lo que el sistema le
@@ -1426,7 +1447,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/passages",             get(handle_list_passages))
         .route("/passages/{id}",        axum::routing::delete(handle_delete_passage))
         .route("/brains",               get(handle_brains).put(handle_set_brains))
-        .route("/brains/test",          post(handle_test_brain));
+        .route("/brains/test",          post(handle_test_brain))
+        .route("/brains/fit",           post(handle_brain_fit));
 
     Router::new()
         .route("/",                   get(handle_dashboard))
@@ -2094,6 +2116,35 @@ mod tests {
         assert!(text.contains("lenguaje de sistemas"));
         assert!(text.contains(r#""answered_from":"web""#));
         assert!(text.contains(r#""reinforced_edges":0"#), "la memoria no bastó: no se refuerza: {text}");
+    }
+
+    /// Paso 33b: el catálogo de cerebros trae la memoria libre y si caben;
+    /// sin cerebros configurables, 503.
+    #[tokio::test]
+    async fn test_brains_report_memory_and_fit() {
+        assert_eq!(send(test_router(vec![]), get_req("/api/v1/brains")).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = AppState {
+            graph,
+            llm:           mock_llm(vec![]),
+            agent_id:      "agent-test".to_string(),
+            events_tx:     dummy_tx(),
+            sessions:      Arc::new(SessionManager::new()),
+            tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
+            priority:      Arc::new(crate::priority::CognitivePriority::default()),
+            deep:          None,
+            brains:        Some(Arc::new(BrainHub::fixed(mock_llm(vec![]), mock_llm(vec![])))),
+            search:        None,
+        };
+        let (status, body) = send(build_router(state.clone()), get_req("/api/v1/brains")).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["memory"].is_object() && json["fit"]["status"].is_string(), "{json}");
+        let config = r#"{"rapido":{"engine":"ollama","model":"a"},"profundo":{"engine":"ollama","model":"b"}}"#;
+        let (status, body) = send(build_router(state), post_json("/api/v1/brains/fit", config)).await;
+        assert_eq!(status, StatusCode::OK);
+        let fit: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fit["need_bytes"], 0, "sin modelos en el catálogo no hay nada que cargar: {fit}");
     }
 
     /// Paso 32: una pregunta sobre el usuario no escala a la web aunque el

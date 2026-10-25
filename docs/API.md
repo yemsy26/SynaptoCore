@@ -289,7 +289,23 @@ Motores, modelos disponibles y los cerebros en uso.
 }
 ```
 
-`reasoning`: `absent` (no razona), `optional` (se puede apagar), `always` (razona siempre) o `unknown`. `tier`: `ligero`, `medio` o `avanzado`.
+`reasoning`: `absent` (no razona), `optional` (se puede apagar), `always` (razona siempre) o `unknown`. `tier`: `ligero`, `medio` o `avanzado`. Cada modelo trae también `size_bytes` (tamaño del archivo).
+
+La respuesta incluye la memoria del equipo y si los cerebros en uso caben:
+
+```json
+"memory": {"ram_total": 34037112832, "ram_free": 16649162752, "vram_total": 8585740288, "vram_free": 8342470656,
+           "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU"},
+"fit": {"status": "justo", "need_bytes": 23729713659, "available_bytes": 24991633408,
+        "message": "Caben justos: necesitan unos 22,1 GB de los 23,3 GB libres. El equipo irá lento mientras estén cargados.",
+        "idle_loaded": []}
+```
+
+`fit.status`: `ok`, `justo`, `no_cabe` o `desconocido` (sin medir). Solo cuentan los modelos que aún no están cargados; `idle_loaded` lista los cargados que no son cerebros. La VRAM se mide con `nvidia-smi` (sin GPU NVIDIA sale `null`).
+
+### `POST /api/v1/brains/fit`
+
+Si unos cerebros cabrían en la memoria libre, sin cambiarlos. Mismo cuerpo que `PUT /api/v1/brains`; responde con un `fit` como el de arriba.
 
 ### `PUT /api/v1/brains`
 
