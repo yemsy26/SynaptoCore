@@ -460,6 +460,90 @@ conversación. Conversa de forma natural, cálida y breve, en el idioma del usua
 si te piden información concreta que no conoces con seguridad, dilo y ofrece investigarla."
 }
 
+/// Paso 33: preguntas por lo que SynaptoCore puede hacer.
+pub fn capabilities_system_prompt() -> &'static str {
+    "Eres SynaptoCore y te preguntan qué puedes hacer. Responde en primera persona, con honestidad y brevedad, en el \
+idioma del usuario, usando SOLO la lista de lo que puedes hacer: di con claridad qué sí y qué no. Si hay una forma de \
+conseguir lo que pide con lo que tienes (una herramienta, una búsqueda, una investigación), explícala en una frase. No \
+inventes capacidades ni hables de permisos de otros servicios."
+}
+
+/// Lo que SynaptoCore puede hacer de verdad (Paso 33), con sus herramientas.
+pub fn format_capabilities(tools: &[(String, String)], web: bool) -> String {
+    let mut lines = vec![
+        "- Memoria a largo plazo: recuerdo lo que el usuario me enseña (hechos y textos) y lo que aprendo investigando.".to_string(),
+    ];
+    if web {
+        lines.push("- Búsqueda web: busco en internet y respondo citando las fuentes. Leo lo público; no entro en cuentas.".into());
+        lines.push("- Investigación a fondo: con «investiga todo sobre X» hago varias rondas de búsqueda en segundo plano y doy una conclusión con fuentes.".into());
+    } else {
+        lines.push("- Sin búsqueda web en esta instalación: respondo con mi memoria y mi conocimiento general.".into());
+    }
+    lines.push("- Modo pensar: con «piensa», «imagina» o «crea…» propongo ideas, las conecto y construyo un resultado.".into());
+    lines.push("- No puedo iniciar sesión en cuentas, ver repositorios o archivos privados, ejecutar programas ni actuar fuera de esta conversación.".into());
+    for (name, description) in tools {
+        let summary: String = description.split(". ").next().unwrap_or(description).chars().take(200).collect();
+        lines.push(format!("- Herramienta {name}: {}", summary.trim_end_matches('.')));
+    }
+    lines.join("\n")
+}
+
+/// Paso 33: el objetivo de una investigación o de pensar, autocontenido.
+/// `create`: pide crear o imaginar; si no, investigar. Con una sola
+/// instrucción para ambos, el 2B empezaba «Imagina una app…» por «Investigar…».
+pub fn objective_system_prompt(create: bool) -> &'static str {
+    if create {
+        "Reformulas peticiones. Escribe SOLO lo que el usuario quiere que crees o imagines, en una frase autocontenida en \
+el idioma del usuario que empiece por un verbo como «Crear», «Diseñar» o «Imaginar», con su alcance, sin saludos ni lo \
+que el usuario cuenta de sí. Sustituye las referencias («eso», «este tema») por lo que significan según el historial."
+    } else {
+        "Reformulas peticiones. Escribe SOLO el objetivo de investigación del usuario, en una frase autocontenida en el \
+idioma del usuario: qué hay que investigar y con qué alcance, sin saludos ni lo que el usuario cuenta de sí. Sustituye \
+las referencias («eso», «este tema», «el primer objetivo») por lo que significan según el historial."
+    }
+}
+
+pub fn format_objective_user_prompt(history: &str, message: &str) -> String {
+    format!("Historial:\n{history}\n\nMensaje: {message}\n\nObjetivo:")
+}
+
+/// Paso 33, modo pensar: las reglas comunes a los tres pasos.
+pub fn think_system_prompt() -> &'static str {
+    "Eres SynaptoCore pensando por tu cuenta: creas ideas propias conectando lo que sabes. Escribe en el idioma del \
+usuario, en Markdown. El material es tu base: cuando tomes un dato de las fuentes, cítalo con su [n], y sin fuentes no cites números; lo demás son ideas \
+tuyas, y deben ser concretas y realizables, no generalidades. No presentes como hechos datos que no estén en el \
+material ni copies sus marcas («[certeza: …, peso: …]»). No hagas preguntas al usuario ni pidas más detalles: decide \
+tú y avanza."
+}
+
+/// Paso 1 del modo pensar: proponer ideas.
+pub fn think_ideas_prompt(objective: &str, material: &str, ideas: usize) -> String {
+    format!(
+        "Objetivo: {objective}\n\nMaterial:\n{material}\n\nPaso 1 de 3. Propón {ideas} ideas distintas para el \
+objetivo; cada una conecta algo del material con algo nuevo. Lista numerada: cada idea con un título en negrita y una o \
+dos frases. Solo la lista."
+    )
+}
+
+/// Paso 2 del modo pensar: conectar las ideas en un todo.
+pub fn think_connections_prompt(objective: &str, material: &str, ideas: &str) -> String {
+    format!(
+        "Objetivo: {objective}\n\nMaterial:\n{material}\n\nIdeas propuestas:\n{ideas}\n\nPaso 2 de 3. Elige las \
+mejores ideas y conéctalas en un todo: qué pieza aporta cada una, cómo se relacionan y en qué orden se construyen. \
+Lista breve, sin repetir las ideas."
+    )
+}
+
+/// Paso 3 del modo pensar: construir el resultado.
+pub fn think_result_prompt(objective: &str, material: &str, ideas: &str, connections: &str) -> String {
+    format!(
+        "Objetivo: {objective}\n\nMaterial:\n{material}\n\nIdeas:\n{ideas}\n\nConexiones:\n{connections}\n\n\
+Paso 3 de 3. Construye el resultado final, completo y detallado, apoyado en las conexiones: estructura, piezas, cómo \
+funciona y primeros pasos. Si el objetivo pide software, incluye fragmentos breves con lo esencial de cada pieza, no \
+programas completos. No repitas la lista de ideas."
+    )
+}
+
 /// Fuentes numeradas para el prompt: `[n] título — fragmento`.
 pub fn format_sources(hits: &[crate::truth_filter::SearchHit]) -> String {
     format_numbered(hits, 300)
@@ -598,16 +682,17 @@ pub fn investigation_judge_schema() -> serde_json::Value {
 /// Conclusión final, en prosa y con citas [n]. Dos variantes: con una sola
 /// instrucción condicional («si ninguna quedó apoyada…») el 2B escribía que
 /// no había apoyo junto a hipótesis apoyadas.
-pub fn investigation_conclusion_system_prompt(any_supported: bool) -> &'static str {
+/// `length`: extensión según el alcance del cerebro (Paso 33).
+pub fn investigation_conclusion_system_prompt(any_supported: bool, length: &str) -> String {
     if any_supported {
-        "Eres SynaptoCore. Redacta la conclusión de una investigación en 2 a 5 frases, en el idioma del \
+        format!("Eres SynaptoCore. Redacta la conclusión de una investigación en {length}, en el idioma del \
 objetivo: responde al objetivo con las hipótesis APOYADAS y menciona las refutadas si ayuda. Cita las \
 fuentes con su número entre corchetes, por ejemplo [3]. Usa SOLO las hipótesis y fuentes dadas; no \
-inventes datos."
+inventes datos.")
     } else {
         "Eres SynaptoCore. Ninguna hipótesis de esta investigación quedó apoyada por las fuentes. Redacta \
 en 2 a 4 frases, en el idioma del objetivo, que la investigación no es concluyente, qué se descartó (si \
-algo quedó refutado, con su número de fuente entre corchetes) y qué faltaría averiguar. No inventes datos."
+algo quedó refutado, con su número de fuente entre corchetes) y qué faltaría averiguar. No inventes datos.".into()
     }
 }
 

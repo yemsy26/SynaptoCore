@@ -87,11 +87,14 @@ impl Tier {
     pub fn scope(self) -> Scope {
         match self {
             Self::Ligero => Scope { tier: self, synthesis_tokens: 384, prompt_passages: 3,
-                                    investigation_rounds: 3, conclusion_tokens: 450 },
+                                    investigation_rounds: 3, conclusion_tokens: 450,
+                                    think_ideas: 3, think_step_tokens: 300, think_tokens: 800 },
             Self::Medio => Scope { tier: self, synthesis_tokens: 768, prompt_passages: 5,
-                                   investigation_rounds: 3, conclusion_tokens: 700 },
+                                   investigation_rounds: 3, conclusion_tokens: 700,
+                                   think_ideas: 4, think_step_tokens: 400, think_tokens: 1400 },
             Self::Avanzado => Scope { tier: self, synthesis_tokens: 1536, prompt_passages: 8,
-                                      investigation_rounds: 4, conclusion_tokens: 1000 },
+                                      investigation_rounds: 4, conclusion_tokens: 1000,
+                                      think_ideas: 5, think_step_tokens: 500, think_tokens: 2400 },
         }
     }
 
@@ -117,6 +120,23 @@ pub struct Scope {
     pub investigation_rounds: u32,
     /// Tokens de la conclusión de una investigación.
     pub conclusion_tokens:    i32,
+    /// Paso 33: ideas que propone al pensar.
+    pub think_ideas:          usize,
+    /// Paso 33: tokens de cada paso intermedio al pensar (ideas, conexiones).
+    pub think_step_tokens:    i32,
+    /// Paso 33: tokens del resultado final al pensar.
+    pub think_tokens:         i32,
+}
+
+impl Scope {
+    /// Paso 33: extensión de la conclusión de una investigación.
+    pub fn conclusion_length(&self) -> &'static str {
+        match self.tier {
+            Tier::Ligero   => "2 a 5 frases",
+            Tier::Medio    => "uno o dos párrafos",
+            Tier::Avanzado => "uno a cuatro párrafos, según lo que aporten las fuentes, cubriendo cada aspecto del objetivo",
+        }
+    }
 }
 
 impl Default for Scope {

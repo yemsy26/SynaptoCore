@@ -33,7 +33,9 @@ SynaptoCore es un servidor escrito en Rust que da a un modelo de lenguaje local 
 - **Te recuerda a ti.** Lo que cuentas de ti mismo («Me llamo Ana», «Trabajo en ventas») queda en tu perfil de la memoria. Las preguntas sobre ti («¿cómo me llamo?», «¿qué sabes de mí?») se responden con eso y nunca se buscan en la web; si aún no se lo has contado, te lo dice.
 - **Memoria con procedencia.** Cada relación recuerda de dónde vino (enseñada por ti, investigada, deducida, importada) y su fuente. Lo enseñado no se olvida; lo deducido sin supervisión caduca en semanas si nadie lo usa.
 - **Memoria de pasajes.** Guarda el texto de las fuentes y de lo que enseñas, para explicar con detalle y citar de dónde sale cada dato.
-- **Investigación profunda.** Divide un objetivo en preguntas, reúne fuentes, propone hipótesis y las contrasta con evidencias a favor y en contra antes de concluir.
+- **Investigación profunda.** Divide un objetivo en preguntas, reúne fuentes, propone hipótesis y las contrasta con evidencias a favor y en contra antes de concluir. Se lanza desde el panel o desde el chat («Investiga a fondo todo sobre…»), y el chat la sigue hasta la conclusión.
+- **Modo pensar.** Con «piensa», «imagina» o «crea…» propone ideas propias conectando lo que sabe, las une en un todo y construye el resultado paso a paso, a la vista en el chat. Las ideas quedan en la memoria marcadas como propias y sin verificar.
+- **Sabe lo que puede hacer.** Las preguntas sobre sus capacidades («¿tienes acceso a GitHub?») se responden con lo que de verdad puede hacer, no con una búsqueda en la web.
 - **Aprendizaje autónomo.** En reposo, un proceso en segundo plano detecta conceptos relacionados sin conectar, formula una pregunta, busca evidencia y consolida solo lo verificado.
 - **Cálculo exacto.** Las preguntas numéricas van a una calculadora de precisión arbitraria, a un verificador de conjeturas y a un buscador de fórmulas de sucesiones; el modelo nunca rehace las cuentas.
 - **Conectores sin código.** Cualquier API HTTP (ERP, CRM, inventario) se declara en un archivo JSON y el asistente puede consultarla.
@@ -57,7 +59,7 @@ flowchart LR
     T --> R
 ```
 
-1. **Planificador.** Una sola llamada al modelo decide la intención (consultar o aprender), reescribe la pregunta con el historial de la conversación, extrae las entidades y elige una herramienta si hace falta.
+1. **Planificador.** Una sola llamada al modelo decide la intención (consultar o aprender), reescribe la pregunta con el historial de la conversación, extrae las entidades y elige una herramienta si hace falta. Las peticiones de investigar a fondo, de pensar y las preguntas sobre lo que puede hacer se reconocen sin el modelo, y nunca se toman por algo que aprender.
 2. **Memoria.** Recupera las relaciones del grafo y los pasajes relevantes (búsqueda semántica con embeddings y búsqueda de texto completo).
 3. **Investigación.** Busca en SearXNG y responde citando las fuentes solo si la memoria no nombra nada de lo preguntado, si el modelo indica que lo que recuerda no alcanza, o si pides expresamente buscar en internet. Si la memoria sabe algo, responde con ella y refuerza lo que usó.
 4. **Aprendizaje.** En segundo plano extrae hechos de las fuentes, los valida contra ellas y consolida solo los verificados. El texto de las fuentes se guarda como pasajes.
@@ -176,7 +178,17 @@ La próxima vez que preguntes por el grafeno responderá desde su memoria, citan
 >
 > *C(49,6) = 13983816 (exacto)*
 
-**5. Lanza una investigación profunda.** Pulsa **Investigar** en el panel, escribe un objetivo (por ejemplo, *¿Quién descubrió la penicilina y en qué año?*) y sigue en vivo las preguntas, las fuentes y las hipótesis.
+**5. Lanza una investigación profunda.** Pídela en el chat:
+
+> Investiga a fondo todo sobre la historia de Python, sus usos y su utilidad.
+
+El chat muestra el avance en vivo y, al terminar, la conclusión con sus fuentes; mientras tanto puedes seguir conversando. También puedes pulsar **Investigar** en el panel, escribir un objetivo y seguir las preguntas, las fuentes y las hipótesis.
+
+**6. Pídele que piense.** Para crear algo en vez de buscar un dato:
+
+> Imagina una app para aprender idiomas conectando lo que sabes.
+
+Escribe a la vista tres pasos: las ideas, cómo se conectan y el resultado.
 
 ## Guía de uso
 
@@ -284,11 +296,11 @@ El botón **Cerebros** del panel muestra los motores encontrados (Ollama, LM Stu
 
 Cada cerebro tiene un **nivel** que sale de su tamaño y decide cuánto se le pide:
 
-| Nivel | Modelos | Respuestas de hasta | Pasajes en el prompt | Rondas al investigar |
-|-------|---------|---------------------|----------------------|----------------------|
-| Ligero | 4B o menos | 384 tokens | 3 | 3 |
-| Medio | 5 a 14B | 768 tokens | 5 | 3 |
-| Avanzado | 15B o más | 1536 tokens | 8 | 4 |
+| Nivel | Modelos | Respuestas de hasta | Pasajes en el prompt | Rondas al investigar | Conclusión | Al pensar |
+|-------|---------|---------------------|----------------------|----------------------|------------|-----------|
+| Ligero | 4B o menos | 384 tokens | 3 | 3 | 2 a 5 frases | 3 ideas, resultado de 800 tokens |
+| Medio | 5 a 14B | 768 tokens | 5 | 3 | 1 o 2 párrafos | 4 ideas, resultado de 1400 tokens |
+| Avanzado | 15B o más | 1536 tokens | 8 | 4 | hasta 4 párrafos | 5 ideas, resultado de 2400 tokens |
 
 Un modelo muy comprimido (1-2 bits por peso) baja un nivel, y el nivel se puede fijar a mano. **Probar** comprueba un cerebro antes de usarlo: si devuelve el JSON que necesitan el planificador y la extracción, si responde en streaming, su velocidad y si razona siempre. **Usar estos cerebros** los cambia sin reiniciar y guarda la elección en `cerebros.json`.
 
@@ -298,15 +310,25 @@ Funciona con modelos que razonan: se les pide no razonar cuando lo admiten y, a 
 
 ### Investigación profunda
 
-Para preguntas que piden más que un dato. Trabaja en segundo plano, por rondas:
+Para preguntas que piden más que un dato. Se lanza desde el botón **Investigar** o desde el chat con frases como «investiga a fondo…», «quiero que investigues todo sobre…» o «aprende todo sobre…»; el cerebro rápido redacta el objetivo con el historial de la conversación, así que «el primer objetivo» o «este tema» se entienden. «Investiga en internet…» sin más es una búsqueda rápida. Trabaja en segundo plano, por rondas:
 
 1. **Preguntas:** divide el objetivo en preguntas de búsqueda; en cada ronda pregunta por lo que sigue sin resolver.
 2. **Fuentes:** busca cada pregunta y numera las fuentes `[n]`.
 3. **Hipótesis:** propone respuestas posibles.
 4. **Evidencias:** busca a favor y en contra de cada hipótesis y la juzga como *apoyada*, *refutada* o *sin confirmar*.
-5. **Conclusión:** cuando una hipótesis queda apoyada con certeza ≥ 0,7, o se agotan las rondas (3 por defecto, hasta 5), redacta la conclusión con citas y aprende lo verificado.
+5. **Conclusión:** cuando todas las hipótesis están decididas y alguna quedó apoyada con certeza ≥ 0,7, o se agotan las rondas (las del nivel del cerebro profundo, hasta 5), redacta la conclusión con citas y aprende lo verificado. Si la pediste desde el chat, la conclusión entra en la conversación para seguir hablando de ella.
 
 Un veredicto solo cuenta si cita fuentes que el sistema le mostró, con certeza suficiente y sin fuentes en conflicto; ante la duda queda *sin confirmar*. Solo corre una investigación a la vez, su estado se guarda tras cada paso y el chat mantiene la prioridad sobre el modelo.
+
+### Modo pensar
+
+Cuando pides crear o imaginar («piensa en…», «imagina…», «crea un sistema…», «diseña…», «¿qué se te ocurre para…?»), el cerebro profundo trabaja en tres pasos, cada uno sobre el anterior:
+
+1. **Ideas:** propone ideas distintas que conectan lo que sabe con algo nuevo.
+2. **Conexiones:** elige las mejores y explica cómo encajan y en qué orden se construyen.
+3. **Resultado:** construye la propuesta completa: estructura, piezas, funcionamiento, primeros pasos y, si es software, los fragmentos de código esenciales.
+
+El material es su memoria sobre el tema; si no sabe nada, hace antes una búsqueda rápida y aprende de ella en segundo plano. Los datos que toma de las fuentes van citados `[n]`; lo demás son ideas suyas. Las ideas se guardan como pasajes «Ideas propias (sin verificar)», que luego puedes consultar, pero no vuelven a usarse como material al pensar, para que no se repita.
 
 ### Conectores externos
 
@@ -394,6 +416,7 @@ SynaptoCore/
 │   ├── truth_filter.rs      # SearXNG y validación de afirmaciones
 │   ├── research.rs          # aprendizaje a partir de fuentes
 │   ├── investigation.rs     # investigación profunda
+│   ├── thinking.rs          # modo pensar: ideas, conexiones y resultado
 │   ├── math_tools.rs        # calculadora, conjeturas y sucesiones
 │   ├── connectors.rs        # conectores HTTP declarativos
 │   ├── importer.rs          # importación por lotes

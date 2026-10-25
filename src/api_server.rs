@@ -66,11 +66,12 @@ use crate::federated_memory::{self, FederationError};
 use crate::investigation::{self, Investigation, InvestigationStatus};
 use crate::llm_bridge::{
     classify_answer_head, AnswerHead, AnswerMode, BoxedTokenStream, BridgeError, ExtractionResult, Intent,
-    LlmBackend, NeuralBridge, Plan, PreparedAnswer,
+    LlmBackend, NeuralBridge, Plan, PreparedAnswer, Task,
 };
 use crate::memory_graph::{GraphSnapshot, InvestigationSummary, MemoryGraph, Passage, TraversalDirection};
 use crate::priority::{BackgroundLlm, CognitivePriority};
 use crate::research;
+use crate::thinking::{self, Step};
 use crate::tools::ToolRegistry;
 use crate::truth_filter::{BoxedSearch, SearchHit};
 use crate::types::current_unix_ts;
@@ -302,7 +303,11 @@ fn save_investigation(g: &MemoryGraph, inv: &Investigation) -> Result<(), Memory
 /// cede el turno al chat (Paso 28). Tras cada paso guarda el estado y emite
 /// un evento; la cancelación llega por la base: si el estado guardado ya no
 /// es «running», el motor se detiene en el siguiente paso.
-fn spawn_investigation(deps: LearnDeps, mut inv: Investigation) {
+/// Paso 33: conversación (sesiones e id) a la que vuelve la conclusión de
+/// una investigación pedida desde el chat.
+type ChatFollowUp = Option<(Arc<SessionManager>, String)>;
+
+fn spawn_investigation(deps: LearnDeps, mut inv: Investigation, chat: ChatFollowUp) {
     let Some(search) = deps.search.clone() else { return };
     tokio::task::spawn_blocking(move || {
         let llm: Arc<dyn LlmBackend + Send + Sync> =
@@ -335,7 +340,26 @@ fn spawn_investigation(deps: LearnDeps, mut inv: Investigation) {
                 eprintln!("[investigación] No se pudo guardar el estado final: {e}");
             }
         }
+        // Paso 33: la conclusión entra en la conversación que la pidió, para
+        // poder seguir hablando de ella.
+        if let (Some((sessions, sid)), Some(conclusion)) = (chat, inv.conclusion.as_ref()) {
+            let text = format!("Conclusión de la investigación «{}»: {conclusion}", inv.objective);
+            sessions.push(&sid, ChatMessage::assistant(&thinking::for_history(&text)));
+        }
     });
+}
+
+/// Guarda una investigación nueva si no hay otra en marcha (Paso 28; desde
+/// el chat, Paso 33). `None` si ya corre una.
+fn queue_investigation(graph: &Mutex<MemoryGraph>, objective: &str, rounds: u32) -> Result<Option<Investigation>, ApiError> {
+    let objective: String = objective.trim().chars().take(MAX_OBJECTIVE_CHARS).collect();
+    let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
+    if g.running_investigation()?.is_some() {
+        return Ok(None);
+    }
+    let inv = Investigation::new(&objective, rounds);
+    save_investigation(&g, &inv)?;
+    Ok(Some(inv))
 }
 
 /// Fuentes citables para el cliente: `{n, title, url}` en el orden de [n].
@@ -684,6 +708,19 @@ pub async fn handle_query_stream(
             tool:     Option<String>,
             timings:  Timings,
         },
+        /// Paso 33: investigación a fondo en segundo plano (`None`: ya
+        /// corre otra).
+        Investigate {
+            started: Option<Investigation>,
+            timings: Timings,
+        },
+        /// Paso 33: modo pensar, con su material y lo hallado en la web.
+        Think {
+            plan:     Plan,
+            prepared: PreparedAnswer,
+            web:      Vec<SearchHit>,
+            timings:  Timings,
+        },
     }
 
     let routed_result = tokio::task::spawn_blocking(move || -> Result<RoutedStream, ApiError> {
@@ -705,6 +742,29 @@ pub async fn handle_query_stream(
                 .map_err(ApiError::from)?;
             let timings = Timings { plan_ms, prepare_ms: t_prepare.elapsed().as_millis() };
             return Ok(RoutedStream::Learn(extract_res, timings));
+        }
+
+        // Paso 33: lo que sabe hacer, pensar o investigar a fondo.
+        let timings = |t: Instant| Timings { plan_ms, prepare_ms: t.elapsed().as_millis() };
+        match plan.task {
+            Task::AboutSelf => {
+                let prepared = bridge.prepare_about_self(&prompt_for_bridge, &history_text);
+                let tokens = Some(bridge.answer_stream(&prepared).map_err(ApiError::from)?);
+                return Ok(RoutedStream::Answer { plan, prepared, tokens, tool: None, timings: timings(t_prepare) });
+            }
+            Task::Think => {
+                let plan = Plan { rewritten_query: bridge.objective(&plan, &prompt_for_bridge, &history_text), ..plan };
+                let (prepared, web) = bridge.prepare_thinking(graph, &plan).map_err(ApiError::from)?;
+                return Ok(RoutedStream::Think { plan, prepared, web, timings: timings(t_prepare) });
+            }
+            // Sin buscador no hay investigación: se responde como siempre.
+            Task::Investigate if deps_pre.search.is_some() => {
+                let rounds = deps_pre.deep.scope().investigation_rounds;
+                let objective = bridge.objective(&plan, &prompt_for_bridge, &history_text);
+                let started = queue_investigation(graph, &objective, rounds)?;
+                return Ok(RoutedStream::Investigate { started, timings: timings(t_prepare) });
+            }
+            Task::Investigate | Task::Answer => {}
         }
 
         // Paso 24: la charla no pasa por la memoria.
@@ -737,6 +797,10 @@ pub async fn handle_query_stream(
         }).to_string());
         let researching_event = |query: &str| Event::default().data(serde_json::json!({
             "status": "researching", "query": query, "session_id": sid, "done": false, "intent": "query"
+        }).to_string());
+        let thinking_event = |step: Step| Event::default().data(serde_json::json!({
+            "status": "thinking", "step": step.as_str(), "label": step.status(), "session_id": sid,
+            "done": false, "intent": "query"
         }).to_string());
 
         match routed {
@@ -785,6 +849,116 @@ pub async fn handle_query_stream(
                     "done": true,
                     "intent": "learn",
                     "timings": { "plan_ms": timings.plan_ms, "extract_ms": timings.prepare_ms }
+                }).to_string();
+                yield Ok(Event::default().data(done_payload));
+            }
+            RoutedStream::Investigate { started, timings } => {
+                let text = match &started {
+                    Some(inv) => format!(
+                        "Me pongo a investigar a fondo: «{}». Haré hasta {} rondas de búsqueda con el cerebro \
+                         profundo, en segundo plano: aquí verás el avance y, al terminar, la conclusión con sus \
+                         fuentes. Mientras tanto puedes seguir conversando.",
+                        inv.objective, inv.max_rounds
+                    ),
+                    None => "Ya hay una investigación en marcha. Cuando termine, pídemelo de nuevo; también puedes \
+                             cancelarla en el panel Investigaciones.".to_string(),
+                };
+                yield Ok(token_event(&text));
+                sessions.push(&sid, ChatMessage::user(&prompt_for_history));
+                sessions.push(&sid, ChatMessage::assistant(&text));
+                let investigation_id = started.as_ref().map(|inv| inv.id.clone());
+                if let Some(inv) = started {
+                    spawn_investigation(learn_deps, inv, Some((Arc::clone(&sessions), sid.clone())));
+                }
+                let done_payload = serde_json::json!({
+                    "token": "",
+                    "session_id": sid,
+                    "done": true,
+                    "intent": "investigate",
+                    "answered_from": "investigation",
+                    "investigation_id": investigation_id,
+                    "timings": { "plan_ms": timings.plan_ms, "context_ms": timings.prepare_ms }
+                }).to_string();
+                yield Ok(Event::default().data(done_payload));
+            }
+            RoutedStream::Think { plan, prepared, web, timings } => {
+                use futures_util::StreamExt;
+                // Tres pasos del cerebro profundo, cada uno sobre el anterior,
+                // escritos en el chat según llegan.
+                let scope = deps.deep.scope();
+                let objective = plan.rewritten_query.clone();
+                let mut steps: Vec<String> = Vec::new();
+                let mut full_response = String::new();
+                for step in Step::ALL {
+                    full_response.push_str(step.heading());
+                    yield Ok(token_event(step.heading()));
+                    yield Ok(thinking_event(step));
+                    let user_prompt = step.user_prompt(&objective, &prepared.user_prompt, &steps, &scope);
+                    let max_tokens = step.max_tokens(&scope);
+                    let deep = Arc::clone(&deps.deep);
+                    let started = tokio::task::spawn_blocking(move || {
+                        deep.stream_synthesis(
+                            crate::prompts::think_system_prompt(), &user_prompt, max_tokens, thinking::THINK_TEMPERATURE,
+                        )
+                    }).await;
+                    let mut tokens = match started {
+                        Ok(Ok(tokens)) => tokens,
+                        Ok(Err(e)) => {
+                            yield Ok(error_event(e.to_string()));
+                            return;
+                        }
+                        Err(e) => {
+                            yield Ok(error_event(format!("Join error: {e}")));
+                            return;
+                        }
+                    };
+                    let mut text = String::new();
+                    while let Some(item) = tokens.next().await {
+                        match item {
+                            Ok(token) => {
+                                text.push_str(&token);
+                                full_response.push_str(&token);
+                                yield Ok(token_event(&token));
+                            }
+                            Err(e) => {
+                                yield Ok(error_event(e.to_string()));
+                                return;
+                            }
+                        }
+                    }
+                    steps.push(text);
+                }
+
+                // Las ideas quedan como propias; la memoria usada se refuerza.
+                let graph = Arc::clone(&graph_for_hebb);
+                let ideas = steps.first().cloned().unwrap_or_default();
+                let edge_ids = prepared.context_edge_ids.clone();
+                let passage_ids = prepared.passage_ids.clone();
+                let goal = objective.clone();
+                let (reinforced, ideas_saved) = tokio::task::spawn_blocking(move || {
+                    let reinforced = crate::llm_bridge::reinforce_context(&*graph, &edge_ids, &passage_ids);
+                    (reinforced, thinking::save_ideas(&*graph, &goal, &ideas))
+                }).await.unwrap_or((0, 0));
+
+                sessions.push(&sid, ChatMessage::user(&prompt_for_history));
+                sessions.push(&sid, ChatMessage::assistant(&thinking::for_history(&full_response)));
+
+                let learning = !web.is_empty() && learn_deps.search.is_some();
+                if learning {
+                    spawn_research_learning(learn_deps, objective, web);
+                }
+                let done_payload = serde_json::json!({
+                    "token": "",
+                    "session_id": sid,
+                    "done": true,
+                    "intent": "query",
+                    "answered_from": prepared.mode.as_str(),
+                    "sources": sources_json(&prepared.sources),
+                    "learning": learning,
+                    "tool": null,
+                    "reinforced_edges": reinforced,
+                    "ideas_saved": ideas_saved,
+                    "timings": { "plan_ms": timings.plan_ms, "context_ms": timings.prepare_ms }
                 }).to_string();
                 yield Ok(Event::default().data(done_payload));
             }
@@ -1234,18 +1408,13 @@ pub async fn handle_start_investigation(
         return Err(ApiError::unavailable("Investigar necesita búsqueda web: configura SEARXNG_URL"));
     }
     // Paso 33a: las rondas por defecto, según el alcance del cerebro profundo.
-    let inv = Investigation::new(objective, req.rounds.unwrap_or(state.deep_llm().scope().investigation_rounds));
+    let rounds = req.rounds.unwrap_or(state.deep_llm().scope().investigation_rounds);
     let graph = Arc::clone(&state.graph);
-    let initial = inv.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-        let g = graph.lock().map_err(|_| ApiError::internal("Mutex del grafo envenenado"))?;
-        if g.running_investigation()?.is_some() {
-            return Err(ApiError::conflict("Ya hay una investigación en marcha; espera a que termine o cancélala"));
-        }
-        Ok(save_investigation(&g, &initial)?)
-    })
-    .await??;
-    spawn_investigation(LearnDeps::from_state(&state), inv.clone());
+    let objective = objective.to_string();
+    let inv = tokio::task::spawn_blocking(move || queue_investigation(&graph, &objective, rounds))
+        .await??
+        .ok_or_else(|| ApiError::conflict("Ya hay una investigación en marcha; espera a que termine o cancélala"))?;
+    spawn_investigation(LearnDeps::from_state(&state), inv.clone(), None);
     Ok((StatusCode::ACCEPTED, Json(inv)))
 }
 
@@ -2183,6 +2352,98 @@ mod tests {
         assert!(text.contains(r#""answered_from":"conversation""#), "{text}");
         assert!(!text.contains("researching"));
         assert!(text.contains(r#""learning":false"#));
+    }
+
+    /// Paso 33: «quiero que investigues todo sobre…» arranca una
+    /// investigación a fondo en segundo plano, con el objetivo que escribe el
+    /// cerebro rápido, y el chat la anuncia con su id.
+    #[tokio::test]
+    async fn test_chat_investigate_starts_a_background_investigation() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = research_state(&graph, vec![
+            r#"{"i":"query","q":"Investigar todo sobre Python","e":["python"],"t":"none","p":{}}"#,
+            "Investigar la historia, el uso y la utilidad de Python.",
+        ], vec!["Python es un lenguaje de programación."]);
+        let sessions = Arc::clone(&state.sessions);
+        let prompt = r#"{"prompt":"quiero investigue todo sobre python historia uso trayetoria utlidad","session_id":"s1"}"#;
+        let (_, body) = send(build_router(state), post_json("/api/v1/chat", prompt)).await;
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(r#""intent":"investigate""#), "{text}");
+        assert!(text.contains(r#""investigation_id":""#), "{text}");
+        assert!(text.contains("Me pongo a investigar a fondo: «Investigar la historia, el uso y la utilidad de Python.»"), "{text}");
+        assert!(!text.contains(r#""intent":"learn""#), "{text}");
+
+        let g = graph.lock().unwrap();
+        let summary = g.investigation_summaries(5).unwrap().remove(0);
+        assert_eq!(summary.objective, "Investigar la historia, el uso y la utilidad de Python.");
+        // Se detiene: el resto de la investigación no es parte de la prueba.
+        g.close_investigation(&summary.id, "cancelled", "Cancelada").unwrap();
+        let history = sessions.get_history("s1");
+        assert!(history[1].content.starts_with("Me pongo a investigar"), "{history:?}");
+    }
+
+    /// Paso 33: con otra investigación en marcha, el chat lo dice y no
+    /// empieza una segunda.
+    #[tokio::test]
+    async fn test_chat_investigate_waits_for_the_running_one() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        save_investigation(&graph.lock().unwrap(), &Investigation::new("otra", 3)).unwrap();
+        let state = research_state(&graph, vec![
+            r#"{"i":"query","q":"Investiga a fondo BitNet","e":["bitnet"],"t":"none","p":{}}"#,
+            "Investigar BitNet.",
+        ], vec!["no debería buscarse"]);
+        let (_, body) = send(build_router(state), post_json("/api/v1/chat", r#"{"prompt":"Investiga a fondo BitNet"}"#)).await;
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("Ya hay una investigación en marcha"), "{text}");
+        assert!(text.contains(r#""investigation_id":null"#), "{text}");
+        assert_eq!(graph.lock().unwrap().investigation_summaries(5).unwrap().len(), 1);
+    }
+
+    /// Paso 33: «crea un sistema con tu imaginación…» no se memoriza: el
+    /// cerebro profundo propone ideas, las conecta y construye el resultado,
+    /// todo visible en el chat, y las ideas quedan como propias.
+    #[tokio::test]
+    async fn test_chat_think_writes_three_steps_and_saves_the_ideas() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = research_state(&graph, vec![
+            // El 2B lo tomaba por una enseñanza.
+            r#"{"i":"learn","q":"usuario crea sistema","e":["sistema"],"t":"none","p":{}}"#,
+            "Crear un sistema avanzado en Python.",
+            "1. **Agenda viva**: tareas que se reordenan solas según la energía del día.",
+            "La agenda viva se apoya en un registro de hábitos.",
+            "Un planificador en Python con dos módulos [1].",
+        ], vec!["Python tiene asyncio para tareas concurrentes."]);
+        let prompt = r#"{"prompt":"crear un sistema detallo con tu imagiacion ve conetando contruyendo hasta fianlizar un sistema avanzando en python"}"#;
+        let (_, body) = send(build_router(state), post_json("/api/v1/chat", prompt)).await;
+        let text = String::from_utf8(body).unwrap();
+        assert!(!text.contains(r#""intent":"learn""#), "{text}");
+        assert!(text.contains(r#""status":"thinking""#), "{text}");
+        for part in ["### 1 · Ideas", "Agenda viva", "### 2 · Cómo se conectan", "### 3 · Resultado", "dos módulos [1]"] {
+            assert!(text.contains(part), "falta «{part}»: {text}");
+        }
+        assert!(text.contains(r#""answered_from":"thought""#), "{text}");
+        assert!(text.contains(r#""ideas_saved":1"#), "{text}");
+        assert!(text.contains(r#""sources":[{"n":1"#), "sin memoria, buscó en la web: {text}");
+        let g = graph.lock().unwrap();
+        let (passage, _) = g.relevant_passages("agenda viva", None, 3).unwrap().remove(0);
+        assert_eq!(passage.title, "Ideas propias (sin verificar): Crear un sistema avanzado en Python.");
+    }
+
+    /// Paso 33: «¿tiene acceso a GitHub…?» lo responde lo que SynaptoCore sabe
+    /// hacer, no una búsqueda sobre los permisos de GitHub.
+    #[tokio::test]
+    async fn test_chat_capability_question_is_answered_from_what_it_can_do() {
+        let graph = Arc::new(Mutex::new(MemoryGraph::open(":memory:").unwrap()));
+        let state = research_state(&graph, vec![
+            r#"{"i":"query","q":"¿Tienes acceso a GitHub?","e":["github"],"t":"none","p":{}}"#,
+            "No puedo entrar en GitHub, pero puedo buscar en la web lo que sea público.",
+        ], vec!["no debería buscarse"]);
+        let prompt = r#"{"prompt":"tiene acesso a revisar repositorio de gihut si te doy nombre"}"#;
+        let (_, body) = send(build_router(state), post_json("/api/v1/chat", prompt)).await;
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(r#""answered_from":"self""#), "{text}");
+        assert!(!text.contains("researching"), "{text}");
+        assert!(text.contains("No puedo entrar en GitHub"), "{text}");
     }
 
     // ── Tests: POST /api/v1/federation/export ───────────────

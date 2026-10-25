@@ -74,6 +74,7 @@ data: {"token":"","session_id":"…","done":true,"intent":"query","answered_from
 | Evento | Cuándo |
 |--------|--------|
 | `status: "researching"` | La memoria no cubre la pregunta y se va a buscar en la web |
+| `status: "thinking"` | Modo pensar: empieza un paso (`step`: `ideas`, `conexiones` o `resultado`; `label`: texto para mostrar) |
 | `token` | Fragmento de la respuesta |
 | `done: true` | Fin de la respuesta, con su origen y sus fuentes |
 | `error` | Fallo; cierra el stream |
@@ -82,17 +83,27 @@ Campos del evento final:
 
 | Campo | Descripción |
 |-------|-------------|
-| `answered_from` | `memory`, `web`, `tool`, `general` (conocimiento general no verificado) o `conversation` |
+| `answered_from` | `memory`, `web`, `tool`, `general` (conocimiento general no verificado), `conversation`, `self` (lo que SynaptoCore puede hacer), `thought` (modo pensar) o `investigation` |
 | `sources` | Fuentes citadas como `[n]` en la respuesta: web o pasajes de la memoria |
 | `learning` | `true` si se está aprendiendo de las fuentes en segundo plano |
 | `tool` | Herramienta usada, si la hubo |
 | `reinforced_edges` | Relaciones de la memoria reforzadas por esta respuesta |
+| `ideas_saved` | Modo pensar: pasajes de ideas propias guardados |
 
 Cuando el mensaje enseña algo (`intent: "learn"`), el primer evento confirma lo aprendido e incluye `triples_count`, `nodes_created`, `edges_created` y `passages_saved`.
 
+Cuando pide investigar a fondo, el chat empieza una investigación en segundo plano (si hay buscador configurado y no corre otra) y lo anuncia. El evento final lleva `intent: "investigate"` e `investigation_id`, que es `null` si ya había otra en marcha; el avance se consulta en [`GET /api/v1/investigations/{id}`](#get-apiv1investigationsid). Al terminar, la conclusión se añade al historial de la sesión.
+
+```text
+data: {"token":"Me pongo a investigar a fondo: «…». Haré hasta 4 rondas…","session_id":"…","done":false,"intent":"query"}
+data: {"token":"","session_id":"…","done":true,"intent":"investigate","answered_from":"investigation","investigation_id":"7e22…","timings":{"plan_ms":740,"context_ms":376}}
+```
+
+En el modo pensar, cada paso llega como un encabezado (`### 1 · Ideas`, `### 2 · Cómo se conectan`, `### 3 · Resultado`) seguido de su texto en tokens, con un evento `status: "thinking"` al empezar cada uno.
+
 ### `POST /api/v1/query`
 
-La misma consulta, con la respuesta completa en un solo JSON. Siempre responde como consulta (no aprende del mensaje).
+La misma consulta, con la respuesta completa en un solo JSON. Siempre responde como consulta (no aprende del mensaje). El modo pensar devuelve sus tres pasos juntos; una petición de investigar a fondo se responde como una pregunta, sin investigación en segundo plano.
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/query \

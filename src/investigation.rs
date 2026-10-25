@@ -217,11 +217,15 @@ impl Investigation {
             .join("\n")
     }
 
-    /// ¿Alguna hipótesis apoyada con certeza suficiente?
+    /// ¿Está todo decidido? Alguna hipótesis apoyada con certeza suficiente
+    /// y ninguna sin decidir. Paso 33: antes bastaba una apoyada, y
+    /// «investiga todo sobre Python» paraba en la primera de cuatro rondas
+    /// con otra hipótesis sin confirmar.
     fn resolved(&self) -> bool {
         self.hypotheses
             .iter()
             .any(|h| h.verdict == Verdict::Supported && h.confidence >= ACCEPT_CONFIDENCE)
+            && self.hypotheses.iter().all(|h| matches!(h.verdict, Verdict::Supported | Verdict::Refuted))
     }
 }
 
@@ -639,7 +643,9 @@ fn conclude<L: LlmBackend>(llm: &L, inv: &Investigation) -> Result<String, Bridg
         if cited.is_empty() { "(ninguna citada)".to_string() } else { inv.format_sources(&cited) }
     );
     let any_supported = inv.hypotheses.iter().any(|h| h.verdict == Verdict::Supported);
-    let raw = llm.complete(prompts::investigation_conclusion_system_prompt(any_supported), &user, llm.scope().conclusion_tokens, 0.3)?;
+    let scope = llm.scope();
+    let system = prompts::investigation_conclusion_system_prompt(any_supported, scope.conclusion_length());
+    let raw = llm.complete(&system, &user, scope.conclusion_tokens, 0.3)?;
     let text = strip_think(&raw);
     Ok(if text.is_empty() {
         "No se pudo redactar la conclusión; revisa las hipótesis y sus fuentes.".into()
@@ -774,6 +780,22 @@ mod tests {
         assert!(inv.questions.contains(&"Alexander Fleming penicilina 1928".to_string()), "la 2.ª ronda reformula");
         assert!(inv.hypotheses.iter().all(|h| h.verdict == Verdict::Uncertain));
         assert!(inv.learned.is_empty(), "sin hipótesis apoyadas no se aprende nada");
+    }
+
+    /// Paso 33: con una hipótesis apoyada y otra sin decidir, sigue
+    /// investigando en vez de cerrar en la primera ronda.
+    #[test]
+    fn test_one_supported_hypothesis_does_not_close_while_another_is_open() {
+        let graph = MemoryGraph::open(":memory:").unwrap();
+        let llm = llm(vec![
+            ("Alexander Fleming descubrió", r#"{"v": "apoya", "c": 0.9, "a": [1], "x": [], "r": "La fuente 1 lo afirma."}"#),
+        ]);
+        let mut inv = Investigation::new("¿Quién descubrió la penicilina?", 2);
+        run(&llm, &FixedSearch::default(), &graph, &mut inv, &[], &mut |_, _: &str| true).unwrap();
+
+        assert_eq!(inv.status, InvestigationStatus::Done);
+        assert_eq!(inv.round, 2, "la hipótesis de Pasteur seguía sin decidir");
+        assert_eq!(inv.hypotheses[0].verdict, Verdict::Supported);
     }
 
     #[test]

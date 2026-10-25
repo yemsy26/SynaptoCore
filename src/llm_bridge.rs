@@ -96,6 +96,10 @@ const EXTRACTION_TEMPERATURE: f32 = 0.1;
 /// Temperatura para síntesis: 0.3 = algo de fluidez, pocos inventos.
 const SYNTHESIS_TEMPERATURE: f32 = 0.3;
 
+/// Paso 33: tokens y caracteres del objetivo de una investigación o de pensar.
+const OBJECTIVE_MAX_TOKENS: i32 = 120;
+const MAX_OBJECTIVE_CHARS: usize = 500;
+
 /// Tokens de salida del planificador (Paso 22). Un plan típico ocupa
 /// 40-90 tokens; el margen cubre reescrituras largas.
 const PLANNER_MAX_TOKENS: i32 = 256;
@@ -181,6 +185,23 @@ pub struct Plan {
     /// Paso 32: pregunta por el propio usuario («¿cómo me llamo?»). La
     /// responde lo que contó de sí (nodo `usuario`), nunca la web.
     pub about_user:      bool,
+    /// Paso 33: investigar a fondo, pensar o explicar lo que puede hacer.
+    pub task:            Task,
+}
+
+/// Paso 33: lo que pide el mensaje, además de una respuesta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Task {
+    /// Responder: memoria, herramienta o búsqueda web rápida.
+    #[default]
+    Answer,
+    /// «Investiga todo sobre…»: investigación de varias rondas con el
+    /// cerebro profundo, en segundo plano.
+    Investigate,
+    /// «Piensa, imagina, crea…»: ideas propias que conectan lo que sabe.
+    Think,
+    /// «¿Tienes acceso a…?»: lo que SynaptoCore puede hacer de verdad.
+    AboutSelf,
 }
 
 impl Plan {
@@ -196,6 +217,7 @@ impl Plan {
             fallback:        true,
             web_requested:   asks_for_web(message),
             about_user,
+            task:            requested_task(message),
         }
     }
 
@@ -204,6 +226,7 @@ impl Plan {
     /// entidades no cuenta: sin planificador no se sabe qué es.
     pub fn is_conversation(&self) -> bool {
         self.intent == Intent::Query
+            && self.task == Task::Answer
             && self.tool.is_none()
             && (is_small_talk(&self.rewritten_query) || (self.entities.is_empty() && !self.fallback))
     }
@@ -294,6 +317,10 @@ pub enum AnswerMode {
     General,
     /// Saludos y charla.
     Conversation,
+    /// Paso 33: lo que SynaptoCore puede hacer («¿tienes acceso a…?»).
+    Capabilities,
+    /// Paso 33: ideas propias en tres pasos (modo pensar).
+    Think,
 }
 
 impl AnswerMode {
@@ -304,6 +331,8 @@ impl AnswerMode {
             Self::Research     => "web",
             Self::General      => "general",
             Self::Conversation => "conversation",
+            Self::Capabilities => "self",
+            Self::Think        => "thought",
         }
     }
 
@@ -314,6 +343,8 @@ impl AnswerMode {
             Self::Research     => prompts::research_answer_system_prompt(),
             Self::General      => prompts::general_answer_system_prompt(),
             Self::Conversation => prompts::conversation_system_prompt(),
+            Self::Capabilities => prompts::capabilities_system_prompt(),
+            Self::Think        => prompts::think_system_prompt(),
         }
     }
 }
@@ -388,6 +419,23 @@ pub struct PreparedAnswer {
 }
 
 impl PreparedAnswer {
+    /// Sin memoria, fuentes ni herramienta: solo el prompt.
+    fn bare(mode: AnswerMode, user_prompt: String) -> Self {
+        Self {
+            user_prompt,
+            context_edge_ids: Vec::new(),
+            mode,
+            uncovered:        Vec::new(),
+            memory_context:   String::new(),
+            sources:          Vec::new(),
+            direct:           None,
+            passage_ids:      Vec::new(),
+            memory_relevant:  false,
+            web_requested:    false,
+            about_user:       false,
+        }
+    }
+
     /// Prompt del sistema: el del modo, salvo que la memoria traiga pasajes
     /// numerados que citar (Paso 30).
     fn system_prompt(&self) -> &'static str {
@@ -681,7 +729,7 @@ impl<B: LlmBackend> NeuralBridge<B> {
     }
 
     /// Cerebro que redacta las respuestas.
-    fn writer(&self) -> &dyn LlmBackend {
+    pub(crate) fn writer(&self) -> &dyn LlmBackend {
         match &self.deep {
             Some(deep) => deep.as_ref(),
             None => &self.backend,
@@ -1012,19 +1060,94 @@ impl<B: LlmBackend> NeuralBridge<B> {
     pub fn prepare_conversation(&self, message: &str, history_text: &str) -> PreparedAnswer {
         let history = history_text.trim();
         let history = if history.is_empty() { "(vacío)" } else { history };
-        PreparedAnswer {
-            user_prompt:      format!("Historial:\n{history}\n\nUsuario: {}", message.trim()),
-            context_edge_ids: Vec::new(),
-            mode:             AnswerMode::Conversation,
-            uncovered:        Vec::new(),
-            memory_context:   String::new(),
-            sources:          Vec::new(),
-            direct:           None,
-            passage_ids:      Vec::new(),
-            memory_relevant:  false,
-            web_requested:    false,
-            about_user:       false,
+        PreparedAnswer::bare(AnswerMode::Conversation, format!("Historial:\n{history}\n\nUsuario: {}", message.trim()))
+    }
+
+    /// Paso 33: el objetivo de una investigación o de pensar, en una frase
+    /// autocontenida. Lo escribe el cerebro rápido con el historial: la
+    /// reescritura del plan no sirve si lo tomó por enseñanza («soy un máster
+    /// en esto, quiero aprenda todo sobre el primer objetivo» quedaba en
+    /// «Python es el primer objetivo»), y resume las peticiones largas.
+    pub fn objective(&self, plan: &Plan, message: &str, history_text: &str) -> String {
+        let history = history_text.trim();
+        let history = if history.is_empty() { "(vacío)" } else { history };
+        let written = self.backend
+            .complete(
+                prompts::objective_system_prompt(plan.task == Task::Think),
+                &prompts::format_objective_user_prompt(history, message.trim()),
+                OBJECTIVE_MAX_TOKENS,
+                0.0,
+            )
+            .unwrap_or_else(|e| {
+                log::warn!("Sin objetivo del modelo ({e}); se usa la reescritura del plan");
+                String::new()
+            });
+        let line = written.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        let line = line.strip_prefix("Objetivo:").unwrap_or(line);
+        let line = line.trim().trim_matches(|c| matches!(c, '"' | '«' | '»' | '*')).trim();
+        let objective = if line.chars().count() >= 8 { line } else { plan.rewritten_query.trim() };
+        objective.chars().take(MAX_OBJECTIVE_CHARS).collect()
+    }
+
+    /// Preguntas por lo que SynaptoCore puede hacer (Paso 33). Las responde
+    /// la lista real de capacidades y herramientas, no la web: «¿tienes
+    /// acceso a GitHub?» se investigaba y respondía con los permisos de GitHub.
+    pub fn prepare_about_self(&self, message: &str, history_text: &str) -> PreparedAnswer {
+        let tools: Vec<(String, String)> = self.tool_registry.as_ref().map_or_else(Vec::new, |registry| {
+            registry.names()
+                .into_iter()
+                .filter_map(|name| registry.get(&name).map(|t| (name.clone(), t.description().to_string())))
+                .collect()
+        });
+        let history = history_text.trim();
+        let history = if history.is_empty() { "(vacío)" } else { history };
+        PreparedAnswer::bare(AnswerMode::Capabilities, format!(
+            "Lo que puedes hacer:\n{}\n\nHistorial:\n{history}\n\nUsuario: {}",
+            prompts::format_capabilities(&tools, self.search.is_some()),
+            message.trim()
+        ))
+    }
+
+    /// **Modo pensar** (Paso 33): el material para crear ideas. La memoria
+    /// sobre el objetivo y, si no sabe nada de él y hay buscador, una
+    /// búsqueda rápida. Devuelve también lo hallado en la web, para aprender
+    /// de ello después como en una respuesta investigada.
+    pub fn prepare_thinking<G: GraphAccess>(
+        &self,
+        graph: &G,
+        plan:  &Plan,
+    ) -> Result<(PreparedAnswer, Vec<SearchHit>), BridgeError> {
+        let memory_plan = Plan { tool: None, about_user: false, ..plan.clone() };
+        let mut prepared = self.prepare_answer(graph, &memory_plan)?;
+        // Las ideas propias de otras veces no son material: el modelo las
+        // repetía casi al pie de la letra en vez de pensar de nuevo.
+        let own = |title: &str| title.starts_with(crate::thinking::IDEAS_TITLE);
+        prepared.passage_ids = prepared.passage_ids
+            .iter()
+            .zip(&prepared.sources)
+            .filter(|(_, source)| !own(&source.title))
+            .map(|(id, _)| id.clone())
+            .collect();
+        prepared.sources.retain(|source| !own(&source.title));
+        let known = prepared.memory_relevant
+            && !(prepared.context_edge_ids.is_empty() && prepared.passage_ids.is_empty());
+        let web = if known { Vec::new() } else { self.search_web(&plan.rewritten_query, &plan.entities) };
+        if !known {
+            // Memoria de otros conceptos: ni se usa ni se refuerza.
+            prepared.context_edge_ids.clear();
+            prepared.passage_ids.clear();
+            prepared.sources.clear();
         }
+        prepared.sources.extend(web.iter().cloned());
+        let memory = if known { crate::thinking::without_marks(&prepared.memory_context) } else { "(nada sobre esto)".into() };
+        let sources = if prepared.sources.is_empty() {
+            "(ninguna)".to_string()
+        } else {
+            prompts::format_passages(&prepared.sources)
+        };
+        prepared.user_prompt = format!("Memoria:\n{memory}\n\nFuentes:\n{sources}");
+        prepared.mode = AnswerMode::Think;
+        Ok((prepared, web))
     }
 
     /// ¿Investigar ANTES de responder? Solo en modo memoria (con herramienta
@@ -1192,6 +1315,25 @@ impl<B: LlmBackend> NeuralBridge<B> {
         history_text: &str,
     ) -> Result<(String, PreparedAnswer), BridgeError> {
         let plan = self.plan(question, history_text);
+        match plan.task {
+            Task::AboutSelf => {
+                let prepared = self.prepare_about_self(question, history_text);
+                return Ok((self.answer(&prepared)?, prepared));
+            }
+            Task::Think => {
+                let plan = Plan { rewritten_query: self.objective(&plan, question, history_text), ..plan };
+                let (prepared, _) = self.prepare_thinking(graph, &plan)?;
+                let thought = crate::thinking::run(self.writer(), &plan.rewritten_query, &prepared.user_prompt)?;
+                reinforce_context(graph, &prepared.context_edge_ids, &prepared.passage_ids);
+                if let Some(ideas) = thought.steps.first() {
+                    crate::thinking::save_ideas(graph, &plan.rewritten_query, ideas);
+                }
+                return Ok((thought.text(), prepared));
+            }
+            // Investigar a fondo corre en segundo plano: lo arranca `/chat`;
+            // aquí se responde como cualquier pregunta.
+            Task::Investigate | Task::Answer => {}
+        }
         if plan.is_conversation() {
             let prepared = self.prepare_conversation(question, history_text);
             return Ok((self.answer(&prepared)?, prepared));
@@ -1401,8 +1543,12 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
     // plazo; un falso "query" solo responde. Preguntas y peticiones nunca
     // se memorizan, diga lo que diga el modelo. Paso 32: lo que el usuario
     // cuenta de sí mismo («Mi nombre es…») se aprende aunque el modelo no lo
-    // vea: lo tomaba por conversación y lo buscaba en la web.
+    // vea: lo tomaba por conversación y lo buscaba en la web. Paso 33: lo
+    // que pide investigar o crear tampoco («soy un máster en esto, quiero
+    // aprenda todo sobre…» se memorizaba como «python es primer_objetivo»).
+    let task = requested_task(message);
     let intent = if (text("i", "intent").eq_ignore_ascii_case("learn") || states_about_user(message))
+        && task == Task::Answer
         && !is_question_or_request(message)
         && !opens_without_statement(message)
         && !is_acknowledgement(message)
@@ -1480,7 +1626,7 @@ fn parse_plan(raw: &str, message: &str, registry: Option<&ToolRegistry>) -> Plan
         tool => tool,
     };
 
-    Plan { intent, rewritten_query, entities, tool, fallback: false, web_requested: asks_for_web(message), about_user }
+    Plan { intent, rewritten_query, entities, tool, fallback: false, web_requested: asks_for_web(message), about_user, task }
 }
 
 /// Nodo del grafo que representa a quien escribe (Paso 32): la extracción
@@ -1525,6 +1671,198 @@ fn states_about_user(message: &str) -> bool {
 fn asks_about_user(message: &str) -> bool {
     let words = format!(" {} ", canonical_words(message));
     USER_QUESTIONS.iter().any(|q| words.contains(&format!(" {q} "))) && !states_about_user(message)
+}
+
+/// Lo que puede preceder al verbo de una petición: saludos, conectores y
+/// cortesías («hola, por favor investiga…», «ok, ahora crea…»).
+const REQUEST_PREAMBLE: &[&str] = &[
+    "hola", "oye", "ok", "okay", "vale", "bien", "bueno", "entonces", "ahora", "luego", "despues", "tambien",
+    "ademas", "y", "e", "pues", "porfa", "por", "favor", "tu", "please",
+];
+
+/// Lo que anuncia una petición al sistema: «¿puedes…?», «quiero que…».
+const ASK_LEADS: &[&str] = &[
+    "puedes", "podrias", "podras", "puede", "podria", "quiero", "quisiera", "necesito", "gustaria", "pido",
+    "debes", "deberias",
+];
+
+/// Pedir investigar. Las formas de `INVESTIGATE_LED` también son pasado
+/// («investigué»): cuentan solo tras «quiero (que)», «puedes»…
+const INVESTIGATE_VERBS: &[&str] = &[
+    "investiga", "investigalo", "investigala", "investigalos", "investigalas", "investigame", "investigar",
+    "investigarlo", "investigarla", "profundiza", "profundizar", "indaga", "indagar",
+];
+const INVESTIGATE_LED: &[&str] = &[
+    "investigue", "investigues", "investigara", "investigaras", "profundice", "profundices", "indague", "indagues",
+];
+
+/// Aprender o estudiar: piden investigar si llevan tema («aprende todo
+/// sobre…»); seguidos de «que» enseñan («aprende que el cobre…»).
+const STUDY_VERBS: &[&str] = &["aprende", "aprendete", "estudia", "aprender", "estudiar"];
+const STUDY_LED: &[&str] = &["aprenda", "aprendas", "aprendieras", "estudie", "estudies", "estudiaras"];
+const TOPIC_WORDS: &[&str] = &["sobre", "acerca", "todo", "tema"];
+
+/// Buscar a fondo («busca a fondo…») y «haz una investigación sobre…».
+const SEARCH_VERBS: &[&str] = &["busca", "buscame", "buscar", "averigua", "averiguar"];
+const START_VERBS: &[&str] = &[
+    "haz", "hazme", "realiza", "inicia", "empieza", "comienza", "lanza", "hacer", "realizar", "iniciar",
+];
+const DEPTH_MARKERS: &[&str] = &[
+    "a fondo", "en profundidad", "investigacion profunda", "investigacion completa", "en detalle", "todo sobre",
+    "todo acerca", "todo lo que",
+];
+
+/// Pedir que piense o cree. `CREATE_LED`, solo tras «quiero que»,
+/// «puedes»…: «crees» también es «tú crees».
+const CREATE_VERBS: &[&str] = &[
+    "crea", "creame", "creanos", "diseña", "diseñame", "imagina", "imaginate", "inventa", "inventame", "piensa",
+    "piensalo", "propon", "proponme", "construye", "construyeme", "idea", "ideame", "conecta", "combina",
+    "crear", "diseñar", "imaginar", "inventar", "pensar", "proponer", "construir", "idear", "conectar", "combinar",
+];
+const CREATE_LED: &[&str] = &[
+    "cree", "crees", "diseñe", "diseñes", "imagines", "inventes", "pienses", "propongas", "construyas", "idees",
+    "conectes", "combines",
+];
+const CREATE_PHRASES: &[&str] = &[
+    "con tu imaginacion", "usa tu imaginacion", "lluvia de ideas", "dame ideas", "dame una idea", "se te ocurre",
+    "se te ocurren", "ideas nuevas", "ideas innovadoras", "ideas originales",
+];
+
+/// Verbos que hacen de un infinitivo inicial el sujeto de una afirmación
+/// («Crear empresas es difícil», «Investigar es mi pasión»).
+const COPULAS: &[&str] = &["es", "son", "fue", "era", "sera", "seria", "puede", "requiere"];
+
+/// Un verbo que el mensaje dirige al sistema (Paso 33).
+struct Asked {
+    verb: String,
+    /// Las palabras que le siguen en su frase.
+    rest: Vec<String>,
+    /// Tras «puedes», «quiero (que)»…; si no, abre la frase.
+    led:  bool,
+    /// «Quiero aprender…»: un deseo propio, no una petición al sistema.
+    own:  bool,
+}
+
+impl Asked {
+    /// Infinitivo que abre una afirmación: «Crear empresas es difícil».
+    fn is_statement(&self) -> bool {
+        !self.led && is_infinitive(&self.verb) && self.rest.iter().any(|w| COPULAS.contains(&w.as_str()))
+    }
+}
+
+/// Verbos con que el mensaje pide algo (Paso 33): el que abre cada frase,
+/// tras saludos y conectores, y el que sigue a «puedes», «quiero (que)»…
+/// Así «Mi hermano investiga el cáncer» no pide investigar, y «soy un
+/// máster en esto, quiero aprenda todo sobre…» sí.
+fn asked_verbs(message: &str) -> Vec<Asked> {
+    let mut asked = Vec::new();
+    for clause in message.split(|c: char| ".;:!?¿¡,\n".contains(c)) {
+        let canonical = canonical_words(clause);
+        let words: Vec<&str> = canonical.split(' ').filter(|w| !w.is_empty()).collect();
+        let at = |i: usize, led: bool, own: bool| Asked {
+            verb: words[i].to_string(),
+            rest: words[i + 1..].iter().map(|w| w.to_string()).collect(),
+            led,
+            own,
+        };
+        let start = words.iter().take_while(|w| REQUEST_PREAMBLE.contains(w)).count();
+        if start < words.len() {
+            asked.push(at(start, false, false));
+        }
+        for (i, lead) in words.iter().enumerate().skip(start) {
+            if !ASK_LEADS.contains(lead) {
+                continue;
+            }
+            let mut j = i + 1;
+            let with_que = words.get(j) == Some(&"que");
+            if with_que {
+                j += 1;
+            }
+            while matches!(words.get(j), Some(&("tu" | "me" | "te" | "nos"))) {
+                j += 1;
+            }
+            if j < words.len() {
+                let wish = matches!(*lead, "quiero" | "quisiera" | "necesito" | "gustaria");
+                asked.push(at(j, true, wish && !with_que && is_infinitive(words[j])));
+            }
+        }
+    }
+    asked
+}
+
+/// ¿Es la palabra un infinitivo, con o sin pronombre («investigarlo»)?
+fn is_infinitive(word: &str) -> bool {
+    let stem = ["los", "las", "les", "nos", "lo", "la", "le", "me", "te", "se"]
+        .iter()
+        .find_map(|clitic| word.strip_suffix(clitic))
+        .filter(|stem| ["ar", "er", "ir"].iter().any(|end| stem.ends_with(end)))
+        .unwrap_or(word);
+    ["ar", "er", "ir"].iter().any(|end| stem.ends_with(end))
+}
+
+/// ¿Qué pide el mensaje? (Paso 33) Determinista, como las demás redes del
+/// planificador: el 2B tomaba «quiero investigue todo sobre Python» por una
+/// pregunta, y «crear un sistema con tu imaginación…» por algo que aprender.
+pub fn requested_task(message: &str) -> Task {
+    if asks_about_self(message) {
+        return Task::AboutSelf;
+    }
+    let words = format!(" {} ", canonical_words(message));
+    let has = |phrase: &str| words.contains(&format!(" {phrase} "));
+    let deep = DEPTH_MARKERS.iter().any(|m| has(m));
+    // «Investiga en internet quién creó Rust» es una búsqueda rápida (Paso 31).
+    let quick_web = !deep && WEB_PLACES.iter().any(|p| has(p));
+    let asked = asked_verbs(message);
+    let investigate = asked.iter().filter(|a| !a.is_statement()).any(|a| {
+        let verb = a.verb.as_str();
+        let topic = deep || a.rest.iter().any(|w| TOPIC_WORDS.contains(&w.as_str()));
+        let teaches = a.rest.first().is_some_and(|w| w == "que");
+        let investigates = INVESTIGATE_VERBS.contains(&verb) || (a.led && INVESTIGATE_LED.contains(&verb));
+        let studies = STUDY_VERBS.contains(&verb) || (a.led && STUDY_LED.contains(&verb));
+        (investigates && !quick_web)
+            || (studies && !a.own && topic && !teaches)
+            || (SEARCH_VERBS.contains(&verb) && deep)
+            || (START_VERBS.contains(&verb) && a.rest.iter().any(|w| w.starts_with("investigacion")))
+    });
+    if investigate {
+        return Task::Investigate;
+    }
+    let creates = CREATE_PHRASES.iter().any(|p| has(p))
+        || asked.iter().filter(|a| !a.is_statement()).any(|a| {
+            let verb = a.verb.as_str();
+            CREATE_VERBS.contains(&verb) || (a.led && CREATE_LED.contains(&verb))
+        });
+    if creates { Task::Think } else { Task::Answer }
+}
+
+/// Acceso o conexión, en una pregunta por lo que el sistema puede hacer.
+const ACCESS_WORDS: &[&str] = &[
+    "acceso", "acesso", "accesso", "acceder", "accedes", "conectarte", "conectas", "navegar", "navegas",
+];
+const SELF_CAPABILITY: &[&str] = &[
+    "eres capaz", "serias capaz", "tienes la capacidad", "tienes capacidad", "que puedes hacer", "que sabes hacer",
+    "tus capacidades", "tus funciones", "tus herramientas", "que herramientas tienes", "tus limites",
+    "tus limitaciones",
+];
+const SELF_OFFERS: &[&str] = &["si te doy", "si te paso", "si te envio", "si te mando", "si te comparto"];
+
+/// ¿Pregunta el mensaje por lo que SynaptoCore puede hacer? (Paso 33)
+/// «¿Tienes acceso a GitHub?», «si te doy un usuario, ¿podrás revisar…?».
+/// «tiene» o «puede» solo abriendo el mensaje (de usted): «¿El usuario
+/// tiene acceso…?» pregunta por otro. «¿Puedes decirme cómo acceder…?» pide
+/// instrucciones, no una capacidad.
+fn asks_about_self(message: &str) -> bool {
+    let canonical = canonical_words(message);
+    let words: Vec<&str> = canonical.split(' ').collect();
+    let padded = format!(" {canonical} ");
+    let has = |phrase: &str| padded.contains(&format!(" {phrase} "));
+    let access = words.iter().enumerate().any(|(i, w)| {
+        let to_you = matches!(*w, "tienes" | "puedes" | "podrias" | "podras")
+            || (i == 0 && matches!(*w, "tiene" | "puede" | "podria"));
+        to_you && words[i + 1..].iter().take(3).take_while(|n| **n != "como").any(|n| ACCESS_WORDS.contains(n))
+    });
+    let can = ["puedes", "podrias", "podras", "serias", "seras", "sabrias", "sabras"].iter().any(|w| has(w));
+    access || SELF_CAPABILITY.iter().any(|p| has(p)) || (can && SELF_OFFERS.iter().any(|p| has(p)))
 }
 
 /// Comienzos que expresan un deseo o una duda, no un hecho (Paso 31). Con la
@@ -2700,6 +3038,140 @@ Espero que sea útil."#;
         ] {
             assert!(!asks_for_web(no), "{no}");
         }
+    }
+
+    /// Paso 33: los mensajes del chat del usuario, que se tomaban por
+    /// preguntas normales o por enseñanzas.
+    #[test]
+    fn test_requested_task_in_the_users_chat() {
+        let cases = [
+            ("tiene acesso a revisar repositorio de gihut si te doy nombre", Task::AboutSelf),
+            ("si te doy el nombre de un usario de gihut podras revisar cuanto sistema tiene publico", Task::AboutSelf),
+            (
+                "quiero investigue todo sobre python historia uso trayetoria utlidad luego de eso te dire que mas investigaras",
+                Task::Investigate,
+            ),
+            ("soy un master en este tema quiero aprenda todo sobre el primer ojetivo", Task::Investigate),
+            (
+                "podrias investiga usos mas comunes para usar python documetnacion oficial de python libreria que suo \
+                 como se aplican la idea es que imagina que ere ingeniero y debes crear un sistema inovador",
+                Task::Investigate,
+            ),
+            (
+                "crear un sistema detallo con tu imagiacion ve conetando contruyendo hasta fianlizar un sistema avanzando en python",
+                Task::Think,
+            ),
+        ];
+        for (message, task) in cases {
+            assert_eq!(requested_task(message), task, "{message}");
+        }
+    }
+
+    #[test]
+    fn test_requested_task() {
+        for message in [
+            "Investiga a fondo la computación cuántica", "¿Puedes investigar sobre los pesos ternarios?",
+            "Busca a fondo información sobre BitNet", "Haz una investigación sobre la fotosíntesis",
+            "Aprende todo sobre Rust", "Investiga en internet todo sobre Python", "Hola, por favor investígalo",
+        ] {
+            assert_eq!(requested_task(message), Task::Investigate, "{message}");
+        }
+        for message in [
+            "Imagina una ciudad sin coches", "Piensa en una app para estudiar idiomas",
+            "¿Qué se te ocurre para mejorar mi tienda?", "Quiero que diseñes un sistema de riego",
+            "Diseña un logo para mi café", "Ok, ahora crea un juego de cartas",
+        ] {
+            assert_eq!(requested_task(message), Task::Think, "{message}");
+        }
+        for message in [
+            "¿Tienes acceso a internet?", "¿Qué puedes hacer?", "¿Eres capaz de leer PDFs?",
+            "¿Puedes conectarte a mi base de datos?",
+        ] {
+            assert_eq!(requested_task(message), Task::AboutSelf, "{message}");
+        }
+        for message in [
+            "Mi hermano investiga el cáncer en Harvard", "Ayer investigué sobre Python", "Investigar es mi pasión",
+            "Crear empresas es difícil", "Aprende que el cobre conduce la electricidad", "¿Qué piensas de Rust?",
+            "Busca en internet qué es BitNet", "Investiga online quién creó Rust", "Quiero aprender inglés",
+            "¿Puedes decirme cómo acceder a la BIOS?", "¿El usuario tiene acceso a la base de datos?",
+            "Mi nombre es Ramón", "Me gusta investigar", "¿Qué es el grafeno?", "Hola",
+        ] {
+            assert_eq!(requested_task(message), Task::Answer, "{message}");
+        }
+    }
+
+    /// Paso 33: lo que pide investigar o crear nunca se memoriza, aunque el
+    /// modelo diga «learn» o el usuario cuente algo de sí.
+    #[test]
+    fn test_requests_to_investigate_or_create_are_never_learned() {
+        for (message, task) in [
+            ("soy un master en este tema quiero aprenda todo sobre el primer ojetivo", Task::Investigate),
+            (
+                "crear un sistema detallo con tu imagiacion ve conetando contruyendo hasta fianlizar un sistema avanzando en python",
+                Task::Think,
+            ),
+        ] {
+            let plan = parse_plan(&plan_json("learn", "Python es el primer objetivo", &["python"], "none"), message, None);
+            assert_eq!(plan.intent, Intent::Query, "{message}");
+            assert_eq!(plan.task, task, "{message}");
+            assert!(!plan.is_conversation(), "{message}");
+        }
+        // Lo que cuenta de sí sin pedir nada se sigue aprendiendo.
+        let message = "soy ramon burgos creador de synaptocore";
+        let plan = parse_plan(&plan_json("query", message, &[], "none"), message, None);
+        assert_eq!(plan.intent, Intent::Learn);
+        assert_eq!(plan.task, Task::Answer);
+    }
+
+    /// Paso 33: el objetivo lo escribe el cerebro rápido con el historial; si
+    /// no da nada útil, queda la reescritura del plan.
+    #[test]
+    fn test_objective_is_written_with_the_history() {
+        let llm = MockLlmBackend::new(vec!["Objetivo: «Investigar la historia y los usos de Python»", ""]);
+        let bridge = NeuralBridge::new(llm.clone());
+        let plan = Plan::fallback("quiero aprenda todo sobre el primer objetivo");
+        let objective = bridge.objective(&plan, "quiero aprenda todo sobre el primer objetivo", "User: investiga python");
+        assert_eq!(objective, "Investigar la historia y los usos de Python");
+        assert!(llm.user_prompts()[0].contains("User: investiga python"), "el modelo ve el historial");
+        assert_eq!(bridge.objective(&plan, "quiero aprenda todo sobre el primer objetivo", ""), plan.rewritten_query);
+    }
+
+    /// Paso 33: «¿tienes acceso a…?» se responde con lo que sabe hacer, sus
+    /// herramientas incluidas, sin buscar en la web.
+    #[test]
+    fn test_about_self_lists_real_capabilities() {
+        let bridge = NeuralBridge::new(MockLlmBackend::new(vec!["No"])).with_tools(time_registry());
+        let prepared = bridge.prepare_about_self("¿Tienes acceso a GitHub?", "");
+        assert_eq!(prepared.mode, AnswerMode::Capabilities);
+        assert!(prepared.user_prompt.contains("Herramienta TimeTool"), "{}", prepared.user_prompt);
+        assert!(prepared.user_prompt.contains("Sin búsqueda web"), "sin buscador lo dice");
+        assert!(!bridge.research_first(&prepared));
+    }
+
+    /// Paso 33: pensar parte de la memoria si sabe del tema; si no, de una
+    /// búsqueda rápida, que se devuelve para aprender de ella.
+    #[test]
+    fn test_thinking_uses_memory_first_then_the_web() {
+        let graph = titanio_graph();
+        let search = BoxedSearch::new(crate::truth_filter::MockSearchBackend::new(vec![vec!["El grafeno conduce muy bien el calor."]]));
+        let bridge = NeuralBridge::new(MockLlmBackend::new(vec!["No"])).with_search(search);
+
+        let idea = "1. **Titanio espacial**: placas de titanio para satélites ligeros y baratos.";
+        assert_eq!(crate::thinking::save_ideas(&graph, "usos nuevos del titanio", idea), 1);
+        let known = Plan { entities: vec!["titanio".into()], ..Plan::fallback("Imagina usos nuevos del titanio") };
+        let (prepared, web) = bridge.prepare_thinking(&graph, &known).unwrap();
+        assert_eq!(prepared.mode, AnswerMode::Think);
+        assert!(web.is_empty(), "con memoria no busca");
+        assert!(prepared.user_prompt.contains("titanio"), "{}", prepared.user_prompt);
+        assert!(!prepared.user_prompt.contains("Titanio espacial"), "sus ideas de otra vez no son material");
+        assert!(!prepared.user_prompt.contains("[certeza:"), "{}", prepared.user_prompt);
+        assert!(!prepared.context_edge_ids.is_empty(), "la memoria usada se refuerza");
+
+        let unknown = Plan { entities: vec!["grafeno".into()], ..Plan::fallback("Imagina usos del grafeno") };
+        let (prepared, web) = bridge.prepare_thinking(&graph, &unknown).unwrap();
+        assert_eq!(web.len(), 1);
+        assert!(prepared.user_prompt.contains("[1]") && prepared.user_prompt.contains("conduce muy bien el calor"));
+        assert!(prepared.context_edge_ids.is_empty(), "memoria de otros conceptos: no se refuerza");
     }
 
     /// Un pasaje que no nombra la entidad preguntada no evita investigarla,

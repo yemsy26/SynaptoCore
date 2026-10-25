@@ -42,6 +42,7 @@ mod priority;
 mod prompts;
 mod research;
 mod subconscious;
+mod thinking;
 mod tools;
 mod truth_filter;
 mod types;

@@ -214,6 +214,12 @@ button { cursor: pointer; }
 .bubble ul { margin: 4px 0 8px; padding-left: 18px; }
 .bubble code { font: 12px var(--mono); background: rgba(34,211,238,.08); border: 1px solid rgba(34,211,238,.18); padding: 0 5px; border-radius: 5px; }
 .bubble strong { color: #fff; }
+.bubble h4 { margin: 12px 0 6px; font-size: 13.5px; color: var(--cyan-2); }
+.bubble h4:first-child { margin-top: 0; }
+.bubble pre { margin: 4px 0 8px; padding: 8px 10px; overflow-x: auto; background: rgba(0,0,0,.35); border: 1px solid var(--line-2); border-radius: 8px; }
+.bubble pre code { background: none; border: 0; padding: 0; white-space: pre; }
+.chat-inv { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line-2); display: grid; gap: 8px; }
+.chat-inv .inv-status { margin-top: 0; }
 .bubble-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font: 10.5px var(--mono); color: var(--text-3); }
 .bubble-meta:empty { display: none; }
 .msg--user .bubble-meta { justify-content: flex-end; color: rgba(237,233,254,.6); }
@@ -1876,13 +1882,14 @@ function hostOf(url) {
 /** Convierte las citas [n] en enlaces a su fuente (solo números que existan). */
 function linkCitations(html, sources) {
   if (!sources?.length) return html;
-  return html.replace(/\[(\d+)\]/g, (m, n) => {
+  // Paso 33: en el código, «lista[1]» no es una cita.
+  return html.split(/(<pre>[\s\S]*?<\/pre>|<code>[\s\S]*?<\/code>)/).map((part, i) => i % 2 ? part : part.replace(/\[(\d+)\]/g, (m, n) => {
     const s = sources[n - 1];
     if (!s) return m;
     return isHttp(s.url)
       ? `<a class="cite" href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.title || s.url)}">${n}</a>`
       : `<span class="cite">${n}</span>`;
-  });
+  })).join('');
 }
 
 /** Markdown mínimo y seguro: se escapa todo antes de transformar. */
@@ -1891,15 +1898,26 @@ function miniMarkdown(text) {
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   const blocks = [];
-  let list = null;
+  let list = null, code = null;
+  const endList = () => { if (list) { blocks.push(`<ul>${list.join('')}</ul>`); list = null; } };
+  const endCode = () => { blocks.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`); code = null; };
   for (const raw of text.split('\n')) {
     const line = raw.trimEnd();
+    // Paso 33: el modo pensar escribe encabezados y fragmentos de código.
+    if (/^\s*```/.test(line)) {
+      if (code) endCode(); else { endList(); code = []; }
+      continue;
+    }
+    if (code) { code.push(raw); continue; }
+    const head = line.match(/^#{1,4}\s+(.*)$/);
+    if (head) { endList(); blocks.push(`<h4>${inline(head[1])}</h4>`); continue; }
     const li = line.match(/^\s*(?:[-*•]|\d+[.)])\s+(.*)$/);
     if (li) { (list ??= []).push(`<li>${inline(li[1])}</li>`); continue; }
-    if (list) { blocks.push(`<ul>${list.join('')}</ul>`); list = null; }
+    endList();
     if (line.trim()) blocks.push(`<p>${inline(line)}</p>`);
   }
-  if (list) blocks.push(`<ul>${list.join('')}</ul>`);
+  if (code) endCode();
+  endList();
   return blocks.join('');
 }
 
@@ -1917,15 +1935,21 @@ function appendAgent() {
   chatLog().append(el);
   const body = el.querySelector('.bubble-body'), meta = el.querySelector('.bubble-meta');
   const srcBox = el.querySelector('.sources');
+  let note = null;
   return {
     update(raw, streaming = true, sources = null) {
       const { html, thinking } = renderAgentText(raw);
-      const think = thinking ? `<div class="thinking-note">${icon('bulb')}razonando…</div>` : '';
-      body.innerHTML = linkCitations(html, sources) + think + (streaming && !thinking ? '<span class="caret"></span>' : '');
+      const status = thinking ? 'razonando…' : (streaming ? note : null);
+      const think = status ? `<div class="thinking-note">${icon('bulb')}${escapeHtml(status)}</div>` : '';
+      body.innerHTML = linkCitations(html, sources) + think + (streaming && !status ? '<span class="caret"></span>' : '');
       if (!html && !thinking && !streaming) body.innerHTML = '<p>(respuesta vacía)</p>';
       scrollChat();
     },
     meta(parts) { meta.innerHTML = parts.map(p => `<span>${escapeHtml(p)}</span>`).join(''); },
+    /** Paso 33: paso del modo pensar en curso, hasta su primer token. */
+    status(text) { note = text; },
+    /** Paso 33: un bloque bajo el texto (la investigación pedida). */
+    attach(node) { srcBox.before(node); scrollChat(); },
     sources(list, fromMemory) {
       if (!list?.length) return;
       const items = list.map(s => {
@@ -2029,6 +2053,11 @@ async function sendChat(text) {
           logLocal('research', `Investigando en la web: «${p.query || text}»`);
           continue;
         }
+        // Paso 33: modo pensar, paso a paso.
+        if (p.status === 'thinking') {
+          if (bubble) { bubble.status(p.label); bubble.update(raw); } else pending.label(p.label);
+          continue;
+        }
 
         if (p.error) {
           pending.remove();
@@ -2048,6 +2077,7 @@ async function sendChat(text) {
             }
           } else {
             bubble ??= appendAgent();
+            bubble.status(null);
             raw += p.token;
             bubble.update(raw);
           }
@@ -2059,6 +2089,7 @@ async function sendChat(text) {
           const ORIGIN = {
             memory: 'de mi memoria', web: 'investigado en la web', tool: 'datos en tiempo real',
             general: 'conocimiento general · no verificado', conversation: 'conversación',
+            self: 'sobre mí', thought: 'pensado · ideas propias', investigation: 'investigación a fondo',
           };
           const origin = intent === 'learn' ? 'asimilación' : (ORIGIN[p.answered_from] || 'consulta');
           const parts = [`TTFT ${tFirst ? secs(tFirst) : '—'}`, `total ${secs(end)}`, origin];
@@ -2066,6 +2097,7 @@ async function sendChat(text) {
           if (p.timings) parts.push(`plan ${p.timings.plan_ms} ms`);
           if (p.timings?.research_ms != null) parts.push(`búsqueda ${p.timings.research_ms} ms`);
           if (p.tool) parts.push(`herramienta ${p.tool}`);
+          if (p.ideas_saved) parts.push(`${p.ideas_saved} idea(s) guardada(s)`);
           if (p.reinforced_edges) {
             parts.push(`+${p.reinforced_edges} conexiones reforzadas`);
             logLocal('graph', `Refuerzo hebbiano: ${p.reinforced_edges} conexión(es) usada(s) en la respuesta`);
@@ -2075,6 +2107,10 @@ async function sendChat(text) {
             bubble.update(raw, false, p.sources);
             bubble.sources(p.sources, p.answered_from === 'memory');
             bubble.meta(parts);
+            if (p.investigation_id) {
+              logLocal('research', `Investigación a fondo en marcha desde el chat`);
+              chatInvestigation(bubble, p.investigation_id);
+            }
           }
           if (card) card.meta(parts);
         }
@@ -2440,6 +2476,52 @@ function renderHistory(list) {
       </button>`).join('')}</div></section>`;
 }
 
+/** Una fuente de investigación: enlace y dominio, o su título. */
+function invSourceHtml(s) {
+  return isHttp(s.url)
+    ? `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.title || hostOf(s.url))}</a> <span class="host">${escapeHtml(hostOf(s.url))}</span>`
+    : escapeHtml(s.title || s.snippet.slice(0, 90));
+}
+
+/** Paso 33: sigue en el chat la investigación pedida en él, hasta su conclusión. */
+function chatInvestigation(bubble, id) {
+  const box = h('<div class="chat-inv"></div>');
+  bubble.attach(box);
+  const render = d => {
+    const running = d.status === 'running';
+    box.innerHTML = `
+      <div class="inv-status">
+        <span class="inv-chip" data-s="${escapeHtml(d.status)}">${escapeHtml(INV_STATUS[d.status] || d.status)}</span>
+        ${running ? '<span class="inv-spin" aria-hidden="true"></span>' : ''}
+        <span>${escapeHtml(d.stage)} · ronda ${d.round}/${d.max_rounds} · ${d.sources.length} fuentes</span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm" type="button" data-open-inv="${escapeHtml(d.id)}">${icon('search')}Ver detalle</button>
+      </div>
+      ${d.error ? `<p class="inv-error">${escapeHtml(d.error)}</p>` : ''}
+      ${d.conclusion ? `<div class="inv-sec">Conclusión</div><div class="inv-conclusion">${linkCitations(miniMarkdown(d.conclusion), d.sources)}</div>` : ''}
+      ${d.conclusion && d.sources.length ? `<details class="inv-sources"><summary class="inv-sec">Fuentes (${d.sources.length})</summary>
+        <ol>${d.sources.map(s => `<li><span class="cite">${s.n}</span> ${invSourceHtml(s)}</li>`).join('')}</ol></details>` : ''}`;
+    scrollChat();
+  };
+  const poll = async () => {
+    try {
+      const r = await fetch(`${API}/api/v1/investigations/${encodeURIComponent(id)}`);
+      if (!r.ok) throw new Error(await apiError(r));
+      const d = await r.json();
+      render(d);
+      if (d.status === 'running') {
+        setTimeout(poll, 3000);
+      } else {
+        logLocal('research', `Investigación ${(INV_STATUS[d.status] || d.status).toLowerCase()}: «${d.objective}»`);
+        if (d.learned.length) scheduleGraph();
+      }
+    } catch (e) {
+      box.innerHTML = `<p class="inv-error">No se pudo seguir la investigación: ${escapeHtml(e.message)}</p>`;
+    }
+  };
+  poll();
+}
+
 function renderInvestigation(d) {
   const box = $('#inv-detail');
   if (!d) {
@@ -2464,9 +2546,6 @@ function renderInvestigation(d) {
       ${why ? `<div class="hyp-why">${cite(escapeHtml(why))}</div>` : ''}
     </div>`;
   }).join('');
-  const source = s => isHttp(s.url)
-    ? `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.title || hostOf(s.url))}</a> <span class="host">${escapeHtml(hostOf(s.url))}</span>`
-    : escapeHtml(s.title || s.snippet.slice(0, 90));
   box.innerHTML = `
     <div class="inv-objective">${escapeHtml(d.objective)}</div>
     <div class="inv-status">
@@ -2482,7 +2561,7 @@ function renderInvestigation(d) {
     ${d.learned.length ? `<section style="margin-top:14px"><div class="inv-sec">Aprendido en memoria</div><div class="inv-learned">${d.learned.map(f => `<span class="inv-fact">${escapeHtml(f)}</span>`).join('')}</div></section>` : ''}
     ${d.questions.length ? `<section style="margin-top:14px"><div class="inv-sec">Preguntas investigadas</div><div class="inv-questions">${d.questions.map(q => `<span class="inv-q">${escapeHtml(q)}</span>`).join('')}</div></section>` : ''}
     ${d.sources.length ? `<details class="inv-sources" style="margin-top:14px"><summary class="inv-sec">Fuentes (${d.sources.length})</summary>
-      <ol>${d.sources.map(s => `<li><span class="cite">${s.n}</span> ${source(s)}</li>`).join('')}</ol></details>` : ''}`;
+      <ol>${d.sources.map(s => `<li><span class="cite">${s.n}</span> ${invSourceHtml(s)}</li>`).join('')}</ol></details>` : ''}`;
 }
 
 async function startInvestigation(e) {
@@ -2555,6 +2634,12 @@ function bindUI() {
   $('#btn-teach').addEventListener('click', openTeach);
   $('#btn-investigate').addEventListener('click', () => (inv.open ? closeInvestigations() : openInvestigations()));
   $('#btn-brains').addEventListener('click', () => (brains.open ? closeBrains() : openBrains()));
+  chatLog().addEventListener('click', e => {
+    const b = e.target.closest('[data-open-inv]');
+    if (!b) return;
+    inv.current = b.dataset.openInv;
+    openInvestigations();
+  });
 
   // Cerebros (Paso 33a)
   $('#brains-close').addEventListener('click', closeBrains);
